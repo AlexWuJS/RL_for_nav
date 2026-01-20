@@ -1,0 +1,17 @@
+<launch>
+    <!-- 加载URDF -->
+    <param name="robot_description" command="$(find xacro)/xacro $(find urdf02_gazebo)/urdf/car.urdf.xacro" />
+
+    <!-- 启动Gazebo -->
+    <include file="$(find gazebo_ros)/launch/empty_world.launch">
+        <arg name="world_name" value="$(find urdf02_gazebo)/worlds/box_house.world" />
+    </include>
+
+    <!-- 在Gazebo中添加机器人 -->
+    <node pkg="gazebo_ros" type="spawn_model" name="spawn_model"
+          args="-urdf -model car -param robot_description"/>
+
+    <!-- 启动TD3避障控制器 -->
+    <node pkg="nav_demo" type="td3_controller.py" name="td3_controller" output="screen"/>
+
+</launch>

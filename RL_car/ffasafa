@@ -1,0 +1,10 @@
+http.proxy=127.0.0.1:7890
+https.proxy=127.0.0.1:7890
+user.name=AlexWuJS
+user.email=13610385105@139.com
+core.repositoryformatversion=0
+core.filemode=true
+core.bare=false
+core.logallrefupdates=true
+remote.RL.url=https://github.com/AlexWuJS/RL_car.git
+remote.RL.fetch=+refs/heads/*:refs/remotes/RL/*

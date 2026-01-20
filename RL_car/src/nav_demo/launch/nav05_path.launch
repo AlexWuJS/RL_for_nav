@@ -1,0 +1,27 @@
+<launch>
+
+    <node pkg="move_base" type="move_base" respawn="false" name="move_base" output="screen" clear_params="true">
+
+        <!-- 全局规划器 -->
+        <param name="base_global_planner" value="global_planner/GlobalPlanner"/>
+
+        <!-- costmap -->
+        <rosparam file="$(find nav_demo)/param/costmap_common_params.yaml" command="load" ns="global_costmap" />
+        <rosparam file="$(find nav_demo)/param/costmap_common_params.yaml" command="load" ns="local_costmap" />
+
+        <rosparam file="$(find nav_demo)/param/local_costmap_params.yaml" command="load" />
+        <rosparam file="$(find nav_demo)/param/global_costmap_params.yaml" command="load" />
+
+        <!-- 局部规划器（可能是TEB或DWA）-->
+        <!-- <rosparam file="$(find nav_demo)/param/base_local_planner_params.yaml" command="load" /> -->
+        <!-- <rosparam file="$(find nav_demo)/param/teb_local_planner_params.yaml" command="load" /> -->
+        <rosparam file="$(find nav_demo)/param/dwa_local_planner_params.yaml" command="load" />
+
+        <!-- 设置本地规划器为TEB -->
+        <!-- <param name="base_local_planner" value="teb_local_planner/TebLocalPlannerROS"/> -->
+        <!-- 设置本地规划器为DWA -->
+        <param name="base_local_planner" value="dwa_local_planner/DWAPlannerROS"/>
+
+    </node>
+
+</launch>

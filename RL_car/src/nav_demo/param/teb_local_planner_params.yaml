@@ -1,0 +1,34 @@
+TebLocalPlannerROS:
+
+  odom_topic: odom
+  map_frame: map
+
+  # 机器人外形
+  footprint_model:
+    type: "circular"
+    radius: 0.15
+
+  # 差速小车动力学
+  max_vel_x: 0.5
+  max_vel_x_backwards: 0.3
+  max_vel_theta: 1.0
+
+  acc_lim_x: 0.5
+  acc_lim_theta: 1.5
+
+  # 轨迹时间分辨率
+  dt_ref: 0.3
+  dt_hysteresis: 0.1
+
+  # 避障
+  min_obstacle_dist: 0.25
+  inflation_dist: 0.35
+  weight_obstacle: 50.0
+
+  # 优化参数
+  weight_kinematics_nh: 100.0       
+  max_global_plan_lookahead_dist: 3.0
+
+  # 多拓扑路线
+  enable_homotopy_class_planning: true
+  max_number_classes: 2

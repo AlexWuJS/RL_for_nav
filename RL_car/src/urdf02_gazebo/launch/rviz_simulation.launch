@@ -1,0 +1,35 @@
+<launch>
+
+    <!-- 1. 加载 URDF 到参数服务器（可选，如果要在 RViz 显示机器人模型） -->
+    <param name="robot_description" 
+           command="$(find xacro)/xacro $(find urdf02_gazebo)/urdf/car.urdf.xacro" />
+    
+    <node pkg="robot_state_publisher" type="robot_state_publisher" name="robot_state_publisher">
+    <param name="robot_description" command="$(find xacro)/xacro $(find urdf02_gazebo)/urdf/car.urdf.xacro"/>
+    </node>
+
+
+
+    <!-- 2. 加载地图（修改为你的地图路径） -->
+    <node pkg="map_server" type="map_server" name="map_server"
+          args="$(find urdf02_gazebo)/maps/scans.yaml" />
+
+
+    <!-- 3. 发布静态 TF（map -> odom） -->
+    <node pkg="tf" type="static_transform_publisher" name="map_to_odom"
+          args="0 0 0 0 0 0 map odom 100" />
+
+    <!-- 4. 发布静态 TF（odom -> base_link） -->
+    <node pkg="tf" type="static_transform_publisher" name="odom_to_base"
+          args="0 0 0 0 0 0 odom base_link 100" />
+    
+
+
+    <!-- 5. 启动 RViz -->
+    <!-- <node pkg="rviz" type="rviz" name="rviz" output="screen" /> -->
+
+
+    <!-- 6. 如果仍想运行动态障碍脚本，可以保留（否则删掉） -->
+    <!-- <node pkg="urdf02_gazebo" type="obstacle_controller.py" name="obstacle_controller" /> -->
+
+</launch>

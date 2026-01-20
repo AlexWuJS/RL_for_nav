@@ -1,0 +1,8 @@
+prefix=/home/alex/RL_car/RL_car/devel
+
+Name: my_urdf
+Description: Description of my_urdf
+Version: 0.0.0
+Cflags: 
+Libs: -L${prefix}/lib 
+Requires: 

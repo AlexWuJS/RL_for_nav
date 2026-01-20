@@ -1,0 +1,2 @@
+my_urdf:nav_demo:urdf01_rviz:urdf02_gazebo
+-DCATKIN_DEVEL_PREFIX=/home/alex/RL_car/RL_car/devel -DCMAKE_INSTALL_PREFIX=/home/alex/RL_car/RL_car/install -G Unix Makefiles
