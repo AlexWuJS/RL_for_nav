@@ -184,14 +184,6 @@
       </link>
     </model>
 
-    <physics type="ode">
-      <!-- 设为 0 表示不限制运行速度，全速跑 -->
-      <real_time_update_rate>0</real_time_update_rate> 
-      
-      <!-- 物理仿真步长，0.001是标准精度。 -->
-      <!-- 如果想要更快，可以改为 0.002 或 0.005，但可能会导致碰撞检测不准 -->
-      <max_step_size>0.001</max_step_size>
-    </physics>  
 
   </world>
 </sdf>
