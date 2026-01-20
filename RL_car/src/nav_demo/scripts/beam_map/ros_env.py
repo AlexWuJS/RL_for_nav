@@ -175,6 +175,77 @@ class MyCarEnv(gym.Env):
         # 将 [0, 30] 映射到 [0, 1]，这对神经网络训练非常重要
         processed_ranges = np.array(processed_ranges, dtype=np.float32)
         return processed_ranges / self.max_laser_range
+    
+    def _update_marker(self, marker_name, x, y, color):
+            """
+            生成或移动一个【无重力、无碰撞、可移动】的幽灵球体
+            """
+            # === 核心修改：SDF 定义 ===
+            # 1. <static>0</static>: 让它变成动态物体，这样才能被 SetModelState 移动
+            # 2. <gravity>0</gravity>: 关掉重力，让它悬浮在半空
+            # 3. <inertial>: 动态物体必须有质量，给个极小值
+            # 4. <collision>: 故意不写，实现“无碰撞”
+            sdf_xml = f"""
+            <sdf version="1.6">
+            <model name="{marker_name}">
+                <static>0</static> 
+                <link name="link">
+                <gravity>0</gravity>
+                <inertial>
+                    <mass>0.001</mass>
+                    <inertia>
+                    <ixx>0.0001</ixx><ixy>0</ixy><ixz>0</ixz>
+                    <iyy>0.0001</iyy><iyz>0</iyz>
+                    <izz>0.0001</izz>
+                    </inertia>
+                </inertial>
+                <visual name="visual">
+                    <geometry><sphere><radius>0.3</radius></sphere></geometry>
+                    <material>
+                    <script>
+                        <uri>file://media/materials/scripts/gazebo.material</uri>
+                        <name>Gazebo/{color}</name>
+                    </script>
+                    </material>
+                    <cast_shadows>0</cast_shadows>
+                </visual>
+                <!-- 没有 collision 标签，车可以直接穿过去 -->
+                </link>
+            </model>
+            </sdf>
+            """
+
+            # 尝试移动模型
+            state_msg = ModelState()
+            state_msg.model_name = marker_name
+            state_msg.pose.position.x = x
+            state_msg.pose.position.y = y
+            state_msg.pose.position.z = 0.5 # 高度
+            state_msg.pose.orientation.w = 1.0
+            # 强制速度为0，防止之前如果有速度残留导致它漂移
+            state_msg.twist.linear.x = 0
+            state_msg.twist.linear.y = 0
+            state_msg.twist.angular.z = 0
+            
+            try:
+                # 发送移动指令
+                resp = self.set_state_proxy(state_msg)
+                
+                # 如果移动失败（通常是因为模型还不存在），则生成它
+                if not resp.success:
+                    raise rospy.ServiceException("Model not found")
+            
+            except rospy.ServiceException:
+                # 如果报错，说明模型还没生成，调用 spawn
+                try:
+                    spawn_proxy = rospy.ServiceProxy('/gazebo/spawn_sdf_model', SpawnModel)
+                    spawn_proxy(marker_name, sdf_xml, "", Pose(), "world")
+                    
+                    # 生成后立刻再设置一次位置，确保万无一失
+                    rospy.sleep(0.05) 
+                    self.set_state_proxy(state_msg)
+                except rospy.ServiceException as e:
+                    pass
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -195,6 +266,11 @@ class MyCarEnv(gym.Env):
                 self.target_pos = np.array([goal_x, goal_y])
                 break
         
+        # 1. 标记终点 (红色球)
+        self._update_marker("marker_goal", self.target_pos[0], self.target_pos[1], "Red")
+        
+        # 2. 标记起点 (蓝色球)
+        self._update_marker("marker_start", start_x, start_y, "Blue")
         
         state_msg = ModelState()
         state_msg.model_name = 'car'
