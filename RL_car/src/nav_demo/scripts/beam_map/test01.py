@@ -1,9 +1,11 @@
 import gymnasium as gym
 from stable_baselines3 import SAC
+from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack 
 from ros_env import MyCarEnv
-from lidar_compress_net import LidarProcessor # 必须导入这个，否则加载模型会报错
+from lidar_compress_net import LidarProcessor 
 import os
 import rospy
+import numpy as np
 
 # 防止库冲突
 os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
@@ -11,62 +13,82 @@ os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
 def main():
     print("DEBUG: 程序开始运行...")
 
+    # ==========================================
     # 1. 初始化环境
-    # 注意：这里的环境逻辑必须和训练时的一模一样（Observation空间维度必须一致）
-    env = MyCarEnv()
+    # ==========================================
+    env = DummyVecEnv([lambda: MyCarEnv()]) 
+    env = VecFrameStack(env, n_stack=4)
     
+    # === 新增：获取底层环境引用 ===
+    # env 是 VecFrameStack -> env.venv 是 DummyVecEnv -> env.venv.envs[0] 是原始 MyCarEnv
+    # 这样我们要读取 self.target_pos 或 self.current_pos 就方便了
+    raw_env = env.venv.envs[0] 
+
+    # ==========================================
     # 2. 指定模型路径
-    # 优先使用自动保存的最高分模型
-    best_model_path = "./training_results/best_model.zip"
-    last_model_path = "nav_car_sac.zip"
+    # ==========================================
+    best_model_path = "./training_frenet_results/best_model.zip"
+    final_model_path = "./training_frenet_results/final_model_stacked.zip"
     
     if os.path.exists(best_model_path):
         model_path = best_model_path
         print(f"✅ 发现最佳模型，正在加载: {model_path}")
-    else:
-        model_path = last_model_path
+    elif os.path.exists(final_model_path):
+        model_path = final_model_path
         print(f"⚠️ 未找到最佳模型，尝试加载最终模型: {model_path}")
-    
-    if not os.path.exists(model_path):
-        print(f"❌ 错误：找不到文件 {model_path}")
+    else:
+        print(f"❌ 错误：找不到模型文件")
         return
 
+    # ==========================================
     # 3. 加载模型
-    # 这里的 custom_objects 主要是为了防止有些版本不兼容，通常直接 load 即可
+    # ==========================================
     model = SAC.load(model_path, env=env)
     print("DEBUG: 模型加载成功！开始导航测试...")
 
-    obs, info = env.reset()
+    obs = env.reset()
     
-    episode_reward = 0
+    # === 新增：打印初始起点和终点 ===
+    print(f"\n📍 [第一轮] 起点: ({raw_env.current_pos[0]:.2f}, {raw_env.current_pos[1]:.2f}) "
+          f"-> 🎯 终点: ({raw_env.target_pos[0]:.2f}, {raw_env.target_pos[1]:.2f})")
+    
+    episode_reward = 0.0
     steps = 0
     
     try:
         while True:
-            # === 关键点：deterministic=True ===
-            # 训练时我们需要随机性来探索(False)，测试时我们需要最强的执行力(True)
             action, _states = model.predict(obs, deterministic=True)
             
-            obs, reward, terminated, truncated, info = env.step(action)
+            obs, rewards, dones, infos = env.step(action)
+            
+            reward = rewards[0]
+            done = dones[0]
+            
             episode_reward += reward
             steps += 1
             
-            # 可以在这里打印当前距离目标的距离 (如果你的 info 里有的话，或者是 env 里的变量)
-            # print(f"Action: {action}, Reward: {reward:.2f}")
-
-            if terminated or truncated:
-                if reward > 50: # 粗略判断，如果是正向大奖励，说明到了
-                    print(f"🎉 成功到达终点！ 用时: {steps}步, 总得分: {episode_reward:.1f}")
+            if done:
+                if episode_reward > 100: 
+                    print(f"🎉 任务完成！ 用时: {steps}步, 总得分: {episode_reward:.1f}")
                 else:
-                    print(f"💥 碰撞或超时！ 用时: {steps}步, 总得分: {episode_reward:.1f}")
+                    print(f"💥 任务结束 (碰撞/超时)！ 用时: {steps}步, 总得分: {episode_reward:.1f}")
                 
-                obs, info = env.reset()
+                print("-" * 30)
+                
+                # === 关键修改：VecEnv 自动 Reset 后，打印新一轮的起点终点 ===
+                # 因为 VecEnv 在 done=True 时已经自动调用了 reset()，
+                # 所以此时 raw_env 里的 target_pos 已经是新生成的了。
+                print(f"📍 [新一轮] 起点: ({raw_env.current_pos[0]:.2f}, {raw_env.current_pos[1]:.2f}) "
+                      f"-> 🎯 终点: ({raw_env.target_pos[0]:.2f}, {raw_env.target_pos[1]:.2f})")
+
                 episode_reward = 0
                 steps = 0
-                print("-" * 30)
                 
     except KeyboardInterrupt:
         print("\n测试停止")
+        from geometry_msgs.msg import Twist
+        pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
+        pub.publish(Twist())
 
 if __name__ == '__main__':
     main()
