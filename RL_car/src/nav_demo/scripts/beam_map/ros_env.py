@@ -60,10 +60,19 @@ class MyCarEnv(gym.Env):
         self.last_distance_to_goal = None
         self.step_count = 0
         self.max_steps = 500
+
+        # 3-DOF 惯性模型状态 (Surge, Sway, Yaw)
+        self.velocity = np.array([0.0, 0.0, 0.0])  # [u, v, r]
+        self.damping = 0.5  # 阻尼系数
+        self.dt = 0.1       # 控制周期 (秒)
+
+        # 激光雷达异步回调缓存
+        self.latest_scan = None
+        rospy.Subscriber('/scan', LaserScan, self._scan_callback, queue_size=1)
     
     def _get_robot_position(self):
         try:
-            res = self.get_state_proxy('car', 'world')
+            res = self.get_state_proxy('usv', 'world')
             pos = res.pose.position
             ori = res.pose.orientation
             quaternion = (ori.x, ori.y, ori.z, ori.w)
@@ -74,23 +83,31 @@ class MyCarEnv(gym.Env):
             print("get robot position failed: %s" % e)
             return np.array([0.0, 0.0]), 0.0
 
+    def _scan_callback(self, msg):
+        self.latest_scan = msg
+
     def step(self, action):
-        # 1. 解析动作并发布控制指令
-        linear_vel = float(action[0])
-        angular_vel = float(action[1])
-        
+        # 1. 解析动作为控制输入 (欠驱动 USV: action[0]=Surge期望, action[1]=Yaw期望)
+        control_input = np.array([
+            float(action[0]),  # 期望 Surge 力/速度
+            0.0,               # Sway 无直接控制输入 (欠驱动)
+            float(action[1])   # 期望 Yaw 角速度
+        ])
+
+        # 2. 惯性结算: V_{t+1} = V_t + (Control_Input - Damping × V_t) × dt
+        self.velocity = self.velocity + (control_input - self.damping * self.velocity) * self.dt
+
+        # 3. 发布带有惯性的实际速度指令
         vel_msg = Twist()
-        vel_msg.linear.x = linear_vel
-        vel_msg.angular.z = angular_vel
+        vel_msg.linear.x = self.velocity[0]   # 实际 Surge 速度
+        vel_msg.linear.y = self.velocity[1]   # 实际 Sway 速度
+        vel_msg.angular.z = self.velocity[2]  # 实际 Yaw 角速度
         self.pub_cmd_vel.publish(vel_msg)
-        
-        # 2. 获取激光雷达数据
-        scan_data = None
-        while scan_data is None:
-            try:
-                scan_data = rospy.wait_for_message('/scan', LaserScan, timeout=0.1)
-            except:
-                pass
+
+        # 2. 获取激光雷达数据（非阻塞回调）
+        while self.latest_scan is None:
+            rospy.sleep(0.01)
+        scan_data = self.latest_scan
 
         # 3. 获取机器人当前状态与目标距离
         self.current_pos, self.current_yaw = self._get_robot_position()
@@ -165,17 +182,22 @@ class MyCarEnv(gym.Env):
             print("Goal reached!")
             
         else:
-            # 7.2 路径跟踪奖励 (Frenet)
+            # 7.2 路径跟踪奖励 (Frenet，放大2.5倍鼓励探索)
             frenet_reward_dict = frenet_reward(delta_s, frenet_d, heading_to_path)
-            reward += frenet_reward_dict['total']
+            frenet_amplification_factor = 2.5
+            reward += frenet_reward_dict['total'] * frenet_amplification_factor
 
-            # 7.3 安全避障惩罚
+            # 7.3 安全避障惩罚（指数级，k=7.2确保0.25m处惩罚<-50）
             safe_distance = 0.8
             if min_laser_dist < safe_distance:
-                reward -= (safe_distance - min_laser_dist) * 10.0
+                k = 7.2
+                penalty = math.exp(k * (safe_distance - min_laser_dist)) - 1
+                reward -= min(penalty, 50.0)  # 上限-50
 
-            # 7.4 动作平滑度约束
-            reward -= abs(angular_vel) * 0.1
+            # 7.4 动作平滑度约束（新增动作变化率惩罚）
+            surge_change_penalty = abs(action[0] - self.last_action[0]) * 1.5
+            yaw_change_penalty = abs(action[1] - self.last_action[1]) * 1.0
+            reward -= surge_change_penalty + yaw_change_penalty
 
             # 7.5 存活时间惩罚
             reward -= 0.1
@@ -189,13 +211,19 @@ class MyCarEnv(gym.Env):
 
         # 9. 更新上一帧的 s 值
         self.last_frenet_s = frenet_s
-        
+        # 10. 更新上一帧动作（用于下一step的动作平滑度惩罚）
+        self.last_action = np.array([float(action[0]), float(action[1])])
+
         return obs, reward, terminated, truncated, {}
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self.pub_cmd_vel.publish(Twist())
         self.step_count = 0
+        # 重置 3-DOF 惯性速度状态
+        self.velocity = np.array([0.0, 0.0, 0.0])
+        # 重置动作平滑度状态
+        self.last_action = np.array([0.0, 0.0])
 
         range_limit = 20.0
         start_x = np.random.uniform(-range_limit/2, range_limit/2)
@@ -219,7 +247,7 @@ class MyCarEnv(gym.Env):
 
         # 移动机器人
         state_msg = ModelState()
-        state_msg.model_name = 'car'
+        state_msg.model_name = 'usv'
         state_msg.pose.position.x = start_x
         state_msg.pose.position.y = start_y
         state_msg.pose.position.z = 0.05
@@ -259,12 +287,9 @@ class MyCarEnv(gym.Env):
         print("Reset: Start(%.1f,%.1f) -> Goal(%.1f,%.1f) | Path Length: %.2fm" %
               (start_x, start_y, self.target_pos[0], self.target_pos[1], path_length))
 
-        data = None
-        while data is None:
-            try:
-                data = rospy.wait_for_message('/scan', LaserScan, timeout=1.0)
-            except:
-                pass
+        while self.latest_scan is None:
+            rospy.sleep(0.01)
+        data = self.latest_scan
 
         return self._build_obs(data, path_length), {}
 

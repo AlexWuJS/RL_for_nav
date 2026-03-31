@@ -27,8 +27,8 @@ def main():
     # ==========================================
     # 2. 指定模型路径
     # ==========================================
-    best_model_path = "./training_frenet_results/best_model.zip"
-    final_model_path = "./training_frenet_results/final_model_stacked.zip"
+    best_model_path = "./training_usv_frenet_results/best_model.zip"
+    final_model_path = "./training_usv_frenet_results/final_model_stacked.zip"
     
     if os.path.exists(best_model_path):
         model_path = best_model_path

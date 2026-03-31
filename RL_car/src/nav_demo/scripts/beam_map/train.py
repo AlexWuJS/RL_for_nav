@@ -65,7 +65,7 @@ def make_env(rank, log_dir):
 # ==========================================
 if __name__ == "__main__":
     # 1. 路径设置
-    save_dir = "./training_frenet_results/"
+    save_dir = "./training_usv_frenet_results/"
     log_dir = "./logs/"
     os.makedirs(save_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
@@ -175,4 +175,4 @@ if __name__ == "__main__":
     obs = eval_env.reset()
     for _ in range(1000):
         action, _states = model.predict(obs, deterministic=True)
-        obs, reward, done, info = eval_env.step(action)
+        obs, reward, terminated, truncated, info = eval_env.step(action)
