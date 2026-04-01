@@ -33,8 +33,8 @@ class EntropyControlCallback(BaseCallback):
             self.model.ent_coef = self.target_ent_coef
             print(f"   -> 熵系数 (ent_coef) 已强制锁死为: {self.target_ent_coef}")
             
-            # 2. 降低学习率
-            self.model.learning_rate = self.target_lr
+            # 2. 降低学习率（同步修改 SB3 调度器 + PyTorch 优化器）
+            self.model.lr_schedule = lambda _: self.target_lr
             for optimizer in [self.model.actor.optimizer, self.model.critic.optimizer]:
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = self.target_lr
@@ -65,7 +65,7 @@ def make_env(rank, log_dir):
 # ==========================================
 if __name__ == "__main__":
     # 1. 路径设置
-    save_dir = "./training_usv_frenet_results/"
+    save_dir = "./training_usv_v2_results/"
     log_dir = "./logs/"
     os.makedirs(save_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
@@ -134,18 +134,19 @@ if __name__ == "__main__":
     # ==========================================
     model = SAC(
         "MlpPolicy",
-        train_env,                  
+        train_env,
         verbose=1,
         tensorboard_log="./3_sac_nav_car_log/",
         policy_kwargs=policy_kwargs,
-        learning_rate=3e-4,         # 前期较高学习率
-        buffer_size=200000,         # 加大经验池容量
-        batch_size=512,             # 加大 Batch Size
-        ent_coef='auto',            # 前期让它自动调节探索
+        learning_rate=3e-4,
+        buffer_size=200000,
+        batch_size=128,
+        ent_coef='auto',
         gamma=0.99,
         tau=0.005,
-        train_freq=1,               
-        gradient_steps=1,
+        learning_starts=10000,
+        train_freq=(10, "step"),
+        gradient_steps=10,
         device="cuda" if torch.cuda.is_available() else "cpu"
     )
 
@@ -175,4 +176,4 @@ if __name__ == "__main__":
     obs = eval_env.reset()
     for _ in range(1000):
         action, _states = model.predict(obs, deterministic=True)
-        obs, reward, terminated, truncated, info = eval_env.step(action)
+        obs, rewards, dones, infos = eval_env.step(action)

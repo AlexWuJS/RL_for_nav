@@ -27,9 +27,9 @@ def main():
     # ==========================================
     # 2. 指定模型路径
     # ==========================================
-    best_model_path = "./training_usv_frenet_results/best_model.zip"
-    final_model_path = "./training_usv_frenet_results/final_model_stacked.zip"
-    
+    best_model_path = "./training_usv_v2_results/best_model.zip"
+    final_model_path = "./training_usv_v2_results/final_model_stacked.zip"
+
     if os.path.exists(best_model_path):
         model_path = best_model_path
         print(f"✅ 发现最佳模型，正在加载: {model_path}")
@@ -37,7 +37,8 @@ def main():
         model_path = final_model_path
         print(f"⚠️ 未找到最佳模型，尝试加载最终模型: {model_path}")
     else:
-        print(f"❌ 错误：找不到模型文件")
+        print(f"❌ 未找到新版本模型，请先运行 train.py 进行训练")
+        print(f"   期望路径: {best_model_path}")
         return
 
     # ==========================================

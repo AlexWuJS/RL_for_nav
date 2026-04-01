@@ -144,18 +144,22 @@ class FrenetTransform:
 def frenet_reward(delta_s: float, frenet_d: float, heading_error: float) -> dict:
     """强化学习奖励函数"""
     components = {}
-    
-    # 1. 纵向进度奖励 (鼓励沿着 s 方向前进)
-    components['s_progress'] = delta_s * 20.0 
-    
-    # 2. 横向偏离惩罚 (二次方惩罚，偏离越大惩罚越重)
-    raw_lateral_penalty = -(frenet_d ** 2) * 2.0
-    components['lateral_deviation'] = max(raw_lateral_penalty, -10.0)
-    
-    # 3. 朝向误差惩罚 (鼓励车头对准路径切线方向)
+
+    # 1. 纵向进度奖励 (稍微提高，鼓励向前探索)
+    components['s_progress'] = delta_s * 30.0
+
+    # 2. 横向偏离惩罚 (建立 0.5m 的免罚走廊，超出后给出缓和的线性惩罚)
+    abs_d = abs(frenet_d)
+    if abs_d <= 0.5:
+        raw_lateral_penalty = 0.0
+    else:
+        raw_lateral_penalty = -(abs_d - 0.5) * 1.5
+    components['lateral_deviation'] = max(raw_lateral_penalty, -5.0)
+
+    # 3. 朝向误差惩罚 (保持柔和)
     heading_normalized = abs(heading_error) / math.pi
-    components['heading_penalty'] = -heading_normalized * 2.0
-    
+    components['heading_penalty'] = -heading_normalized * 1.5
+
     reward = sum(components.values())
     return {'total': reward, 'components': components}
 

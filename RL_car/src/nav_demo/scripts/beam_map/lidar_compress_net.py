@@ -10,7 +10,7 @@ class LidarProcessor(BaseFeaturesExtractor):
         n_input_features = observation_space.shape[0]
         
         # 2. 定义基础单帧维度
-        self.base_lidar_dim = 1000
+        self.base_lidar_dim = 400
         self.base_frenet_dim = 4
         
         # 3. 自动计算堆叠了多少帧 (例如 4016 / 1004 = 4)

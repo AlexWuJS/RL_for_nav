@@ -4,7 +4,7 @@ import numpy as np
 from gymnasium import spaces
 from geometry_msgs.msg import Twist, Point
 from sensor_msgs.msg import LaserScan
-from gazebo_msgs.msg import ModelState
+from gazebo_msgs.msg import ModelState, ModelStates
 from gazebo_msgs.srv import SetModelState, GetModelState, SpawnModel
 from geometry_msgs.msg import Pose
 from visualization_msgs.msg import Marker, MarkerArray
@@ -21,11 +21,11 @@ class MyCarEnv(gym.Env):
         except rospy.ROSException:
             pass
         
-        self.action_space = spaces.Box(low=np.array([0.0, -1.0]), 
-                                       high=np.array([2.0, 1.0]), 
+        self.action_space = spaces.Box(low=np.array([-1.0, -1.0]),
+                                       high=np.array([2.0, 1.0]),
                                        dtype=np.float32)
-        
-        self.n_laser_beams = 1000 
+
+        self.n_laser_beams = 400 
         self.max_laser_range = 10.0
         self.map_size = 40.0 
         self.goal_reach_threshold = 0.4
@@ -63,28 +63,38 @@ class MyCarEnv(gym.Env):
 
         # 3-DOF 惯性模型状态 (Surge, Sway, Yaw)
         self.velocity = np.array([0.0, 0.0, 0.0])  # [u, v, r]
+        self.mass = 2.0    # 质量系数
         self.damping = 0.5  # 阻尼系数
         self.dt = 0.1       # 控制周期 (秒)
 
         # 激光雷达异步回调缓存
         self.latest_scan = None
         rospy.Subscriber('/scan', LaserScan, self._scan_callback, queue_size=1)
+
+        # 机器人状态异步回调缓存
+        self.usv_pos = np.array([0.0, 0.0])
+        self.usv_yaw = 0.0
+        rospy.Subscriber('/gazebo/model_states', ModelStates, self._model_states_callback, queue_size=1)
+
+        # ROS 仿真时间频率控制器（锁定 MDP 步长为 10Hz，对应 dt=0.1）
+        self.rate = rospy.Rate(10)
     
     def _get_robot_position(self):
-        try:
-            res = self.get_state_proxy('usv', 'world')
-            pos = res.pose.position
-            ori = res.pose.orientation
-            quaternion = (ori.x, ori.y, ori.z, ori.w)
-            euler = tf.transformations.euler_from_quaternion(quaternion)
-            yaw = euler[2]
-            return np.array([pos.x, pos.y]), yaw
-        except rospy.ServiceException as e:
-            print("get robot position failed: %s" % e)
-            return np.array([0.0, 0.0]), 0.0
+        return self.usv_pos.copy(), self.usv_yaw
 
     def _scan_callback(self, msg):
         self.latest_scan = msg
+
+    def _model_states_callback(self, msg):
+        try:
+            idx = msg.name.index('usv')
+            pos = msg.pose[idx].position
+            ori = msg.pose[idx].orientation
+            self.usv_pos = np.array([pos.x, pos.y])
+            _, _, yaw = tf.transformations.euler_from_quaternion((ori.x, ori.y, ori.z, ori.w))
+            self.usv_yaw = yaw
+        except ValueError:
+            pass
 
     def step(self, action):
         # 1. 解析动作为控制输入 (欠驱动 USV: action[0]=Surge期望, action[1]=Yaw期望)
@@ -94,8 +104,9 @@ class MyCarEnv(gym.Env):
             float(action[1])   # 期望 Yaw 角速度
         ])
 
-        # 2. 惯性结算: V_{t+1} = V_t + (Control_Input - Damping × V_t) × dt
-        self.velocity = self.velocity + (control_input - self.damping * self.velocity) * self.dt
+        # 2. 惯性结算: a = F/m - damping*v, V_{t+1} = V_t + a*dt
+        acceleration = (control_input / self.mass) - (self.damping * self.velocity)
+        self.velocity = self.velocity + acceleration * self.dt
 
         # 3. 发布带有惯性的实际速度指令
         vel_msg = Twist()
@@ -177,7 +188,7 @@ class MyCarEnv(gym.Env):
             print(f"Out of bounds! Deviated {frenet_d:.2f}m from path.")
             
         elif distance_remaining < self.goal_reach_threshold:
-            reward = +200.0
+            reward = +1000.0
             terminated = True
             print("Goal reached!")
             
@@ -187,16 +198,16 @@ class MyCarEnv(gym.Env):
             frenet_amplification_factor = 2.5
             reward += frenet_reward_dict['total'] * frenet_amplification_factor
 
-            # 7.3 安全避障惩罚（指数级，k=7.2确保0.25m处惩罚<-50）
-            safe_distance = 0.8
+            # 7.3 安全避障惩罚（收缩边界，k=5.0，上限10.0）
+            safe_distance = 0.45
             if min_laser_dist < safe_distance:
-                k = 7.2
+                k = 5.0
                 penalty = math.exp(k * (safe_distance - min_laser_dist)) - 1
-                reward -= min(penalty, 50.0)  # 上限-50
+                reward -= min(penalty, 10.0)  # 上限-10
 
-            # 7.4 动作平滑度约束（新增动作变化率惩罚）
-            surge_change_penalty = abs(action[0] - self.last_action[0]) * 1.5
-            yaw_change_penalty = abs(action[1] - self.last_action[1]) * 1.0
+            # 7.4 动作平滑度约束（削弱系数，降低前期探索阻力）
+            surge_change_penalty = abs(action[0] - self.last_action[0]) * 0.2
+            yaw_change_penalty = abs(action[1] - self.last_action[1]) * 0.1
             reward -= surge_change_penalty + yaw_change_penalty
 
             # 7.5 存活时间惩罚
@@ -213,6 +224,9 @@ class MyCarEnv(gym.Env):
         self.last_frenet_s = frenet_s
         # 10. 更新上一帧动作（用于下一step的动作平滑度惩罚）
         self.last_action = np.array([float(action[0]), float(action[1])])
+
+        # 11. 锁定 MDP 步长为仿真时间 10Hz
+        self.rate.sleep()
 
         return obs, reward, terminated, truncated, {}
 
@@ -237,8 +251,9 @@ class MyCarEnv(gym.Env):
                 self.target_pos = np.array([goal_x, goal_y])
                 break
 
-        # 初始化Frenet坐标系
-        self.frenet_transform = FrenetTransform(self.start_pos, self.target_pos)
+        # 初始化Frenet坐标系（随机曲率增强泛化）
+        curve_offset = np.random.uniform(-2.5, 2.5)
+        self.frenet_transform = FrenetTransform(self.start_pos, self.target_pos, curve_offset=curve_offset)
 
         # 可视化
         self._update_marker("marker_start", start_x, start_y, "Blue")
