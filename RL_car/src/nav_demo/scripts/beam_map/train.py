@@ -2,6 +2,7 @@ import os
 import torch
 from stable_baselines3 import SAC
 from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, BaseCallback
+from stable_baselines3.common.utils import constant_fn
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
 
@@ -34,7 +35,7 @@ class EntropyControlCallback(BaseCallback):
             print(f"   -> 熵系数 (ent_coef) 已强制锁死为: {self.target_ent_coef}")
             
             # 2. 降低学习率（同步修改 SB3 调度器 + PyTorch 优化器）
-            self.model.lr_schedule = lambda _: self.target_lr
+            self.model.lr_schedule = constant_fn(self.target_lr)
             for optimizer in [self.model.actor.optimizer, self.model.critic.optimizer]:
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = self.target_lr
