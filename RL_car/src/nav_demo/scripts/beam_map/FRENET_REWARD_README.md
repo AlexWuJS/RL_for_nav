@@ -182,6 +182,201 @@ python test.py
 
 ---
 
-**文档版本**: 1.0
+**文档版本**: 1.1
 **创建日期**: 2026-02-12
-**分支**: frenet_reward
+**分支**: frenet_reward/USV
+
+---
+
+# Grid环境使用文档
+
+## 概述
+
+Grid环境是一个纯Python实现的Gymnasium强化学习环境，不依赖ROS/Gazebo，可用于快速训练和测试导航策略。
+
+## 环境特性
+
+- **纯Python实现**: 无需ROS/Gazebo，可在任何环境运行
+- **栅格地图**: 支持加载npy格式地图或自动生成测试地图
+- **动态障碍物**: 支持JSON格式的障碍物轨迹
+- **局部视野**: 提供机器人中心的局部栅格patch观测
+- **两阶段训练**: SAC自动熵控制切换到精细调优
+
+## 文件结构
+
+```
+beam_map/
+├── grid_env.py              # Grid环境Gymnasium实现
+├── grid_map_loader.py       # 栅格地图加载器
+├── grid_render.py           # matplotlib渲染器
+├── dynamic_obstacle_manager.py  # 动态障碍物管理器
+├── train.py                 # 训练脚本（支持--env_type切换）
+├── grid_test.py             # 测试脚本
+├── configs/
+│   ├── train_grid.yaml      # 训练配置
+│   └── grid_env.yaml        # 环境配置
+└── example_data/
+    ├── sample_map.npy       # 示例地图(100x100)
+    └── sample_trajectories.json  # 示例障碍物轨迹
+```
+
+## 快速开始
+
+### 1. 训练模型
+
+```bash
+cd RL_car/src/nav_demo/scripts/beam_map
+
+# 基础训练（10万步）
+python train.py --env_type grid --total_timesteps 100000
+
+# 自定义配置
+python train.py --env_type grid \
+    --config configs/train_grid.yaml \
+    --total_timesteps 200000
+```
+
+### 2. 测试模型
+
+```bash
+# 自动检测最佳/最终模型
+python grid_test.py
+
+# 指定模型路径
+python grid_test.py --model ./training_grid_results/best_model.zip --episodes 5
+
+# 渲染+录像
+python grid_test.py --model ./training_grid_results/best_model.zip --record-gif --gif-path demo.gif
+```
+
+### 3. 随机Agent基线测试
+
+```bash
+# 验证环境正常工作
+python grid_test.py --random
+```
+
+## 配置说明
+
+### 训练配置 (configs/train_grid.yaml)
+
+```yaml
+training:
+  total_timesteps: 100000  # 总训练步数
+  eval_freq: 5000          # 评估频率
+  save_freq: 10000         # 保存频率
+
+sac:
+  learning_rate: 0.0003
+  batch_size: 256
+  buffer_size: 100000
+
+env:
+  map_path: "example_data/sample_map.npy"
+  trajectory_path: "example_data/sample_trajectories.json"
+  robot_radius: 0.15
+  v_max: 1.0
+  w_max: 1.0
+  patch_size: 21
+```
+
+### 环境配置 (configs/grid_env.yaml)
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| map_resolution | 地图分辨率(米/格) | 0.1 |
+| robot_radius | 机器人半径(米) | 0.15 |
+| v_max | 最大线速度(米/秒) | 1.0 |
+| w_max | 最大角速度(弧度/秒) | 1.0 |
+| patch_size | 局部视野大小(奇数) | 21 |
+| dt | 仿真时间步长(秒) | 0.1 |
+| goal_reward | 到达目标奖励 | 100.0 |
+| collision_penalty | 碰撞惩罚 | -100.0 |
+
+## 观测空间
+
+观测向量由以下部分组成：
+
+1. **局部栅格patch** (21x21 = 441维): 机器人中心的局部地图
+2. **目标信息** (2维): 目标距离和相对朝向
+3. **机器人状态** (2维): 当前线速度和角速度
+4. **最近障碍物** (3x4 = 12维): 3个最近动态障碍物的相对位置
+
+**总维度**: 457维
+
+## 动作空间
+
+- Box([v_min, w_min], [v_max, w_max])
+- v: [0.0, 1.0] 米/秒
+- w: [-1.0, 1.0] 弧度/秒
+
+## 奖励函数
+
+| 奖励项 | 值 | 说明 |
+|--------|-----|------|
+| goal_reward | +100 | 到达目标点 |
+| collision_penalty | -100 | 发生碰撞 |
+| step_penalty | -0.1 | 每步轻微惩罚 |
+| progress_weight | +2.0 | 靠近目标奖励 |
+| safe_distance_penalty | -5.0 | 低于安全距离惩罚 |
+
+## ROS/Gazebo环境切换
+
+```bash
+# 训练Gazebo环境
+python train.py --env_type gazebo --total_timesteps 100000
+
+# 训练Grid环境
+python train.py --env_type grid --total_timesteps 100000
+```
+
+## 动态障碍物轨迹格式
+
+```json
+{
+  "dt": 0.1,
+  "loop": true,
+  "obstacles": [
+    {
+      "id": 0,
+      "radius": 0.25,
+      "trajectory": [
+        {"t": 0, "x": 1.0, "y": 2.0},
+        {"t": 1, "x": 2.0, "y": 2.0},
+        {"t": 2, "x": 3.0, "y": 2.0}
+      ]
+    }
+  ]
+}
+```
+
+## 输出文件
+
+训练完成后在 `training_grid_results/` 目录生成：
+
+- `best_model.zip` - 最佳模型
+- `final_model.zip` - 最终模型
+- `checkpoints/` - 中间检查点
+- `evaluations/` - 评估日志
+
+## 命令行参数
+
+### train.py
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| --env_type | 环境类型(gazebo/grid) | grid |
+| --config | 配置文件路径 | configs/train_grid.yaml |
+| --total_timesteps | 总训练步数 | 100000 |
+| --seed | 随机种子 | 42 |
+
+### grid_test.py
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| --model | 模型路径 | 自动检测 |
+| --episodes | 测试回合数 | 3 |
+| --no-render | 禁用渲染 | False |
+| --record-gif | 录制GIF | False |
+| --gif-path | GIF输出路径 | test_traj.gif |
+| --random | 随机Agent测试 | False |

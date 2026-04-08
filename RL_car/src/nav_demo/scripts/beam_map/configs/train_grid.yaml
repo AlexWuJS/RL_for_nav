@@ -1,0 +1,61 @@
+# Grid Environment Training Configuration
+
+# 训练通用配置
+training:
+  total_timesteps: 100000  # 总训练步数
+  seed: 42  # 随机种子
+  device: "auto"  # cuda 或 cpu 或 auto
+
+  # 日志配置
+  log_dir: "training_results_grid"
+  save_freq: 1000  # 保存频率（步）
+  eval_freq: 5000  # 评估频率（步）
+  n_eval_episodes: 10  # 每次评估的episode数
+
+# SAC超参数
+sac:
+  learning_rate: 0.0003
+  batch_size: 256
+  buffer_size: 100000
+  gamma: 0.99  # 折扣因子
+  tau: 0.005  # 软更新系数
+  train_freq: 1  # 训练频率
+  gradient_steps: 1  # 每次收集后的梯度步数
+
+  # 探索配置
+  exploration_initial_eps: 1.0
+  exploration_final_eps: 0.05
+  exploration_fraction: 0.2
+
+  # 目标网络更新
+  target_update_interval: 1
+
+  # 策略配置
+  policy_kwargs:
+    net_arch:
+      - 256
+      - 256
+
+# 环境配置（会传递给GridDynamicObstacleEnv）
+env:
+  map_path: "example_data/sample_map.npy"
+  trajectory_path: "example_data/sample_trajectories.json"
+  robot_radius: 0.15
+  v_max: 1.0
+  w_max: 1.0
+  dynamic_obstacle_radius: 0.25
+  use_local_patch: true
+  patch_size: 21
+  include_dynamic_in_patch: true
+  include_nearest_dynamic: true
+  nearest_dynamic_k: 3
+  dt: 0.1
+  max_episode_steps: 500
+
+  # 奖励参数
+  goal_reward: 100.0
+  collision_penalty: -100.0
+  step_penalty: -0.1
+  progress_weight: 2.0
+  safe_distance: 0.5
+  safe_distance_penalty: -5.0

@@ -1,0 +1,47 @@
+# Grid Dynamic Obstacle Environment Configuration
+
+# 地图配置
+map:
+  resolution: 0.1  # 米/格
+  width: 100  # 栅格宽度
+  height: 100  # 栅格高度
+
+# 机器人配置
+robot:
+  radius: 0.15  # 机器人半径（米）
+  v_max: 1.0  # 最大线速度（米/秒）
+  w_max: 1.0  # 最大角速度（弧度/秒）
+
+# 动态障碍物配置
+dynamic_obstacle:
+  radius: 0.25  # 障碍物半径（米）
+  trajectory_path: "example_data/sample_trajectories.json"  # 轨迹文件路径
+  loop: true  # 是否循环播放
+
+# 观测配置
+observation:
+  use_local_patch: true  # 是否使用局部栅格patch
+  patch_size: 21  # patch大小（必须是奇数）
+  include_dynamic_in_patch: true  # 在patch中包含动态障碍物
+  include_nearest_dynamic: true  # 包含最近动态障碍物特征
+  nearest_dynamic_k: 3  # 最近障碍物数量
+
+# 仿真配置
+simulation:
+  dt: 0.1  # 时间步长（秒）
+  max_episode_steps: 500  # 最大episode步数
+
+# 奖励配置
+reward:
+  goal_reward: 100.0  # 到达目标奖励
+  collision_penalty: -100.0  # 碰撞惩罚
+  step_penalty: -0.1  # 每步惩罚
+  progress_weight: 2.0  # 进度奖励权重
+  safe_distance: 0.5  # 安全距离阈值（米）
+  safe_distance_penalty: -5.0  # 低于安全距离的惩罚
+
+# 渲染配置
+render:
+  mode: "human"  # human 或 rgb_array
+  save_traj: false  # 是否保存轨迹GIF
+  traj_output: "training_results_grid/trajectory.gif"
