@@ -1,5 +1,101 @@
 # CHANGELOG_MINIMAX
 
+## 2026-04-09 20:00 配准校准分析 - 默认映射已最优
+
+### 改动文件
+- tools/calibrate_lonlat_to_pixel.py (新增)
+- tools/visualize_processed_scenario.py
+- tools/convert_ais_xls_to_obstacles.py
+
+### 重要结论：pixel-space 叠加不合理
+
+**问题根因已确认**：pixel-space 叠加显示轨迹点与地图不对齐，问题在于**经纬度到像素(col,row)的映射模型**，而非 world-space 显示参数。
+
+当前使用的映射公式：
+```python
+col = (lon - lon_min) / lon_range * width
+row = (lat_max - lat) / lat_range * height
+```
+
+这是最简单的"四角线性映射"，假设经纬度范围严格对应图像四个角。但实际可能：
+1. 图像有裁剪/旋转/投影变形
+2. 经纬度边界与图像边界不一致
+3. 需要更复杂的映射模型（仿射、投影、多项式）
+
+### 新增工具
+
+#### calibrate_lonlat_to_pixel.py
+
+**功能**: 配准校准工具，支持两种模式
+
+**自动优化模式** (`--mode auto`):
+- 使用 scipy.optimize.minimize 寻找最佳 scale_x, scale_y, offset_x, offset_y
+- 目标函数：最大化 free 区域覆盖率，最小化平均到 free 的距离
+- 输出：校准后参数文件
+
+**控制点模式** (`--mode control_points`):
+- 从 yaml/json 读取手工控制点
+- 拟合 affine transform
+- 适合自动优化效果不好时使用
+
+### 校准结果
+
+**自动优化（bounds: scale=[0.5,2.0], offset=[-50,50]）**:
+```
+初始参数: scale_x=1.0, scale_y=1.0, offset_x=0.0, offset_y=0.0
+优化后:   scale_x=1.0, scale_y=1.0, offset_x=0.0, offset_y=0.0
+结果:     未找到改进，初始参数已是局部最优
+```
+
+**校准前后统计对比**:
+| 指标 | 校准前 | 校准后 | 变化 |
+|-----|-------|-------|------|
+| 水域(free)比例 | 36.0% | 36.0% | 0.0% |
+| 陆地(obstacle)比例 | 64.0% | 64.0% | 0.0% |
+| 平均到free距离 | 1.49px | 1.49px | 0.00 |
+| 中位到free距离 | 1.41px | 1.41px | 0.00 |
+
+### 关键发现
+
+1. **默认线性映射已是参数空间局部最优** - scale/offset 调整无法改善
+2. **问题在映射模型本身** - 需要更复杂的变换（仿射/投影/多项式）
+3. **边界贴合度检查**: col<2 或 col>W-3 的点约占 2.2%，row 边界无贴边
+
+### 校准前后对比图
+
+- `overlay_pixel_before.png` - pixel-space 校准前
+- `overlay_pixel_after.png` - pixel-space 校准后（无变化）
+- `overlay_world_before.png` - world-space 校准前
+- `overlay_world_after.png` - world-space 校准后（无变化）
+- `overlay_pixel_comparison.png` - pixel-space 左右对比
+- `overlay_world_comparison.png` - world-space 左右对比
+
+### 验证命令
+
+```bash
+# 运行自动校准
+python3 tools/calibrate_lonlat_to_pixel.py \
+  --map data/processed/maps/navigation_map.npy \
+  --meta data/processed/maps/navigation_map_meta.yaml \
+  --traj data/processed/trajectories/multi_obstacles.json \
+  --mode auto \
+  --out-params params_calibrated.yaml
+
+# 查看校准参数
+cat params_calibrated.yaml
+```
+
+### 下一步建议
+
+由于线性 scale/offset 调整无法改善，考虑：
+
+1. **仿射变换**: 加入 rotation 参数
+2. **投影变换**: 考虑地图投影（如 Mercator vs 墨卡托）
+3. **多项式拟合**: 使用 2D 多项式而非线性
+4. **控制点配准**: 手工指定 3-5 个 (lon,lat) -> (col,row) 对应关系
+
+---
+
 ## 2026-04-09 19:00 full-image vs content_bbox 对比分析
 
 ### 改动文件
