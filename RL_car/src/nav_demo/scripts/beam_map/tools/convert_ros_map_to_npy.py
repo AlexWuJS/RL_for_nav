@@ -163,9 +163,11 @@ def convert_pgm_to_occupancy_grid(pgm_path, yaml_data):
     将PGM图像转换为二值占据栅格
 
     ROS地图语义:
-    - negate: 0表示白色=自由，1表示白色=障碍物
-    - occupied_thresh: 超过此阈值视为占据
-    - free_thresh: 低于此阈值视为自由
+    - negate: 0表示白色=自由(occupied_prob低)，黑色=障碍物(occupied_prob高)
+              1表示相反
+    - occupied_thresh: 占据概率阈值，超过此值视为障碍物
+    - free_thresh: 自由概率阈值，低于此值视为自由
+    - 中间区域视为unknown，第一版保守处理为障碍物
     """
     # 读取PGM
     img = Image.open(pgm_path)
@@ -181,22 +183,34 @@ def convert_pgm_to_occupancy_grid(pgm_path, yaml_data):
     print(f"ROS地图参数:")
     print(f"  negate={negate}, occupied_thresh={occupied_thresh}, free_thresh={free_thresh}")
 
-    # 反转（如果需要）
-    if negate == 1:
-        img_array = 1.0 - img_array
+    # 计算占据概率 occ_prob
+    # occ_prob = 1.0 - pixel_value when negate=0 (白=0=自由, 黑=1=障碍)
+    # occ_prob = pixel_value when negate=1 (白=1=障碍, 黑=0=自由)
+    if negate == 0:
+        # 标准ROS地图: 白色=自由, 黑色=障碍
+        # pixel=1.0(白)->occ_prob=0.0(自由), pixel=0.0(黑)->occ_prob=1.0(障碍)
+        occ_prob = 1.0 - img_array
+    else:
+        # 反转语义
+        occ_prob = img_array
 
-    # 转换为占据栅格: 0=自由, 1=障碍物
+    # 三分类: free / occupied / unknown
+    # free: occ_prob < free_thresh (非常低概率占据 = 高概率自由)
+    # occupied: occ_prob > occupied_thresh (非常高概率占据)
+    # unknown: free_thresh <= occ_prob <= occupied_thresh (中间区域)
+    is_free = occ_prob < free_thresh
+    is_occupied = occ_prob > occupied_thresh
+    is_unknown = ~(is_free | is_occupied)
+
+    # 构建二值占据栅格: 0=free, 1=obstacle
+    # unknown区域保守处理为obstacle
     occupancy = np.zeros_like(img_array, dtype=np.uint8)
+    occupancy[is_occupied] = 1
+    occupancy[is_unknown] = 1  # 保守: unknown当作障碍物
 
-    # 占据区域 (>occupied_thresh)
-    occupancy[img_array > occupied_thresh] = 1
-
-    # 自由区域 (<free_thresh)
-    # 其他区域(未知)保持0(障碍物保守处理)
-
-    free_count = np.sum(img_array < free_thresh)
-    occupied_count = np.sum(img_array > occupied_thresh)
-    unknown_count = width * height - free_count - occupied_count
+    free_count = np.sum(is_free)
+    occupied_count = np.sum(is_occupied)
+    unknown_count = np.sum(is_unknown)
 
     print(f"栅格统计:")
     print(f"  自由像素: {free_count} ({100*free_count/(width*height):.1f}%)")
@@ -285,6 +299,15 @@ def main():
     # 4. 转换为占据栅格
     print("\n[步骤4] 转换为二值占据栅格...")
     occupancy = convert_pgm_to_occupancy_grid(args.map, yaml_data)
+
+    # 4.5 保存debug PNG（用于肉眼确认语义）
+    print("\n[步骤4.5] 保存debug PNG...")
+    debug_png_path = args.out_map.replace('.npy', '_debug.png')
+    # 0=free(白), 1=obstacle(灰)
+    debug_display = (1 - occupancy) * 255  # 反转: free白, obstacle暗
+    debug_img = Image.fromarray(debug_display.astype(np.uint8), mode='L')
+    debug_img.save(debug_png_path)
+    print(f"  已保存debug PNG: {debug_png_path}")
 
     # 5. 保存npy文件
     print("\n[步骤5] 保存npy文件...")

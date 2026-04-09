@@ -43,13 +43,15 @@ def load_trajectories(traj_path: str) -> dict:
 
 
 def world_to_pixel(world_x: float, world_y: float, meta: dict) -> Tuple[int, int]:
-    """世界坐标转像素坐标"""
+    """
+    世界坐标转像素坐标（y-down约定）
+
+    world_y 向下增加，对应图像row向下增加
+    world_x 向右增加，对应图像col向右增加
+    """
     resolution = meta['resolution']
     col = int(world_x / resolution)
     row = int(world_y / resolution)
-    # 注意: 图像y轴向下，所以row方向需要翻转
-    # 实际上世界坐标的y对应图像的row，但图像row向下增加
-    # 在我们的坐标系中，world_y=0 对应图像顶部
     return col, row
 
 
@@ -65,6 +67,10 @@ def visualize_static(map_data: np.ndarray, meta: dict, trajectories: dict,
     """
     创建静态可视化：地图 + 所有轨迹
 
+    坐标约定: world_y 向下增加 (y-down)
+    - array row=0 对应 world_y=0 (顶部)
+    - array row=height-1 对应 world_y=height*resolution (底部)
+
     Args:
         map_data: 占据栅格 (H, W)
         meta: 地图元数据
@@ -76,12 +82,12 @@ def visualize_static(map_data: np.ndarray, meta: dict, trajectories: dict,
 
     height, width = map_data.shape
 
-    # 显示地图（反转使y轴向上）
-    # 0=free显示为浅色，1=obstacle显示为深色
-    display_map = np.flipud(map_data)  # 翻转使y轴向上
+    # 显示地图 - 使用origin='upper'使array顶部对应plot顶部(world_y=0)
+    # 0=free显示为白色，1=obstacle显示为深灰色
     cmap = plt.cm.colors.ListedColormap(['white', 'darkgray'])
-    ax.imshow(display_map, cmap=cmap, extent=[0, width*meta['resolution'], 0, height*meta['resolution']],
-             origin='lower', aspect='auto')
+    ax.imshow(map_data, cmap=cmap,
+             extent=[0, width*meta['resolution'], height*meta['resolution'], 0],
+             origin='upper', aspect='auto')
 
     # 获取障碍物列表
     obstacles = trajectories.get('obstacles', [])
@@ -157,11 +163,11 @@ def visualize_animated(map_data: np.ndarray, meta: dict, trajectories: dict,
     height, width = map_data.shape
     obstacles = trajectories.get('obstacles', [])
 
-    # 显示地图
-    display_map = np.flipud(map_data)
+    # 显示地图 - origin='upper'使array顶部(world_y=0)在plot顶部
     cmap = plt.cm.colors.ListedColormap(['white', 'darkgray'])
-    ax.imshow(display_map, cmap=cmap, extent=[0, width*meta['resolution'], 0, height*meta['resolution']],
-             origin='lower', aspect='auto')
+    ax.imshow(map_data, cmap=cmap,
+             extent=[0, width*meta['resolution'], height*meta['resolution'], 0],
+             origin='upper', aspect='auto')
 
     # 计算最大时间
     max_t = 0
@@ -282,6 +288,9 @@ def count_obstacles_in_water(map_data: np.ndarray, meta: dict, trajectories: dic
     """
     统计障碍物在水上/陆地上的情况
 
+    坐标约定: world_y 向下增加 (y-down)
+    array row=0 对应 world_y=0 (顶部)
+
     Args:
         map_data: 占据栅格
         meta: 地图元数据
@@ -292,7 +301,6 @@ def count_obstacles_in_water(map_data: np.ndarray, meta: dict, trajectories: dic
         统计字典
     """
     resolution = meta['resolution']
-    radius_in_pixels = int(radius / resolution) + 1
 
     stats = {
         'total_points': 0,
@@ -309,7 +317,7 @@ def count_obstacles_in_water(map_data: np.ndarray, meta: dict, trajectories: dic
             stats['total_points'] += 1
             x, y = pt['x'], pt['y']
 
-            # 转像素坐标
+            # 转像素坐标 (y-down: world_y -> row)
             col = int(x / resolution)
             row = int(y / resolution)
 
@@ -319,9 +327,8 @@ def count_obstacles_in_water(map_data: np.ndarray, meta: dict, trajectories: dic
                 continue
 
             # 检查是否是水域（自由区域）
-            # 注意图像已经翻转，所以row需要映射回来
-            map_row = meta['height'] - 1 - row
-            if map_data[map_row, col] == 0:  # 0 = free
+            # 不再flip，因为display和world坐标一致
+            if map_data[row, col] == 0:  # 0 = free
                 stats['in_water'] += 1
             else:
                 stats['on_land'] += 1
