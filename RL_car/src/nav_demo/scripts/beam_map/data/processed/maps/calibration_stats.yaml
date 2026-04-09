@@ -1,0 +1,22 @@
+affine:
+  avg_dist: 1.8313922333328054
+  free_count: 3431
+  free_pct: 34.75486223662885
+  max_dist: 9.219544457292887
+  median_dist: 2.0
+  obstacle_count: 6415
+  obstacle_pct: 64.98176661264182
+  outside_count: 26
+  outside_pct: 0.2633711507293355
+  total: 9872
+linear:
+  avg_dist: 1.491886407370032
+  free_count: 3555
+  free_pct: 36.01094003241491
+  max_dist: 10.63014581273465
+  median_dist: 1.4142135623730951
+  obstacle_count: 6317
+  obstacle_pct: 63.98905996758509
+  outside_count: 0
+  outside_pct: 0.0
+  total: 9872

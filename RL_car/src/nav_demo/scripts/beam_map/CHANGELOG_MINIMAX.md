@@ -1,5 +1,86 @@
 # CHANGELOG_MINIMAX
 
+## 2026-04-09 21:00 控制点仿射校准 - 验证结论
+
+### 改动文件
+- tools/calibrate_with_control_points.py (新增)
+- data/processed/maps/control_points_example.yaml (新增)
+- data/processed/maps/affine_params.yaml (生成)
+- data/processed/maps/calibration_stats.yaml (生成)
+
+### 重要结论：控制点仿射校准未改善映射
+
+**关键发现**: 基于控制点的仿射变换校准**未能改善**轨迹点水域覆盖率，反而略有下降。
+
+### 仿射变换模型
+
+```
+col = a1*lon + b1*lat + c1
+row = a2*lon + b2*lat + c2
+```
+
+**拟合结果** (基于7个控制点):
+```
+col = 729.0574*lon + -0.0737*lat + -87781.1887
+row = -0.0029*lon + -882.2631*lat + 28303.5837
+控制点RMSE: col=3.60px, row=1.17px
+最大残差: 5.84px
+```
+
+### 线性 vs 仿射 统计对比
+
+| 指标 | 线性映射 | 仿射映射 | 变化 |
+|-----|---------|---------|------|
+| 水域(free)比例 | 36.0% | 34.8% | **-1.3%** |
+| 陆地(obstacle)比例 | 64.0% | 65.0% | +1.0% |
+| 地图外(outside) | 0.0% | 0.3% | +0.3% |
+| 平均到free距离 | 1.49px | 1.83px | **+0.34px** |
+| 中位到free距离 | 1.41px | 2.00px | **+0.59px** |
+
+### 根因分析
+
+**控制点仿射校准失败的原因**:
+
+1. **控制点本身来自线性映射** - 所有控制点的 col/row 都是用当前（可能有问题的）线性映射计算的
+2. **没有ground truth验证** - 无法独立确认控制点的正确性
+3. **仿射变换无法修正系统性偏差** - 如果线性映射本身有旋转/缩放偏移，仿射变换可能加剧而非改善
+
+### 生成的文件
+
+| 文件 | 说明 |
+|-----|------|
+| `control_points_example.yaml` | 7个示例控制点（需根据实际地图调整） |
+| `affine_params.yaml` | 拟合的仿射变换参数 |
+| `calibration_stats.yaml` | 线性/仿射统计对比 |
+| `overlay_pixel_linear.png` | pixel-space 线性映射叠加 |
+| `overlay_pixel_affine.png` | pixel-space 仿射映射叠加 |
+| `overlay_world_linear.png` | world-space 线性映射叠加 |
+| `overlay_world_affine.png` | world-space 仿射映射叠加 |
+| `overlay_pixel_comparison.png` | pixel-space 对比图 |
+| `overlay_world_comparison.png` | world-space 对比图 |
+
+### 验证命令
+
+```bash
+python3 tools/calibrate_with_control_points.py \
+    --map data/processed/maps/navigation_map.npy \
+    --meta data/processed/maps/navigation_map_meta.yaml \
+    --traj data/processed/trajectories/multi_obstacles.json \
+    --control-points data/processed/maps/control_points_example.yaml \
+    --out-params data/processed/maps/affine_params.yaml \
+    --out-stats data/processed/maps/calibration_stats.yaml \
+    --save-dir data/processed/maps/
+```
+
+### 下一步建议
+
+1. **获取高分辨率地图** - 现有123m/pixel无法区分精细地形
+2. **使用真正独立的控制点** - 需要在地图上识别真实地标并获取其经纬度
+3. **考虑投影变换** - 可能需要考虑地图投影（如Mercator）而非简单仿射
+4. **训练策略调整** - 考虑接受当前映射，在训练时对自由区域做膨胀处理
+
+---
+
 ## 2026-04-09 20:00 配准校准分析 - 默认映射已最优
 
 ### 改动文件
@@ -650,6 +731,15 @@ python grid_test.py --model ./training_grid_results/final_model.zip --episodes 1
 - `data/processed/maps/navigation_map.npy` - 二值占据栅格
 - `data/processed/maps/navigation_map_meta.yaml` - 元数据
 - `data/processed/maps/navigation_map_debug.png` - 语义确认图
+- `data/processed/maps/control_points_example.yaml` - 控制点示例文件(需按实际地图调整)
+- `data/processed/maps/affine_params.yaml` - 仿射变换参数(基于控制点拟合)
+- `data/processed/maps/calibration_stats.yaml` - 校准统计对比
+- `data/processed/maps/overlay_pixel_linear.png` - pixel-space线性叠加
+- `data/processed/maps/overlay_pixel_affine.png` - pixel-space仿射叠加
+- `data/processed/maps/overlay_world_linear.png` - world-space线性叠加
+- `data/processed/maps/overlay_world_affine.png` - world-space仿射叠加
+- `data/processed/maps/overlay_pixel_comparison.png` - pixel-space对比
+- `data/processed/maps/overlay_world_comparison.png` - world-space对比
 
 ### 轨迹处理
 - `data/processed/trajectories/multi_obstacles.json` - 38个船舶轨迹

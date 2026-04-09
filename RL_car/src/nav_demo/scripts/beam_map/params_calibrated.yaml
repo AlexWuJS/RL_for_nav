@@ -1,0 +1,60 @@
+after:
+  final_objective: 0.7144849200443525
+  flip_y: false
+  initial_objective: 0.7144849200443525
+  offset_x: 0.0
+  offset_y: 0.0
+  optimization_message: ABNORMAL_TERMINATION_IN_LNSRCH
+  optimization_success: false
+  rotation_deg: 0.0
+  scale_x: 1.0
+  scale_y: 1.0
+before:
+  flip_y: false
+  offset_x: 0.0
+  offset_y: 0.0
+  rotation_deg: 0.0
+  scale_x: 1.0
+  scale_y: 1.0
+boundary_after:
+  2: !!python/tuple
+  - 214
+  - 2.1677471636953
+  3: !!python/tuple
+  - 239
+  - 2.4209886547811994
+  5: !!python/tuple
+  - 276
+  - 2.7957860615883305
+boundary_before:
+  2: !!python/tuple
+  - 214
+  - 2.1677471636953
+  3: !!python/tuple
+  - 239
+  - 2.4209886547811994
+  5: !!python/tuple
+  - 276
+  - 2.7957860615883305
+stats_after:
+  avg_dist_to_free: 1.491886407370032
+  edge_2px_count: 0
+  free_count: 3555
+  free_pct: 36.01094003241491
+  median_dist_to_free: 1.4142135623730951
+  obstacle_count: 6317
+  obstacle_pct: 63.98905996758509
+  outside_count: 0
+  outside_pct: 0.0
+  total: 9872
+stats_before:
+  avg_dist_to_free: 1.491886407370032
+  edge_2px_count: 0
+  free_count: 3555
+  free_pct: 36.01094003241491
+  median_dist_to_free: 1.4142135623730951
+  obstacle_count: 6317
+  obstacle_pct: 63.98905996758509
+  outside_count: 0
+  outside_pct: 0.0
+  total: 9872
