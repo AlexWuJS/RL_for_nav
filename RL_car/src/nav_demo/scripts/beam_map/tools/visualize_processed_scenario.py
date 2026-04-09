@@ -84,9 +84,12 @@ def visualize_static(map_data: np.ndarray, meta: dict, trajectories: dict,
 
     # 显示地图 - 使用origin='upper'使array顶部对应plot顶部(world_y=0)
     # 0=free显示为白色，1=obstacle显示为深灰色
+    # 使用resolution_x和resolution_y分别计算extent
+    resolution_x = meta.get('resolution_x', meta.get('resolution', 1.0))
+    resolution_y = meta.get('resolution_y', meta.get('resolution', 1.0))
     cmap = plt.cm.colors.ListedColormap(['white', 'darkgray'])
     ax.imshow(map_data, cmap=cmap,
-             extent=[0, width*meta['resolution'], height*meta['resolution'], 0],
+             extent=[0, width*resolution_x, height*resolution_y, 0],
              origin='upper', aspect='auto')
 
     # 获取障碍物列表
@@ -135,12 +138,113 @@ def visualize_static(map_data: np.ndarray, meta: dict, trajectories: dict,
     ax.set_title(title)
 
     # 添加元数据信息
-    info_text = (f"Map: {meta['width']}x{meta['height']} @ {meta['resolution']:.1f}m/pixel\n"
+    res_x = meta.get('resolution_x', meta.get('resolution'))
+    res_y = meta.get('resolution_y', meta.get('resolution'))
+    info_text = (f"Map: {meta['width']}x{meta['height']} @ x={res_x:.1f}, y={res_y:.1f} m/pixel\n"
                 f"Trajectories: {len(obstacles)} obstacles\n"
                 f"Geographic: lon=[{meta['lon_min']:.4f}, {meta['lon_max']:.4f}], "
                 f"lat=[{meta['lat_min']:.4f}, {meta['lat_max']:.4f}]")
     ax.text(0.02, 0.02, info_text, transform=ax.transAxes, fontsize=8,
            verticalalignment='bottom', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+
+    plt.tight_layout()
+    return fig
+
+
+def visualize_static_pixel_space(map_data: np.ndarray, meta: dict, trajectories: dict,
+                                  obstacles_to_show: List[int] = None,
+                                  title: str = "Pixel-Space Overlay") -> plt.Figure:
+    """
+    在像素坐标系直接叠加轨迹（不做米制转换）
+
+    背景: 原始occupancy raster，imshow用默认像素坐标
+    轨迹: 直接用col,row叠加，不经过world坐标转换
+
+    目的: 如果pixel-space对齐正确而world-space不对，说明问题在resolution/extent
+         如果pixel-space也不对，说明问题在经纬度→像素映射
+
+    Args:
+        map_data: 占据栅格 (H, W)
+        meta: 地图元数据
+        trajectories: 轨迹JSON
+        obstacles_to_show: 要显示的障碍物索引列表
+        title: 图表标题
+    """
+    fig, ax = plt.subplots(1, 1, figsize=(16, 10))
+
+    height, width = map_data.shape
+
+    # 显示地图 - 直接用像素坐标，origin='upper'使array顶部对应plot顶部
+    cmap = plt.cm.colors.ListedColormap(['white', 'darkgray'])
+    ax.imshow(map_data, cmap=cmap, origin='upper')
+
+    # 获取障碍物列表
+    obstacles = trajectories.get('obstacles', [])
+
+    # 选择要显示的障碍物
+    if obstacles_to_show is not None:
+        obstacles = [obstacles[i] for i in obstacles_to_show if i < len(obstacles)]
+
+    # 为每个障碍物绘制轨迹（使用col,row像素坐标）
+    colors = plt.cm.tab20(np.linspace(0, 1, len(obstacles)))
+
+    for i, obs in enumerate(obstacles):
+        traj = obs.get('trajectory', [])
+        if not traj:
+            continue
+
+        # 检查轨迹点是否有col,row
+        if 'col' in traj[0] and 'row' in traj[0]:
+            cols = [pt['col'] for pt in traj]
+            rows = [pt['row'] for pt in traj]
+        else:
+            # 如果没有col,row，用world坐标转换
+            resolution_x = meta.get('resolution_x', meta.get('resolution', 1.0))
+            resolution_y = meta.get('resolution_y', meta.get('resolution', 1.0))
+            cols = [pt['x'] / resolution_x for pt in traj]
+            rows = [pt['y'] / resolution_y for pt in traj]
+
+        # 绘制轨迹线
+        ax.plot(cols, rows, '-', color=colors[i], alpha=0.6, linewidth=1.5)
+
+        # 绘制起点和终点
+        ax.scatter(cols[0], rows[0], marker='o', s=80, c='green', zorder=5, edgecolors='black')
+        ax.scatter(cols[-1], rows[-1], marker='s', s=80, c='red', zorder=5, edgecolors='black')
+
+        # 标注障碍物ID
+        mid_idx = len(cols) // 2
+        ax.annotate(f"{obs['id']}", (cols[mid_idx], rows[mid_idx]),
+                   fontsize=7, ha='center', va='bottom',
+                   bbox=dict(boxstyle='round,pad=0.2', facecolor='yellow', alpha=0.7))
+
+    # 图例
+    legend_elements = [
+        mpatches.Patch(color='white', label='Free'),
+        mpatches.Patch(color='darkgray', label='Obstacle'),
+        plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='green', markersize=8, label='Start'),
+        plt.Line2D([0], [0], marker='s', color='w', markerfacecolor='red', markersize=8, label='End'),
+    ]
+    ax.legend(handles=legend_elements, loc='upper right')
+
+    # 标签
+    ax.set_xlabel('Pixel Column')
+    ax.set_ylabel('Pixel Row')
+    ax.set_title(title)
+
+    # 设置坐标范围
+    ax.set_xlim(0, width)
+    ax.set_ylim(height, 0)  # origin='upper'时y轴向下
+
+    # 添加元数据信息
+    res_x = meta.get('resolution_x', meta.get('resolution'))
+    res_y = meta.get('resolution_y', meta.get('resolution'))
+    info_text = (f"PIXEL-SPACE OVERLAY (no world conversion)\n"
+                f"Map: {width}x{height} pixels\n"
+                f"Trajectories: {len(obstacles)} obstacles\n"
+                f"If this looks correct but world-space doesn't => problem in extent/resolution\n"
+                f"If this also looks wrong => problem in lon/lat -> col/row mapping")
+    ax.text(0.02, 0.02, info_text, transform=ax.transAxes, fontsize=8,
+           verticalalignment='bottom', bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
 
     plt.tight_layout()
     return fig
@@ -164,9 +268,11 @@ def visualize_animated(map_data: np.ndarray, meta: dict, trajectories: dict,
     obstacles = trajectories.get('obstacles', [])
 
     # 显示地图 - origin='upper'使array顶部(world_y=0)在plot顶部
+    resolution_x = meta.get('resolution_x', meta.get('resolution', 1.0))
+    resolution_y = meta.get('resolution_y', meta.get('resolution', 1.0))
     cmap = plt.cm.colors.ListedColormap(['white', 'darkgray'])
     ax.imshow(map_data, cmap=cmap,
-             extent=[0, width*meta['resolution'], height*meta['resolution'], 0],
+             extent=[0, width*resolution_x, height*resolution_y, 0],
              origin='upper', aspect='auto')
 
     # 计算最大时间
@@ -340,26 +446,37 @@ def count_obstacles_in_water(map_data: np.ndarray, meta: dict, trajectories: dic
 def compute_distance_to_nearest_free(map_data: np.ndarray, meta: dict,
                                      trajectories: dict) -> Dict:
     """
-    计算每个轨迹点到最近自由区域的距离（单位：像素）
+    计算每个落在障碍物区域的轨迹点到最近自由像素的距离（单位：像素）
 
-    坐标约定: world_y 向下增加 (y-down)
-    array row=0 对应 world_y=0 (顶部)
+    Bug修复: 使用brute force计算代替有问题的EDT方法
+
+    EDT的正确用法:
+    - distance_transform_edt(input) 计算到最近值为0的像素的距离
+    - 值为0的像素 = source (自身距离=0)
+    - 值为>0的像素 = 需计算距离
+
+    错误用法:
+    - free_mask = (map_data == 0).astype(float) → free=1.0, obstacle=0.0
+    - EDT(0.0) = 0 (source), EDT(1.0) = positive
+    - 所以obstacle(False=0)被当作source，距离=0 ← BUG!
+
+    正确用法:
+    - 我们想计算"obstacle到最近free的距离"
+    - 也就是说: free是目的地，obstacle是起点
+    - EDT(free_mask) where free=0, obstacle>0 → obstacle到free的距离
+    - 即: input = (map_data != 0).astype(float) → obstacle=1.0, free=0.0
+    - 但EDT(1.0)=positive (到最近0的距离), EDT(0.0)=0
+    - 所以EDT(obstacle_mask)[obstacle] = positive (到最近0的距离)
+    - 而obstacle_mask中0的位置是free!
+    - 所以EDT(obstacle_mask)[obstacle] = distance to nearest free ← 正确!
+
+    但实际测试表明这还是有问题，所以用brute force方法直接验证。
 
     Returns:
-        统计字典，包含每种情况的统计
+        统计字典
     """
-    from scipy.ndimage import distance_transform_edt
-
     resolution_x = meta.get('resolution_x', meta.get('resolution', 1.0))
     resolution_y = meta.get('resolution_y', meta.get('resolution', 1.0))
-
-    # 创建自由区域掩码 (True = 自由)
-    free_mask = (map_data == 0)
-
-    # 计算每个障碍物像素到最近自由像素的距离
-    # distance_transform_edt 计算欧几里得距离
-    dist_to_free = distance_transform_edt(free_mask)
-    # dist_to_free[obstacle] = distance in pixels to nearest free pixel
 
     stats = {
         'total_on_land': 0,
@@ -368,13 +485,17 @@ def compute_distance_to_nearest_free(map_data: np.ndarray, meta: dict,
         'median_dist_pixels': 0.0,
         'min_dist_pixels': float('inf'),
         'max_dist_pixels': 0.0,
-        'dist_1px_count': 0,  # 距离<=1像素
-        'dist_2px_count': 0,  # 距离<=2像素
-        'dist_3px_count': 0,  # 距离<=3像素
-        'dist_5px_count': 0,   # 距离<=5像素
-        'dist_10px_count': 0,  # 距离<=10像素
-        'all_land_points': [],  # [(obstacle_id, t, dist_pixels, dist_meters), ...]
+        'dist_1px_count': 0,
+        'dist_2px_count': 0,
+        'dist_3px_count': 0,
+        'dist_5px_count': 0,
+        'dist_10px_count': 0,
     }
+
+    # 获取所有free像素的坐标
+    free_rows, free_cols = np.where(map_data == 0)
+    if len(free_rows) == 0:
+        return stats
 
     distances = []
     obstacles = trajectories.get('obstacles', [])
@@ -394,11 +515,15 @@ def compute_distance_to_nearest_free(map_data: np.ndarray, meta: dict,
             # 只分析在陆地（障碍区）的点
             if map_data[row, col] != 0:
                 stats['total_on_land'] += 1
-                dist_px = dist_to_free[row, col]
-                distances.append(dist_px)
-                dist_m = dist_px * resolution_x  # 用x分辨率作为近似
 
-                stats['all_land_points'].append((obs_id, pt['t'], dist_px, dist_m))
+                # Brute force: 计算到最近free像素的欧几里得距离
+                # 使用vectorized操作加速
+                d_row = free_rows - row
+                d_col = free_cols - col
+                dists = np.sqrt(d_row**2 + d_col**2)
+                dist_px = float(np.min(dists))
+
+                distances.append(dist_px)
 
                 if dist_px <= 1:
                     stats['dist_1px_count'] += 1
@@ -519,7 +644,8 @@ def main():
     parser.add_argument('--map', type=str, required=True, help='Path to .npy map file')
     parser.add_argument('--meta', type=str, required=True, help='Path to map metadata yaml')
     parser.add_argument('--traj', type=str, required=True, help='Path to trajectory JSON')
-    parser.add_argument('--save-png', type=str, default=None, help='Save static visualization as PNG')
+    parser.add_argument('--save-png', type=str, default=None, help='Save world-space static visualization as PNG')
+    parser.add_argument('--save-pixel-png', type=str, default=None, help='Save pixel-space static visualization as PNG')
     parser.add_argument('--save-gif', type=str, default=None, help='Save animation as GIF')
     parser.add_argument('--no-show', action='store_true', help='Do not display plots')
     parser.add_argument('--interval', type=int, default=200, help='Animation frame interval in ms')
@@ -579,13 +705,21 @@ def main():
         print(f"  {dilate_px}px膨胀: 原水域={res['pct_on_water_original']:.1f}% -> 膨胀后={res['pct_on_water_dilated']:.1f}% "
               f"(+{res['newly_freed']}点, {res['newly_freed']/max(1,res['in_bounds'])*100:.1f}%)")
 
-    # 静态可视化
-    print(f"\n[3] 生成静态可视化...")
-    fig = visualize_static(map_data, meta, trajectories,
-                          title="Map with Dynamic Obstacles (Static)")
+    # 静态可视化 - world-space
+    print(f"\n[3] 生成world-space静态可视化...")
+    fig_world = visualize_static(map_data, meta, trajectories,
+                          title="Map with Dynamic Obstacles (World-Space)")
     if args.save_png:
-        fig.savefig(args.save_png, dpi=150, bbox_inches='tight')
-        print(f"  已保存PNG: {args.save_png}")
+        fig_world.savefig(args.save_png, dpi=150, bbox_inches='tight')
+        print(f"  已保存world-space PNG: {args.save_png}")
+
+    # 静态可视化 - pixel-space
+    if args.save_pixel_png:
+        print(f"\n[3.5] 生成pixel-space静态可视化...")
+        fig_pixel = visualize_static_pixel_space(map_data, meta, trajectories,
+                                      title="Pixel-Space Overlay (col=row)")
+        fig_pixel.savefig(args.save_pixel_png, dpi=150, bbox_inches='tight')
+        print(f"  已保存pixel-space PNG: {args.save_pixel_png}")
 
     # 动画可视化
     if args.save_gif:

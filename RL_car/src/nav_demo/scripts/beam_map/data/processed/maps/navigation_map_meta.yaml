@@ -13,8 +13,10 @@ origin:
 - 0.0
 physical_height: 11310.11
 physical_width: 21705.72
-processed_at: '2026-04-09 12:14:04'
-resolution: 123.127612
+processed_at: '2026-04-09 15:02:28'
+resolution_avg: 123.127612
+resolution_x: 120.587314
+resolution_y: 125.667911
 source_pgm: navigation_map_0.50m.pgm
 source_yaml: navigation_map_0.50m.yaml
 width: 180

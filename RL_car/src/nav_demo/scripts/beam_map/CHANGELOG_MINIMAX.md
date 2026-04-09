@@ -1,5 +1,40 @@
 # CHANGELOG_MINIMAX
 
+## 2026-04-09 18:00 Bug修复 - EDT诊断和extent修复
+
+### 改动文件
+- tools/visualize_processed_scenario.py
+
+### Bug修复
+
+#### 1. extent显示bug (visualize_processed_scenario.py)
+
+**问题**: `imshow(... extent=...)` 使用 `meta['resolution']` (单一平均分辨率)，但轨迹按 `x=col*resolution_x`, `y=row*resolution_y` 生成。当 `resolution_x != resolution_y` 时，地图和轨迹会出现几何失真。
+
+**修复**: extent改为 `[0, width*resolution_x, height*resolution_y, 0]`，静态图和动画图均已修复。
+
+#### 2. EDT距离诊断bug (visualize_processed_scenario.py)
+
+**问题**: `distance_transform_edt(free_mask)` 的语义理解错误：
+- `EDT(input)` 中 `value=0` 的像素被视为 source（距离=0）
+- 错误用法: `free_mask = (map_data == 0).astype(float)` → free=1.0, obstacle=0.0
+- obstacle (0.0) 被视为 source，距离=0 ← **BUG!**
+
+**修复**: 改用 brute-force 方法直接计算每个obstacle轨迹点到最近free像素的欧几里得距离：
+```python
+d_row = free_rows - row
+d_col = free_cols - col
+dist_px = min(sqrt(d_row**2 + d_col**2))
+```
+
+#### 3. AIS转换器CSV on_free字段 (convert_ais_xls_to_obstacles.py)
+
+**问题**: 调试CSV的 `on_free/on_obstacle` 字段因地图路径推导错误恒为-1。
+
+**状态**: 不影响核心诊断，后续可修复。
+
+---
+
 ## 2026-04-09 17:00 完整诊断报告 - 轨迹64%在陆地问题根因分析
 
 ### 改动文件
@@ -26,7 +61,7 @@ obstacle_id, t, lon, lat, col, row, x, y, in_bounds, on_free, on_obstacle
 
 **新增函数**: `compute_distance_to_nearest_free()`
 
-**功能**: 对每个落在障碍物区域的轨迹点，计算到最近自由像素的欧几里得距离
+**功能**: 对每个落在障碍物区域的轨迹点，计算到最近自由像素的欧几里得距离（brute-force）
 
 **输出统计**:
 - 平均/中位/最小/最大距离（像素和米）
@@ -45,24 +80,40 @@ obstacle_id, t, lon, lat, col, row, x, y, in_bounds, on_free, on_obstacle
 - 膨胀5px ≈ 615米
 - 膨胀10px ≈ 1.2km
 
-### 诊断结果
+#### 4. Pixel-Space可视化 (visualize_processed_scenario.py)
+
+**新增函数**: `visualize_static_pixel_space()`
+
+**功能**: 在像素坐标系直接叠加轨迹（不做米制转换），用于诊断坐标系对齐问题
+
+**新增CLI参数**: `--save-pixel-png`
+
+### 诊断结果（修正后）
 
 #### 基础统计
-- 地图: 180x90像素, 123.13m/pixel
+- 地图: 180x90像素, x=120.59, y=125.67 m/pixel
 - 轨迹: 38艘船, 9872轨迹点
 - 水域(free): 3555点 (36.0%)
 - 陆地(obstacle): 6317点 (64.0%)
 - 地图外: 0点 (0.0%)
 
-#### 距离诊断结果
+#### 距离诊断结果（修正后 - brute-force）
 - 在陆地障碍区的点数: 6317
-- **平均距离: 0.00像素 (0.0米)**
-- **所有陆地轨迹点距离最近水域都是0像素**
-- 距离<=1px: 6317 (100.0%)
+- 平均距离: 2.33像素 (281.1米)
+- 中位距离: 2.00像素 (241.2米)
+- 最小距离: 1.00像素 (120.6米)
+- 最大距离: 10.63像素 (1281.9米)
+- 距离<=1px: 610 (9.7%)
+- 距离<=2px: 3584 (56.7%)
+- 距离<=3px: 5110 (80.9%)
+- 距离<=5px: 5912 (93.6%)
+- 距离<=10px: 6316 (100.0%)
 
-**解读**: 所有64%的"陆地上"的轨迹点，实际上都在水域边界的**正相邻像素**。这强烈暗示：
-1. 轨迹点确实在地理上接近水域（港口、码头边界）
-2. 地图分辨率为123m/pixel时，单像素即代表一个"不可分割"的水/陆判断
+**解读**:
+- 67.4%的陆地轨迹点在1-2像素(120-240米)内接近水域
+- 93.6%在5像素(600米)内
+- 100%在11像素(1.3km)内
+- 说明轨迹确实在水/陆边界附近，但距离有差异
 
 #### 膨胀验证结果
 | 膨胀级别 | 水域覆盖率 | 新增自由点数 | 占比 |
@@ -74,9 +125,47 @@ obstacle_id, t, lon, lat, col, row, x, y, in_bounds, on_free, on_obstacle
 | 5px | 97.6% | +6082 | +61.6% |
 | 10px | 100.0% | +6317 | +64.0% |
 
-**解读**: 3像素(约370米)膨胀后，94.3%的轨迹点落在自由水域，说明大部分轨迹确实在水域附近。
+**解读**: 3像素(约370米)膨胀后，94.3%的轨迹点落在自由水域。
 
-### 最终判定: C - 数据链正确但分辨率不匹配
+### 最终判定: C - 数据链基本正确但分辨率不匹配
+
+#### 判定依据
+1. **坐标映射正确**: pixel-space和world-space叠加一致
+2. **经纬度→像素转换正确**: col,row计算验证通过
+3. **64%在陆地真实原因**: 船舶轨迹确实经过陆地附近（港口、停靠）
+4. **距离统计有意义**: 2.33像素平均距离说明轨迹不完全在水中
+
+#### 结论
+- **pixel-space叠加**: ✅ 对齐正确
+- **world-space叠加**: ✅ 对齐正确（使用正确的resolution_x/y）
+- **问题根因**: 地图分辨率过粗(123m/pixel)，无法区分精细地形
+- **建议方案**: 获取高分辨率原图(0.5m/pixel → 901x449像素)
+
+### 验证命令
+```bash
+# 1. 重新生成地图meta（包含正确的resolution_x/y）
+python3 tools/convert_ros_map_to_npy.py \
+  --map example_data/maps/navigation_map_0.50m.pgm \
+  --yaml example_data/maps/navigation_map_0.50m.yaml \
+  --out-map data/processed/maps/navigation_map.npy \
+  --out-meta data/processed/maps/navigation_map_meta.yaml
+
+# 2. 重新生成轨迹
+python3 tools/convert_ais_xls_to_obstacles.py \
+  --input-dir data/raw/trajectories \
+  --map-meta data/processed/maps/navigation_map_meta.yaml \
+  --out-json data/processed/trajectories/multi_obstacles.json \
+  --out-debug-csv data/processed/trajectories/trajectory_debug.csv
+
+# 3. 运行完整诊断
+python3 tools/visualize_processed_scenario.py \
+  --map data/processed/maps/navigation_map.npy \
+  --meta data/processed/maps/navigation_map_meta.yaml \
+  --traj data/processed/trajectories/multi_obstacles.json \
+  --save-png overlay_world_debug.png \
+  --save-pixel-png overlay_pixel_debug.png \
+  --no-show
+```
 
 #### 判定依据
 1. **坐标映射正确**: 64%在陆地不是坐标映射错误
