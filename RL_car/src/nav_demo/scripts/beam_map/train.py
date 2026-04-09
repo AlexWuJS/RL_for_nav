@@ -67,10 +67,13 @@ def load_config(config_path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def make_grid_env(rank: int, log_dir: str, config: dict) -> callable:
+def make_grid_env(rank: int, log_dir: str, config: dict, seed: int = None) -> callable:
     """创建Grid环境的工厂函数"""
     def _init():
         from grid_env import GridDynamicObstacleEnv
+
+        # 合并config中的seed和传入的seed
+        env_seed = seed if seed is not None else config.get('seed', None)
 
         env = GridDynamicObstacleEnv(
             map_path=config.get('map_path', None),
@@ -93,7 +96,7 @@ def make_grid_env(rank: int, log_dir: str, config: dict) -> callable:
             safe_distance=config.get('safe_distance', 0.5),
             safe_distance_penalty=config.get('safe_distance_penalty', -5.0),
             render_mode='human' if rank == 0 else None,
-            seed=config.get('seed', None)
+            seed=env_seed
         )
 
         if log_dir:
@@ -132,9 +135,6 @@ if __name__ == "__main__":
 
     # 根据环境类型设置路径
     if args.env_type == 'grid':
-        save_dir = "./training_grid_results/"
-        log_dir = "./logs_grid/"
-        tensorboard_log = "./3_sac_grid_log/"
         config_path = args.config
 
         # 加载配置
@@ -143,7 +143,10 @@ if __name__ == "__main__":
             env_config = full_config.get('env', {})
             sac_config = full_config.get('sac', {})
             training_config = full_config.get('training', {})
-            total_timesteps = training_config.get('total_timesteps', args.total_timesteps)
+            save_dir = training_config.get('save_dir', './training_grid_results/')
+            log_dir = training_config.get('log_dir', './logs_grid/')
+            tensorboard_log = training_config.get('tensorboard_log', './3_sac_grid_log/')
+            total_timesteps = args.total_timesteps  # CLI args override config
             eval_freq = training_config.get('eval_freq', 5000)
             save_freq = training_config.get('save_freq', 10000)
             n_eval_episodes = training_config.get('n_eval_episodes', 5)
@@ -151,6 +154,9 @@ if __name__ == "__main__":
             print(f"Warning: Config file {config_path} not found, using defaults")
             env_config = {}
             sac_config = {}
+            save_dir = './training_grid_results/'
+            log_dir = './logs_grid/'
+            tensorboard_log = './3_sac_grid_log/'
             total_timesteps = args.total_timesteps
             eval_freq = 5000
             save_freq = 10000
@@ -159,11 +165,11 @@ if __name__ == "__main__":
         os.makedirs(save_dir, exist_ok=True)
         os.makedirs(log_dir, exist_ok=True)
 
-        # 创建环境
+        # 创建环境（传入CLI的seed）
         print("正在初始化Grid训练环境...")
-        train_env = DummyVecEnv([make_grid_env(0, log_dir, env_config)])
+        train_env = DummyVecEnv([make_grid_env(0, log_dir, env_config, seed=args.seed)])
         print("正在初始化Grid评估环境...")
-        eval_env = DummyVecEnv([make_grid_env(1, log_dir, env_config)])
+        eval_env = DummyVecEnv([make_grid_env(1, log_dir, env_config, seed=args.seed)])
 
         # Grid环境不需要LidarProcessor，直接使用MLP
         policy_kwargs = sac_config.get('policy_kwargs', dict(

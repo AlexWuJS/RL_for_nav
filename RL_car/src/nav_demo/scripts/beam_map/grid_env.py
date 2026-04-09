@@ -229,15 +229,18 @@ class GridDynamicObstacleEnv(gym.Env):
         dist = np.linalg.norm(self.robot_pos - self.goal_pos)
         return dist < (self.robot_radius + 0.2)  # 目标到达阈值
 
-    def _check_out_of_bounds(self) -> bool:
-        """检查是否超出边界"""
-        wx, wy = self.robot_pos
-        gx, gy = self.grid_map.world_to_grid(wx, wy)
+    def _check_out_of_bounds_xy(self, x: float, y: float) -> bool:
+        """检查指定位置是否超出边界"""
+        gx, gy = self.grid_map.world_to_grid(x, y)
         return not (0 <= gx < self.grid_map.width and 0 <= gy < self.grid_map.height)
+
+    def _check_out_of_bounds(self) -> bool:
+        """检查机器人当前位置是否超出边界"""
+        return self._check_out_of_bounds_xy(self.robot_pos[0], self.robot_pos[1])
 
     def _is_valid_position(self, x: float, y: float) -> bool:
         """检查位置是否有效（可通行且在地图内）"""
-        if self._check_out_of_bounds():
+        if self._check_out_of_bounds_xy(x, y):
             return False
         return not self.grid_map.check_collision_circle(x, y, self.robot_radius)
 
@@ -275,10 +278,10 @@ class GridDynamicObstacleEnv(gym.Env):
 
         self.step_count = 0
         self.last_progress = 0.0
-        self.position_history = [self.robot_pos.copy()]
 
-        # 重置机器人位置
+        # 重置机器人位置（先采样，再记录历史）
         self.robot_pos = self._sample_free_position()
+        self.position_history = [self.robot_pos.copy()]
         self.robot_yaw = self._np_random.uniform(-np.pi, np.pi)
         self.robot_v = 0.0
         self.robot_w = 0.0
@@ -309,20 +312,24 @@ class GridDynamicObstacleEnv(gym.Env):
         self.robot_v = v_desired
         self.robot_w = w_desired
 
-        # 更新机器人位置（简单运动学）
+        # 运动学积分计算新位置
         dx = self.robot_v * np.cos(self.robot_yaw) * self.dt
         dy = self.robot_v * np.sin(self.robot_yaw) * self.dt
         new_pos = self.robot_pos + np.array([dx, dy])
 
-        # 碰撞检测（运动学积分前）
-        collision_before = self._check_static_collision() or self._check_dynamic_collision()
+        # 检查新位置是否有效（基于new_pos判断，不是self.robot_pos）
+        out_of_bounds = self._check_out_of_bounds_xy(new_pos[0], new_pos[1])
 
-        # 如果新位置有效则更新
-        if self._is_valid_position(new_pos[0], new_pos[1]):
+        # 临时更新位置来检查碰撞
+        old_pos = self.robot_pos.copy()
+        self.robot_pos = new_pos
+        collision = self._check_static_collision() or self._check_dynamic_collision()
+        self.robot_pos = old_pos  # 恢复，等会再决定是否真的更新
+
+        # 如果新位置有效（在边界内且无碰撞）才更新
+        if not out_of_bounds and not collision:
             self.robot_pos = new_pos
-        else:
-            # 碰撞或无效位置，停在原地
-            pass
+        # 否则停在原地（不更新position_history，保持原位置）
 
         # 更新朝向
         self.robot_yaw += self.robot_w * self.dt
@@ -348,17 +355,23 @@ class GridDynamicObstacleEnv(gym.Env):
         # 检查终止条件
         terminated = False
         truncated = False
+        collision_occurred = False
+        goal_reached = False
+        out_of_bounds_occurred = False
 
-        # 碰撞终止
-        if self._check_static_collision() or self._check_dynamic_collision():
+        # 碰撞终止（用new_pos判断后的实际位置）
+        collision_occurred = self._check_static_collision() or self._check_dynamic_collision()
+        if collision_occurred:
             terminated = True
 
         # 目标到达终止
-        if self._check_goal_reached():
+        goal_reached = self._check_goal_reached()
+        if goal_reached:
             terminated = True
 
-        # 超出边界终止
-        if self._check_out_of_bounds():
+        # 超出边界终止（基于new_pos判断）
+        if out_of_bounds:
+            out_of_bounds_occurred = True
             terminated = True
 
         # 超时截断
@@ -367,8 +380,10 @@ class GridDynamicObstacleEnv(gym.Env):
 
         obs = self._get_observation()
         info = {
-            'collision': terminated and (self._check_static_collision() or self._check_dynamic_collision()),
-            'goal_reached': self._check_goal_reached(),
+            'collision': collision_occurred,
+            'goal_reached': goal_reached,
+            'out_of_bounds': out_of_bounds_occurred,
+            'timeout': self.step_count >= self.max_episode_steps,
             'step_count': self.step_count,
             'robot_pos': self.robot_pos.copy(),
             'goal_pos': self.goal_pos.copy(),

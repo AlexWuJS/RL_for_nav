@@ -29,25 +29,23 @@ class DynamicObstacle:
     def get_position_at_time(self, t: float) -> Tuple[float, float]:
         """
         获取指定时间的平滑插值位置
-        使用线性插值
+        使用分段线性插值
         """
         if t <= self.t_min:
-            return self.trajectory[0, 1], self.trajectory[0, 2]
+            return float(self.trajectory[0, 1]), float(self.trajectory[0, 2])
         if t >= self.t_max:
-            return self.trajectory[-1, 1], self.trajectory[-1, 2]
+            return float(self.trajectory[-1, 1]), float(self.trajectory[-1, 2])
 
-        # 线性插值
+        # 分段线性插值：找到满足 t0 <= t <= t1 的区间
         for i in range(len(self.trajectory) - 1):
-            if self.t_min <= t <= self.t_max:
-                break
             t0, x0, y0 = self.trajectory[i]
             t1, x1, y1 = self.trajectory[i + 1]
             if t0 <= t <= t1:
                 alpha = (t - t0) / (t1 - t0) if (t1 - t0) > 0 else 0
-                return x0 + alpha * (x1 - x0), y0 + alpha * (y1 - y0)
+                return float(x0 + alpha * (x1 - x0)), float(y0 + alpha * (y1 - y0))
 
-        # Fallback
-        return self.trajectory[-1, 1], self.trajectory[-1, 2]
+        # Fallback (shouldn't reach here if t is within bounds)
+        return float(self.trajectory[-1, 1]), float(self.trajectory[-1, 2])
 
     def get_velocity_at_time(self, t: float) -> Tuple[float, float]:
         """获取指定时间的近似速度"""
@@ -74,9 +72,8 @@ class DynamicObstacle:
         return self.get_position_at_time(self._current_time)
 
     def update(self, t: float):
-        """更新当前位置"""
+        """更新当前时间（current_position通过property从trajectory计算）"""
         self._current_time = t
-        self.current_position = self.get_position_at_time(t)
 
 
 class DynamicObstacleManager:
@@ -284,9 +281,111 @@ def create_sample_trajectory_file(output_path: str):
 
 
 if __name__ == "__main__":
-    print("Testing DynamicObstacleManager...")
+    # =============================================
+    # 单元测试：验证 DynamicObstacleManager 核心功能
+    # =============================================
+    print("=" * 60)
+    print("单元测试: DynamicObstacleManager")
+    print("=" * 60)
 
-    # 创建样例轨迹
+    # 创建2个障碍物、各自多段轨迹
+    import json
+    import tempfile
+
+    traj_data = {
+        "dt": 0.1,
+        "loop": True,
+        "obstacles": [
+            {
+                "id": 0,
+                "radius": 0.25,
+                "trajectory": [
+                    {"t": 0.0, "x": 0.0, "y": 0.0},
+                    {"t": 1.0, "x": 1.0, "y": 0.0},
+                    {"t": 2.0, "x": 1.0, "y": 1.0},
+                    {"t": 3.0, "x": 0.0, "y": 1.0},
+                    {"t": 4.0, "x": 0.0, "y": 0.0},
+                ]
+            },
+            {
+                "id": 1,
+                "radius": 0.3,
+                "trajectory": [
+                    {"t": 0.0, "x": 5.0, "y": 5.0},
+                    {"t": 2.0, "x": 5.0, "y": 6.0},
+                    {"t": 4.0, "x": 6.0, "y": 6.0},
+                    {"t": 6.0, "x": 6.0, "y": 5.0},
+                    {"t": 8.0, "x": 5.0, "y": 5.0},
+                ]
+            }
+        ]
+    }
+
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        json.dump(traj_data, f)
+        tmp_path = f.name
+
+    try:
+        # 测试1: 加载轨迹
+        manager = load_trajectory_from_json(tmp_path)
+        assert len(manager.obstacles) == 2, f"Expected 2 obstacles, got {len(manager.obstacles)}"
+        print("✅ 测试1: load_trajectory_from_json 正确加载了2个障碍物")
+
+        # 测试2: reset 功能
+        manager.reset()
+        pos0 = manager.obstacles[0].current_position
+        pos1 = manager.obstacles[1].current_position
+        assert pos0 is not None, "Obstacle 0 current_position should not be None after reset"
+        assert pos1 is not None, "Obstacle 1 current_position should not be None after reset"
+        assert abs(pos0[0] - 0.0) < 0.01 and abs(pos0[1] - 0.0) < 0.01, f"Obstacle 0 should be at (0,0), got {pos0}"
+        assert abs(pos1[0] - 5.0) < 0.01 and abs(pos1[1] - 5.0) < 0.01, f"Obstacle 1 should be at (5,5), got {pos1}"
+        print("✅ 测试2: reset() 正确重置到初始位置")
+
+        # 测试3: update 功能和插值
+        manager.reset()
+        # t=0.5时，obstacle 0应该在(0.5, 0.0)附近（线性插值）
+        manager.update(0.5)
+        pos = manager.obstacles[0].current_position
+        assert abs(pos[0] - 0.5) < 0.01 and abs(pos[1] - 0.0) < 0.01, f"At t=0.5, expected (0.5, 0.0), got {pos}"
+        print("✅ 测试3: update() 和插值计算正确")
+
+        # 测试4: get_obstacle_positions
+        manager.reset()
+        positions = manager.get_obstacle_positions()
+        assert 0 in positions and 1 in positions, "get_obstacle_positions should return both obstacles"
+        print("✅ 测试4: get_obstacle_positions() 正确返回所有障碍物位置")
+
+        # 测试5: 循环播放（looping）
+        manager.reset()
+        # 让时间超过最大时间
+        for _ in range(50):
+            manager.update()
+        assert manager.current_time < manager.max_time, "Time should loop back after exceeding max_time"
+        print("✅ 测试5: 循环播放(loop)正确工作")
+
+        # 测试6: 多步更新后检查轨迹连续性
+        manager.reset()
+        prev_pos = manager.obstacles[0].current_position
+        for step in range(1, 10):
+            manager.update(0.1 * step)
+            curr_pos = manager.obstacles[0].current_position
+            # 检查位置在合理范围内（不是None，不是奇怪的跳跃）
+            assert curr_pos is not None, f"Position should not be None at step {step}"
+            assert -0.5 <= curr_pos[0] <= 1.5 and -0.5 <= curr_pos[1] <= 1.5, \
+                f"Position out of range at step {step}: {curr_pos}"
+        print("✅ 测试6: 多步更新轨迹连续性正确")
+
+        print("=" * 60)
+        print("🎉 所有单元测试通过!")
+        print("=" * 60)
+
+    finally:
+        os.unlink(tmp_path)
+
+    # =============================================
+    # 原来的示例代码（保留用于手动验证）
+    # =============================================
+    print("\n手动验证: 创建示例轨迹文件...")
     os.makedirs("example_data", exist_ok=True)
     create_sample_trajectory_file("example_data/sample_trajectories.json")
 

@@ -6,11 +6,15 @@ training:
   seed: 42  # 随机种子
   device: "auto"  # cuda 或 cpu 或 auto
 
-  # 日志配置
-  log_dir: "training_results_grid"
-  save_freq: 1000  # 保存频率（步）
+  # 目录配置
+  save_dir: "./training_grid_results/"  # 模型保存目录
+  log_dir: "./logs_grid/"  # Monitor日志目录
+  tensorboard_log: "./3_sac_grid_log/"  # TensorBoard日志目录
+
+  # 保存频率配置
+  save_freq: 10000  # 保存频率（步）
   eval_freq: 5000  # 评估频率（步）
-  n_eval_episodes: 10  # 每次评估的episode数
+  n_eval_episodes: 5  # 每次评估的episode数
 
 # SAC超参数
 sac:
