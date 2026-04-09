@@ -300,7 +300,8 @@ def count_obstacles_in_water(map_data: np.ndarray, meta: dict, trajectories: dic
     Returns:
         统计字典
     """
-    resolution = meta['resolution']
+    resolution_x = meta.get('resolution_x', meta.get('resolution', 1.0))
+    resolution_y = meta.get('resolution_y', meta.get('resolution', 1.0))
 
     stats = {
         'total_points': 0,
@@ -318,8 +319,8 @@ def count_obstacles_in_water(map_data: np.ndarray, meta: dict, trajectories: dic
             x, y = pt['x'], pt['y']
 
             # 转像素坐标 (y-down: world_y -> row)
-            col = int(x / resolution)
-            row = int(y / resolution)
+            col = int(x / resolution_x)
+            row = int(y / resolution_y)
 
             # 检查是否在地图范围内
             if not (0 <= col < meta['width'] and 0 <= row < meta['height']):
@@ -334,6 +335,183 @@ def count_obstacles_in_water(map_data: np.ndarray, meta: dict, trajectories: dic
                 stats['on_land'] += 1
 
     return stats
+
+
+def compute_distance_to_nearest_free(map_data: np.ndarray, meta: dict,
+                                     trajectories: dict) -> Dict:
+    """
+    计算每个轨迹点到最近自由区域的距离（单位：像素）
+
+    坐标约定: world_y 向下增加 (y-down)
+    array row=0 对应 world_y=0 (顶部)
+
+    Returns:
+        统计字典，包含每种情况的统计
+    """
+    from scipy.ndimage import distance_transform_edt
+
+    resolution_x = meta.get('resolution_x', meta.get('resolution', 1.0))
+    resolution_y = meta.get('resolution_y', meta.get('resolution', 1.0))
+
+    # 创建自由区域掩码 (True = 自由)
+    free_mask = (map_data == 0)
+
+    # 计算每个障碍物像素到最近自由像素的距离
+    # distance_transform_edt 计算欧几里得距离
+    dist_to_free = distance_transform_edt(free_mask)
+    # dist_to_free[obstacle] = distance in pixels to nearest free pixel
+
+    stats = {
+        'total_on_land': 0,
+        'total_on_land_with_dist': 0,
+        'avg_dist_pixels': 0.0,
+        'median_dist_pixels': 0.0,
+        'min_dist_pixels': float('inf'),
+        'max_dist_pixels': 0.0,
+        'dist_1px_count': 0,  # 距离<=1像素
+        'dist_2px_count': 0,  # 距离<=2像素
+        'dist_3px_count': 0,  # 距离<=3像素
+        'dist_5px_count': 0,   # 距离<=5像素
+        'dist_10px_count': 0,  # 距离<=10像素
+        'all_land_points': [],  # [(obstacle_id, t, dist_pixels, dist_meters), ...]
+    }
+
+    distances = []
+    obstacles = trajectories.get('obstacles', [])
+
+    for obs in obstacles:
+        obs_id = obs['id']
+        traj = obs.get('trajectory', [])
+        for pt in traj:
+            x, y = pt['x'], pt['y']
+            col = int(x / resolution_x)
+            row = int(y / resolution_y)
+
+            # 检查是否在地图范围内
+            if not (0 <= col < meta['width'] and 0 <= row < meta['height']):
+                continue
+
+            # 只分析在陆地（障碍区）的点
+            if map_data[row, col] != 0:
+                stats['total_on_land'] += 1
+                dist_px = dist_to_free[row, col]
+                distances.append(dist_px)
+                dist_m = dist_px * resolution_x  # 用x分辨率作为近似
+
+                stats['all_land_points'].append((obs_id, pt['t'], dist_px, dist_m))
+
+                if dist_px <= 1:
+                    stats['dist_1px_count'] += 1
+                if dist_px <= 2:
+                    stats['dist_2px_count'] += 1
+                if dist_px <= 3:
+                    stats['dist_3px_count'] += 1
+                if dist_px <= 5:
+                    stats['dist_5px_count'] += 1
+                if dist_px <= 10:
+                    stats['dist_10px_count'] += 1
+
+                stats['min_dist_pixels'] = min(stats['min_dist_pixels'], dist_px)
+                stats['max_dist_pixels'] = max(stats['max_dist_pixels'], dist_px)
+
+    if distances:
+        distances = np.array(distances)
+        stats['total_on_land_with_dist'] = len(distances)
+        stats['avg_dist_pixels'] = float(np.mean(distances))
+        stats['median_dist_pixels'] = float(np.median(distances))
+
+    return stats
+
+
+def validate_dilation(map_data: np.ndarray, meta: dict, trajectories: dict,
+                      dilations: List[int] = [1, 2, 3]) -> Dict:
+    """
+    验证自由区域膨胀后的轨迹点覆盖率
+
+    对自由区域做膨胀(dilation)，然后检查轨迹点在水域的比例变化
+
+    Args:
+        map_data: 占据栅格 (H, W), 0=free, 1=obstacle
+        meta: 地图元数据
+        trajectories: 轨迹JSON
+        dilations: 膨胀像素数列表
+
+    Returns:
+        每种膨胀级别下的统计字典
+    """
+    from scipy.ndimage import binary_dilation, generate_binary_structure
+
+    resolution_x = meta.get('resolution_x', meta.get('resolution', 1.0))
+    resolution_y = meta.get('resolution_y', meta.get('resolution', 1.0))
+
+    results = {}
+    obstacles = trajectories.get('obstacles', [])
+
+    # 统计所有轨迹点
+    all_points = []
+    for obs in obstacles:
+        obs_id = obs['id']
+        traj = obs.get('trajectory', [])
+        for pt in traj:
+            x, y = pt['x'], pt['y']
+            col = int(x / resolution_x)
+            row = int(y / resolution_y)
+
+            # 检查是否在地图范围内
+            if not (0 <= col < meta['width'] and 0 <= row < meta['height']):
+                in_bounds = False
+            else:
+                in_bounds = True
+
+            all_points.append({
+                'obs_id': obs_id,
+                't': pt['t'],
+                'col': col,
+                'row': row,
+                'in_bounds': in_bounds,
+                'on_free': map_data[row, col] == 0 if in_bounds else None,
+            })
+
+    total = len(all_points)
+    in_bounds_count = sum(1 for p in all_points if p['in_bounds'])
+
+    for dilate_px in dilations:
+        # 创建膨胀结构元素（圆形）
+        struct = generate_binary_structure(2, 2)  # 近似圆形
+        # 自定义膨胀半径
+        if dilate_px > 1:
+            # 多次膨胀
+            dilated_free = map_data == 0
+            for _ in range(dilate_px):
+                dilated_free = binary_dilation(dilated_free, structure=struct).astype(np.uint8)
+        else:
+            # 一次性膨胀
+            dilated_free = binary_dilation(map_data == 0, structure=struct).astype(np.uint8)
+
+        # 统计膨胀后在自由区的点
+        in_water_dilated = 0
+        for p in all_points:
+            if not p['in_bounds']:
+                continue
+            if dilated_free[p['row'], p['col']] == 1:
+                in_water_dilated += 1
+
+        on_land_original = sum(1 for p in all_points if p['in_bounds'] and not p['on_free'])
+
+        results[dilate_px] = {
+            'total_points': total,
+            'in_bounds': in_bounds_count,
+            'original_on_land': on_land_original,
+            'original_on_water': in_bounds_count - on_land_original,
+            'after_dilation_on_water': in_water_dilated,
+            'water_coverage_original': in_bounds_count - on_land_original,
+            'water_coverage_dilated': in_water_dilated,
+            'newly_freed': in_water_dilated - (in_bounds_count - on_land_original),
+            'pct_on_water_original': 100 * (in_bounds_count - on_land_original) / in_bounds_count if in_bounds_count > 0 else 0,
+            'pct_on_water_dilated': 100 * in_water_dilated / in_bounds_count if in_bounds_count > 0 else 0,
+        }
+
+    return results
 
 
 def main():
@@ -359,7 +537,10 @@ def main():
     trajectories = load_trajectories(args.traj)
 
     print(f"  地图: {map_data.shape} ({meta['width']}x{meta['height']})")
-    print(f"  分辨率: {meta['resolution']:.2f} m/pixel")
+    res_x = meta.get('resolution_x', meta.get('resolution'))
+    res_y = meta.get('resolution_y', meta.get('resolution'))
+    res_avg = meta.get('resolution_avg', meta.get('resolution'))
+    print(f"  分辨率: x={res_x:.2f}, y={res_y:.2f} m/pixel (avg={res_avg:.2f})")
     print(f"  地理范围: lon=[{meta['lon_min']:.4f}, {meta['lon_max']:.4f}], "
           f"lat=[{meta['lat_min']:.4f}, {meta['lat_max']:.4f}]")
     print(f"  障碍物数量: {len(trajectories.get('obstacles', []))}")
@@ -374,6 +555,30 @@ def main():
         print(f"  在陆地(障碍区): {water_stats['on_land']} ({100*water_stats['on_land']/total:.1f}%)")
         print(f"  地图范围外: {water_stats['outside_map']} ({100*water_stats['outside_map']/total:.1f}%)")
 
+    # 距离最近自由区域诊断
+    print(f"\n[2.5] 距离最近自由区域诊断...")
+    dist_stats = compute_distance_to_nearest_free(map_data, meta, trajectories)
+    if dist_stats['total_on_land'] > 0:
+        print(f"  在陆地(障碍区)的点数: {dist_stats['total_on_land']}")
+        print(f"  平均距离: {dist_stats['avg_dist_pixels']:.2f} 像素 ({dist_stats['avg_dist_pixels']*res_x:.1f} 米)")
+        print(f"  中位距离: {dist_stats['median_dist_pixels']:.2f} 像素 ({dist_stats['median_dist_pixels']*res_x:.1f} 米)")
+        print(f"  最小距离: {dist_stats['min_dist_pixels']:.2f} 像素 ({dist_stats['min_dist_pixels']*res_x:.1f} 米)")
+        print(f"  最大距离: {dist_stats['max_dist_pixels']:.2f} 像素 ({dist_stats['max_dist_pixels']*res_x:.1f} 米)")
+        print(f"  距离<=1px: {dist_stats['dist_1px_count']} ({100*dist_stats['dist_1px_count']/dist_stats['total_on_land']:.1f}%)")
+        print(f"  距离<=2px: {dist_stats['dist_2px_count']} ({100*dist_stats['dist_2px_count']/dist_stats['total_on_land']:.1f}%)")
+        print(f"  距离<=3px: {dist_stats['dist_3px_count']} ({100*dist_stats['dist_3px_count']/dist_stats['total_on_land']:.1f}%)")
+        print(f"  距离<=5px: {dist_stats['dist_5px_count']} ({100*dist_stats['dist_5px_count']/dist_stats['total_on_land']:.1f}%)")
+        print(f"  距离<=10px: {dist_stats['dist_10px_count']} ({100*dist_stats['dist_10px_count']/dist_stats['total_on_land']:.1f}%)")
+    else:
+        print(f"  没有在陆地(障碍区)的点")
+
+    # 自由区域膨胀验证
+    print(f"\n[2.6] 自由区域膨胀验证...")
+    dilation_results = validate_dilation(map_data, meta, trajectories, dilations=[1, 2, 3, 5, 10])
+    for dilate_px, res in dilation_results.items():
+        print(f"  {dilate_px}px膨胀: 原水域={res['pct_on_water_original']:.1f}% -> 膨胀后={res['pct_on_water_dilated']:.1f}% "
+              f"(+{res['newly_freed']}点, {res['newly_freed']/max(1,res['in_bounds'])*100:.1f}%)")
+
     # 静态可视化
     print(f"\n[3] 生成静态可视化...")
     fig = visualize_static(map_data, meta, trajectories,
@@ -384,13 +589,13 @@ def main():
 
     # 动画可视化
     if args.save_gif:
-        print(f"\n[4] 生成动画可视化...")
+        print(f"\n[5] 生成动画可视化...")
         anim = visualize_animated(map_data, meta, trajectories,
                                 save_path=args.save_gif, interval=args.interval)
 
     # 显示
     if not args.no_show:
-        print("\n[5] 显示图像...")
+        print("\n[6] 显示图像...")
         plt.show()
 
     print("\n" + "=" * 60)

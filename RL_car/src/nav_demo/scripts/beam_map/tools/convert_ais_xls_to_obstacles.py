@@ -29,21 +29,21 @@ def load_map_metadata(meta_path: str) -> dict:
     return meta
 
 
-def lonlat_to_world(lon: float, lat: float, meta: dict) -> Tuple[float, float]:
+def lonlat_to_world(lon: float, lat: float, meta: dict) -> Tuple[float, float, int, int]:
     """
     将经纬度转换为地图世界坐标
 
-    坐标映射:
-    - lon -> world_x: lon范围映射到图像x方向
-    - lat -> world_y: lat范围映射到图像y方向（图像y轴向下）
+    坐标映射 (y-down约定):
+    - lon -> world_x: lon范围映射到图像x方向 (col)
+    - lat -> row: lat范围映射到图像y方向 (y-down: lat_max -> row=0)
 
     Args:
         lon: 经度
         lat: 纬度
-        meta: 地图元数据字典
+        meta: 地图元数据字典 (支持 resolution 或 resolution_x/resolution_y)
 
     Returns:
-        (world_x, world_y) 世界坐标（单位：米）
+        (world_x, world_y, col, row) 世界坐标和像素坐标
     """
     lon_min = meta['lon_min']
     lon_max = meta['lon_max']
@@ -51,15 +51,17 @@ def lonlat_to_world(lon: float, lat: float, meta: dict) -> Tuple[float, float]:
     lat_max = meta['lat_max']
     width = meta['width']
     height = meta['height']
-    resolution = meta['resolution']
+
+    # 使用 resolution_x/resolution_y（如果存在）或 fallback 到 resolution
+    resolution_x = meta.get('resolution_x', meta.get('resolution', 1.0))
+    resolution_y = meta.get('resolution_y', meta.get('resolution', 1.0))
 
     # 经纬度范围
     lon_range = lon_max - lon_min
     lat_range = lat_max - lat_min
 
     # 转换到像素坐标 (col, row)
-    # 注意: 图像坐标系中row向下增加，纬度lat向上增加（北半球）
-    # 所以 lat_max -> row=0, lat_min -> row=height
+    # y-down: lat_max (北) -> row=0 (顶部), lat_min (南) -> row=height-1 (底部)
     if lon_range > 0:
         col = (lon - lon_min) / lon_range * width
     else:
@@ -74,13 +76,11 @@ def lonlat_to_world(lon: float, lat: float, meta: dict) -> Tuple[float, float]:
     col = max(0, min(width - 1, col))
     row = max(0, min(height - 1, row))
 
-    # 像素坐标转世界坐标
-    # world_x = col * resolution + origin_x
-    # world_y = row * resolution + origin_y
-    world_x = col * resolution
-    world_y = row * resolution
+    # 像素坐标转世界坐标 (y-down: world_y向下增加)
+    world_x = col * resolution_x
+    world_y = row * resolution_y
 
-    return world_x, world_y
+    return world_x, world_y, int(col), int(row)
 
 
 def is_in_map_bounds(lon: float, lat: float, meta: dict, margin: float = 0.05) -> bool:
@@ -373,14 +373,18 @@ def process_single_file(filepath: str, meta: dict, trajectory_dt: float,
         # 转换坐标到世界坐标
         world_trajectory = []
         for pt in trajectory:
-            wx, wy = lonlat_to_world(pt['lon'], pt['lat'], meta)
+            wx, wy, col, row = lonlat_to_world(pt['lon'], pt['lat'], meta)
             # 应用origin偏移
             wx += world_origin[0]
             wy += world_origin[1]
             world_trajectory.append({
                 't': round(pt['t'], 2),
                 'x': round(wx, 2),
-                'y': round(wy, 2)
+                'y': round(wy, 2),
+                'col': col,
+                'row': row,
+                'lon': round(pt['lon'], 7),
+                'lat': round(pt['lat'], 7),
             })
 
         return {
@@ -465,6 +469,8 @@ def main():
                        help='Output single ship JSON for debugging')
     parser.add_argument('--out-csv', type=str, default=None,
                        help='Output cleaned CSV for debugging')
+    parser.add_argument('--out-debug-csv', type=str, default=None,
+                       help='Output debug CSV with all trajectory points (lon, lat, col, row, x, y, in_bounds, on_free, on_obstacle)')
     parser.add_argument('--dt', type=float, default=None,
                        help='Fixed time step for resampling (seconds). Auto-detect if not specified.')
     parser.add_argument('--radius', type=float, default=10.0,
@@ -484,7 +490,10 @@ def main():
     print(f"\n[步骤1] 加载地图元数据: {args.map_meta}")
     meta = load_map_metadata(args.map_meta)
     print(f"  地图尺寸: {meta['width']} x {meta['height']}")
-    print(f"  分辨率: {meta['resolution']} m/pixel")
+    res_x = meta.get('resolution_x', meta.get('resolution'))
+    res_y = meta.get('resolution_y', meta.get('resolution'))
+    res_avg = meta.get('resolution_avg', meta.get('resolution'))
+    print(f"  分辨率: x={res_x:.2f}, y={res_y:.2f} m/pixel (avg={res_avg:.2f})")
     print(f"  地理范围: lon=[{meta['lon_min']:.4f}, {meta['lon_max']:.4f}], lat=[{meta['lat_min']:.4f}, {meta['lat_max']:.4f}]")
 
     # 分析时间间隔
@@ -547,7 +556,9 @@ def main():
             'map_meta': {
                 'width': meta['width'],
                 'height': meta['height'],
-                'resolution': meta['resolution'],
+                'resolution_x': meta.get('resolution_x', meta.get('resolution')),
+                'resolution_y': meta.get('resolution_y', meta.get('resolution')),
+                'resolution_avg': meta.get('resolution_avg', meta.get('resolution')),
                 'lon_range': [meta['lon_min'], meta['lon_max']],
                 'lat_range': [meta['lat_min'], meta['lat_max']],
             }
@@ -583,6 +594,50 @@ def main():
             for pt in first_obs['trajectory']:
                 writer.writerow([pt['t'], pt['x'], pt['y']])
         print(f"  已保存CSV样例: {args.out_csv}")
+
+    # 保存调试CSV（所有轨迹点）
+    if args.out_debug_csv and obstacles:
+        print(f"\n[步骤6] 保存调试CSV: {args.out_debug_csv}")
+        # 加载地图数据以判断on_free/on_obstacle
+        map_npy_path = args.out_json.replace('/trajectories/', '/maps/').replace('.json', '.npy')
+        if os.path.exists(map_npy_path):
+            map_data = np.load(map_npy_path)
+            print(f"  加载地图: {map_npy_path}")
+        else:
+            print(f"  警告: 找不到地图文件 {map_npy_path}，on_free/on_obstacle将无法判断")
+            map_data = None
+
+        import csv
+        with open(args.out_debug_csv, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['obstacle_id', 't', 'lon', 'lat', 'col', 'row', 'x', 'y', 'in_bounds', 'on_free', 'on_obstacle'])
+            for obs in obstacles:
+                obs_id = obs['id']
+                for pt in obs['trajectory']:
+                    col = pt['col']
+                    row = pt['row']
+                    in_bounds = 0 <= col < meta['width'] and 0 <= row < meta['height']
+                    if map_data is not None and in_bounds:
+                        cell_value = map_data[row, col]
+                        on_free = 1 if cell_value == 0 else 0
+                        on_obstacle = 1 if cell_value == 1 else 0
+                    else:
+                        on_free = -1
+                        on_obstacle = -1
+                    writer.writerow([
+                        obs_id,
+                        pt['t'],
+                        pt.get('lon', ''),
+                        pt.get('lat', ''),
+                        col,
+                        row,
+                        pt['x'],
+                        pt['y'],
+                        1 if in_bounds else 0,
+                        on_free,
+                        on_obstacle
+                    ])
+        print(f"  已保存调试CSV，包含 {sum(len(o['trajectory']) for o in obstacles)} 个轨迹点")
 
     # 打印摘要
     print("\n" + "=" * 60)

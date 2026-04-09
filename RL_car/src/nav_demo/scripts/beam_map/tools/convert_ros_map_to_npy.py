@@ -280,20 +280,27 @@ def main():
 
                 if diff_w > 50 or diff_h > 50:
                     print(f"  ⚠️ 严重偏差! yaml中的resolution={yaml_resolution}可能是错误的")
-                    print(f"  ✅ 采用基于物理尺寸/地理范围的估算分辨率: {res_avg:.4f} m/pixel")
+                    print(f"  ✅ 采用基于物理尺寸/地理范围的估算分辨率: x={res_x:.4f}, y={res_y:.4f} m/pixel")
 
-        # 采用估算分辨率
-        final_resolution = res_avg
+        # 采用估算分辨率（分开x/y）
+        final_resolution_x = res_x
+        final_resolution_y = res_y
+        final_resolution_avg = res_avg
         final_phys_w = phys_w if phys_w else yaml_resolution * img_width
         final_phys_h = phys_h if phys_h else yaml_resolution * img_height
     else:
         # 无法估算，使用yaml中的分辨率
         print(f"\n  ⚠️ 无法从数据估算分辨率，使用yaml中的值: {yaml_resolution}")
-        final_resolution = yaml_resolution
+        final_resolution_x = yaml_resolution
+        final_resolution_y = yaml_resolution
+        final_resolution_avg = yaml_resolution
         final_phys_w = yaml_resolution * img_width
         final_phys_h = yaml_resolution * img_height
 
-    print(f"\n  最终采用的训练分辨率: {final_resolution:.4f} m/pixel")
+    print(f"\n  最终采用的训练分辨率:")
+    print(f"    resolution_x: {final_resolution_x:.4f} m/pixel")
+    print(f"    resolution_y: {final_resolution_y:.4f} m/pixel")
+    print(f"    resolution_avg: {final_resolution_avg:.4f} m/pixel")
     print(f"  最终物理尺寸: {final_phys_w:.1f} x {final_phys_h:.1f} 米")
 
     # 4. 转换为占据栅格
@@ -325,15 +332,17 @@ def main():
         lon_max = geo_bounds.get('lon_max', 0)
         lat_max = geo_bounds.get('lat_max', 0)
     else:
-        # 根据原点和分辨率计算
+        # 根据原点和分辨率计算（使用x分辨率作为主要参考）
         lon_min = args.origin[0]
         lat_min = args.origin[1]
-        lon_max = lon_min + img_width * final_resolution
-        lat_max = lat_min + img_height * final_resolution
+        lon_max = lon_min + img_width * final_resolution_x
+        lat_max = lat_min + img_height * final_resolution_y
 
     meta_data = {
         'image': os.path.basename(args.out_map),
-        'resolution': float(round(final_resolution, 6)),
+        'resolution_x': float(round(final_resolution_x, 6)),
+        'resolution_y': float(round(final_resolution_y, 6)),
+        'resolution_avg': float(round(final_resolution_avg, 6)),
         'origin': [float(x) for x in args.origin],
         'width': int(img_width),
         'height': int(img_height),
@@ -361,7 +370,7 @@ def main():
     print("地图转换完成!")
     print("=" * 60)
     print(f"  图像尺寸: {img_width} x {img_height}")
-    print(f"  训练分辨率: {final_resolution:.4f} m/pixel")
+    print(f"  训练分辨率: x={final_resolution_x:.4f}, y={final_resolution_y:.4f} m/pixel (avg={final_resolution_avg:.4f})")
     print(f"  物理尺寸: {final_phys_w:.1f} x {final_phys_h:.1f} 米")
     print(f"  地理范围: lon=[{lon_min:.4f}, {lon_max:.4f}], lat=[{lat_min:.4f}, {lat_max:.4f}]")
     print(f"  障碍物占比: {100*np.sum(occupancy)/occupancy.size:.1f}%")
