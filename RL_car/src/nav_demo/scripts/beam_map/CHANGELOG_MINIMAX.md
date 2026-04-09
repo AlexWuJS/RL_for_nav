@@ -1,5 +1,127 @@
 # CHANGELOG_MINIMAX
 
+## 2026-04-09 19:00 full-image vs content_bbox 对比分析
+
+### 改动文件
+- tools/visualize_processed_scenario.py
+- tools/convert_ais_xls_to_obstacles.py
+
+### Bug修复
+
+#### 1. world_to_pixel/pixel_to_world 残留 meta['resolution']
+
+**问题**: `world_to_pixel()` 和 `pixel_to_world()` 仍使用单一 `meta['resolution']`
+
+**修复**:
+```python
+# 修复前:
+resolution = meta['resolution']
+col = int(world_x / resolution)
+row = int(world_y / resolution)
+
+# 修复后:
+resolution_x = meta.get('resolution_x', meta.get('resolution', 1.0))
+resolution_y = meta.get('resolution_y', meta.get('resolution', 1.0))
+col = int(world_x / resolution_x)
+row = int(world_y / resolution_y)
+```
+
+#### 2. 新增 content_bbox 检测逻辑 (convert_ais_xls_to_obstacles.py)
+
+**新增函数**: `detect_content_bbox()`
+```python
+def detect_content_bbox(map_data: np.ndarray, margin: int = 0) -> Tuple[int, int, int, int]:
+    """检测地图内容边界框"""
+    obstacle_mask = (map_data != 0)
+    rows = np.any(obstacle_mask, axis=1)
+    cols = np.any(obstacle_mask, axis=0)
+    # 返回 (left, top, right, bottom)
+```
+
+**新增映射模式**:
+- `lonlat_to_world()` 新增 `mapping_mode` 参数
+- `'full_image'`: 经纬度范围映射到整张图像 (0, 0, width-1, height-1)
+- `'content_bbox'`: 经纬度范围映射到检测到的内容区域
+
+### A/B 对比结果
+
+#### bbox 检测结果
+| 指标 | 值 |
+|-----|-----|
+| Content bbox | left=0, top=0, right=179, bottom=89 |
+| Bbox 尺寸 | 180x90 (与图像相同) |
+| **full_image == content_bbox** | **是 - 内容填满整张图** |
+
+#### 统计对比 (full_image vs content_bbox)
+| 指标 | full_image | content_bbox | 差异 |
+|-----|------------|--------------|------|
+| 水域(free)比例 | 36.0% | 36.0% | 无 |
+| 陆地(obstacle)比例 | 64.0% | 64.0% | 无 |
+| 地图外比例 | 0.0% | 0.0% | 无 |
+| 距边界2px内点数 | 214 (2.2%) | 214 (2.2%) | 无 |
+| 距边界3px内垂直 | 239 (2.4%) | 239 (2.4%) | 无 |
+| 距边界3px内水平 | 0 (0.0%) | 0 (0.0%) | 无 |
+
+#### 距离诊断 (修正后 brute-force)
+| 指标 | 值 |
+|-----|-----|
+| 在陆地障碍区的点数 | 6317 |
+| 平均距离 | 2.33 像素 (281.1 米) |
+| 中位距离 | 2.00 像素 (241.2 米) |
+| 最小距离 | 1.00 像素 (120.6 米) |
+| 最大距离 | 10.63 像素 (1281.9 米) |
+| <=1px | 9.7% |
+| <=2px | 56.7% |
+| <=3px | 80.9% |
+| <=5px | 93.6% |
+| <=10px | 100.0% |
+
+### 最终结论
+
+#### 1. pixel-space 下 full-image vs bbox: 哪个更合理?
+**两者相同** - content bbox 检测结果显示内容填满整张图像 (left=0, top=0, right=179, bottom=89)，所以 full_image 和 content_bbox 映射产生完全相同的结果。
+
+#### 2. bbox 映射后轨迹是否更落在白色区域?
+**否** - 由于 bbox == full_image，映射结果完全相同，36%在白色区域不变。
+
+#### 3. 问题主因是不是"地理范围不该映射到整张图"?
+**不是** - bbox 检测证实内容确实填满整张图，映射到整图是正确的。
+
+#### 4. 问题根因分析
+**当前问题的主因是地图太粗 (123m/pixel)，而非映射方式错误。**
+
+| 可能原因 | 分析结果 |
+|---------|---------|
+| A. 经纬度范围本身不对 | ❌ 范围正确对应180x90图像 |
+| B. 地图裁剪/偏移 | ❌ 内容填满整张图，无偏移 |
+| C. 地图太粗 | ⚠️ **是 - 123m/pixel无法区分精细地形** |
+| D. 组合 | 否 |
+
+#### 关键发现
+1. **content bbox == full image** - 内容检测证实无裁剪/留白
+2. **所有64%落在陆地的点都在水域边界附近** - 平均距离仅2.33像素(约280米)
+3. **2px膨胀可释放51%额外轨迹点** - 说明大部分"陆地"轨迹点距离水域很近
+4. **3px膨胀可达94.3%水域覆盖率** - 进一步验证轨迹在水边
+
+### 输出文件
+- `overlay_pixel_debug_full.png` - pixel-space (full-image)
+- `overlay_pixel_debug_bbox.png` - pixel-space (content-bbox，=full)
+- `overlay_world_debug_full.png` - world-space (full-image)
+- `overlay_world_debug_bbox.png` - world-space (content-bbox，=full)
+
+### 验证命令
+```bash
+python3 tools/visualize_processed_scenario.py \
+  --map data/processed/maps/navigation_map.npy \
+  --meta data/processed/maps/navigation_map_meta.yaml \
+  --traj data/processed/trajectories/multi_obstacles.json \
+  --save-png overlay_world_debug_full.png \
+  --save-pixel-png overlay_pixel_debug_full.png \
+  --no-show
+```
+
+---
+
 ## 2026-04-09 18:00 Bug修复 - EDT诊断和extent修复
 
 ### 改动文件

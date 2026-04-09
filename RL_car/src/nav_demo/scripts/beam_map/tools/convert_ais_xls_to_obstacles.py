@@ -29,7 +29,124 @@ def load_map_metadata(meta_path: str) -> dict:
     return meta
 
 
-def lonlat_to_world(lon: float, lat: float, meta: dict) -> Tuple[float, float, int, int]:
+def detect_content_bbox(map_data: np.ndarray, margin: int = 0) -> Tuple[int, int, int, int]:
+    """
+    检测地图内容边界框
+
+    找到所有非零像素(障碍物)的边界，如果没有障碍物则找非255像素
+
+    Args:
+        map_data: 占据栅格 numpy 数组 (H, W), 0=free, 1=obstacle
+        margin: 边界外扩像素数
+
+    Returns:
+        (left, top, right, bottom) 内容边界框像素坐标
+    """
+    from scipy.ndimage import binary_opening, binary_closing
+
+    # 方法1: 直接找obstacle像素边界
+    obstacle_mask = (map_data != 0)
+
+    # 检查是否有任何obstacle像素
+    if not np.any(obstacle_mask):
+        # 如果没有obstacle，找非255像素（用于原始PGM）
+        non_uniform = (map_data != 255)
+        if np.any(non_uniform):
+            rows = np.any(non_uniform, axis=1)
+            cols = np.any(non_uniform, axis=0)
+        else:
+            rows = cols = np.ones(map_data.shape[0], dtype=bool)
+    else:
+        rows = np.any(obstacle_mask, axis=1)
+        cols = np.any(obstacle_mask, axis=0)
+
+    row_indices = np.where(rows)[0]
+    col_indices = np.where(cols)[0]
+
+    if len(row_indices) == 0 or len(col_indices) == 0:
+        # 全图空白，返回全图
+        return (0, 0, map_data.shape[1]-1, map_data.shape[0]-1)
+
+    top = max(0, row_indices[0] - margin)
+    bottom = min(map_data.shape[0] - 1, row_indices[-1] + margin)
+    left = max(0, col_indices[0] - margin)
+    right = min(map_data.shape[1] - 1, col_indices[-1] + margin)
+
+    return (left, top, right, bottom)
+
+
+def lonlat_to_world(lon: float, lat: float, meta: dict,
+                   mapping_mode: str = 'full_image',
+                   content_bbox: Tuple[int, int, int, int] = None) -> Tuple[float, float, int, int]:
+    """
+    将经纬度转换为地图世界坐标
+
+    坐标映射 (y-down约定):
+    - lon -> world_x: lon范围映射到图像x方向 (col)
+    - lat -> row: lat范围映射到图像y方向 (y-down: lat_max -> row=0)
+
+    支持两种映射模式:
+    - 'full_image': 将经纬度范围映射到整张图像 (0, 0, width-1, height-1)
+    - 'content_bbox': 只映射到检测到的内容区域
+
+    Args:
+        lon: 经度
+        lat: 纬度
+        meta: 地图元数据字典 (支持 resolution 或 resolution_x/resolution_y)
+        mapping_mode: 'full_image' 或 'content_bbox'
+        content_bbox: 内容边界框 (left, top, right, bottom)，仅在 mapping_mode='content_bbox' 时使用
+
+    Returns:
+        (world_x, world_y, col, row) 世界坐标和像素坐标
+    """
+    lon_min = meta['lon_min']
+    lon_max = meta['lon_max']
+    lat_min = meta['lat_min']
+    lat_max = meta['lat_max']
+    width = meta['width']
+    height = meta['height']
+
+    # 使用 resolution_x/resolution_y（如果存在）或 fallback 到 resolution
+    resolution_x = meta.get('resolution_x', meta.get('resolution', 1.0))
+    resolution_y = meta.get('resolution_y', meta.get('resolution', 1.0))
+
+    # 经纬度范围
+    lon_range = lon_max - lon_min
+    lat_range = lat_max - lat_min
+
+    # 根据映射模式确定目标范围
+    if mapping_mode == 'content_bbox' and content_bbox is not None:
+        left, top, right, bottom = content_bbox
+        target_width = right - left + 1
+        target_height = bottom - top + 1
+    else:
+        # full_image 模式
+        left, top = 0, 0
+        right, bottom = width - 1, height - 1
+        target_width = width
+        target_height = height
+
+    # 转换到像素坐标 (col, row)
+    # y-down: lat_max (北) -> row=0 (顶部), lat_min (南) -> row=height-1 (底部)
+    if lon_range > 0:
+        col = (lon - lon_min) / lon_range * target_width + left
+    else:
+        col = left
+
+    if lat_range > 0:
+        row = (lat_max - lat) / lat_range * target_height + top
+    else:
+        row = top
+
+    # 裁剪到有效范围
+    col = max(0, min(width - 1, col))
+    row = max(0, min(height - 1, row))
+
+    # 像素坐标转世界坐标 (y-down: world_y向下增加)
+    world_x = col * resolution_x
+    world_y = row * resolution_y
+
+    return world_x, world_y, int(col), int(row)
     """
     将经纬度转换为地图世界坐标
 
@@ -321,7 +438,9 @@ def resample_trajectory(df: pd.DataFrame, dt: float) -> List[Dict]:
 
 
 def process_single_file(filepath: str, meta: dict, trajectory_dt: float,
-                       obstacle_radius: float, world_origin: Tuple[float, float] = (0.0, 0.0)) -> Optional[Dict]:
+                       obstacle_radius: float, world_origin: Tuple[float, float] = (0.0, 0.0),
+                       mapping_mode: str = 'full_image',
+                       content_bbox: Tuple[int, int, int, int] = None) -> Optional[Dict]:
     """处理单个xls文件，返回障碍物字典"""
     try:
         # 读取xls
@@ -373,7 +492,11 @@ def process_single_file(filepath: str, meta: dict, trajectory_dt: float,
         # 转换坐标到世界坐标
         world_trajectory = []
         for pt in trajectory:
-            wx, wy, col, row = lonlat_to_world(pt['lon'], pt['lat'], meta)
+            wx, wy, col, row = lonlat_to_world(
+                pt['lon'], pt['lat'], meta,
+                mapping_mode=mapping_mode,
+                content_bbox=content_bbox
+            )
             # 应用origin偏移
             wx += world_origin[0]
             wy += world_origin[1]

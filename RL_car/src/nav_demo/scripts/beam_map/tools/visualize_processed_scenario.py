@@ -49,16 +49,18 @@ def world_to_pixel(world_x: float, world_y: float, meta: dict) -> Tuple[int, int
     world_y 向下增加，对应图像row向下增加
     world_x 向右增加，对应图像col向右增加
     """
-    resolution = meta['resolution']
-    col = int(world_x / resolution)
-    row = int(world_y / resolution)
+    resolution_x = meta.get('resolution_x', meta.get('resolution', 1.0))
+    resolution_y = meta.get('resolution_y', meta.get('resolution', 1.0))
+    col = int(world_x / resolution_x)
+    row = int(world_y / resolution_y)
     return col, row
 
 
 def pixel_to_world(pixel_x: int, pixel_y: int, meta: dict) -> Tuple[float, float]:
     """像素坐标转世界坐标"""
-    resolution = meta['resolution']
-    return pixel_x * resolution, pixel_y * resolution
+    resolution_x = meta.get('resolution_x', meta.get('resolution', 1.0))
+    resolution_y = meta.get('resolution_y', meta.get('resolution', 1.0))
+    return pixel_x * resolution_x, pixel_y * resolution_y
 
 
 def visualize_static(map_data: np.ndarray, meta: dict, trajectories: dict,
