@@ -110,7 +110,7 @@ class GridMap:
 
 
 def load_npy_map(path: str) -> GridMap:
-    """从 .npy 文件加载地图"""
+    """从 .npy 文件加载地图（使用默认参数）"""
     if not os.path.exists(path):
         raise FileNotFoundError(f"Map file not found: {path}")
 
@@ -137,7 +137,7 @@ def load_npy_map_with_meta(map_path: str, yaml_path: Optional[str] = None) -> Gr
     occupancy = np.load(map_path)
 
     if yaml_path and os.path.exists(yaml_path):
-        with open(yaml_path, 'r') as f:
+        with open(yaml_path, 'r', encoding='utf-8') as f:
             meta = yaml.safe_load(f)
         resolution = meta.get('resolution', 0.1)
         origin = meta.get('origin', [0.0, 0.0])
@@ -151,6 +151,57 @@ def load_npy_map_with_meta(map_path: str, yaml_path: Optional[str] = None) -> Gr
         origin = (0.0, 0.0)
 
     return GridMap(occupancy=occupancy, resolution=resolution, origin=origin)
+
+
+def load_grid_map(map_path: str, meta_path: Optional[str] = None) -> GridMap:
+    """
+    统一入口：根据文件扩展名自动选择加载方式
+
+    支持的格式:
+    - .npy: 加载npy地图，可选配对yaml元数据
+    - .pgm: 报错提示用户先运行转换脚本
+
+    Args:
+        map_path: 地图文件路径 (.npy 或 .pgm)
+        meta_path: 可选的元数据yaml路径
+
+    Returns:
+        GridMap 实例
+
+    Raises:
+        FileNotFoundError: 文件不存在
+        ValueError: 不支持的格式
+    """
+    if not os.path.exists(map_path):
+        raise FileNotFoundError(f"Map file not found: {map_path}")
+
+    ext = os.path.splitext(map_path)[1].lower()
+
+    if ext == '.npy':
+        # 如果没提供meta_path，尝试在同目录查找
+        if meta_path is None:
+            base = os.path.splitext(map_path)[0]
+            # 尝试 .yaml, _meta.yaml, _meta.yaml 等
+            for candidate in [base + '_meta.yaml', base + '.yaml', map_path.replace('.npy', '_meta.yaml')]:
+                if os.path.exists(candidate):
+                    meta_path = candidate
+                    break
+
+        return load_npy_map_with_meta(map_path, meta_path)
+
+    elif ext == '.pgm':
+        raise ValueError(
+            f"Direct .pgm loading is not supported. "
+            f"Please convert to .npy first using:\n"
+            f"  python tools/convert_ros_map_to_npy.py \\\n"
+            f"    --map {map_path} \\\n"
+            f"    --yaml <对应的yaml文件> \\\n"
+            f"    --out-map <输出.npy路径> \\\n"
+            f"    --out-meta <输出meta.yaml路径>"
+        )
+
+    else:
+        raise ValueError(f"Unsupported map format: {ext}. Supported: .npy, .pgm")
 
 
 def create_simple_map(width: int, height: int, resolution: float = 0.1) -> GridMap:

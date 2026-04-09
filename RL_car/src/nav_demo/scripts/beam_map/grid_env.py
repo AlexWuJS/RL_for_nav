@@ -8,7 +8,7 @@ import numpy as np
 from gymnasium import spaces
 from typing import Optional, Tuple, Dict, Any
 
-from grid_map_loader import GridMap, load_npy_map_with_meta, create_simple_map
+from grid_map_loader import GridMap, load_grid_map, create_simple_map
 from dynamic_obstacle_manager import DynamicObstacleManager, load_trajectory_from_json
 
 
@@ -78,7 +78,7 @@ class GridDynamicObstacleEnv(gym.Env):
 
         # 加载地图
         if map_path:
-            self.grid_map = load_npy_map_with_meta(map_path)
+            self.grid_map = load_grid_map(map_path)
         else:
             # 创建默认测试地图
             self.grid_map = create_simple_map(100, 100, resolution=map_resolution)

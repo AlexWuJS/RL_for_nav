@@ -1,0 +1,20 @@
+free_thresh: 0.196
+height: 90
+image: navigation_map.npy
+lat_max: 32.0819
+lat_min: 31.9803
+lon_max: 120.6447
+lon_min: 120.4147
+negate: 0
+occupied_thresh: 0.65
+origin:
+- 0.0
+- 0.0
+- 0.0
+physical_height: 11310.11
+physical_width: 21705.72
+processed_at: '2026-04-09 11:27:32'
+resolution: 123.127612
+source_pgm: navigation_map_0.50m.pgm
+source_yaml: navigation_map_0.50m.yaml
+width: 180

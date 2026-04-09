@@ -1,4 +1,5 @@
 # Grid Environment Training Configuration
+# 使用真实地图数据
 
 # 训练通用配置
 training:
@@ -42,24 +43,33 @@ sac:
 
 # 环境配置（会传递给GridDynamicObstacleEnv）
 env:
-  map_path: "example_data/sample_map.npy"
-  trajectory_path: "example_data/sample_trajectories.json"
-  robot_radius: 0.15
-  v_max: 1.0
-  w_max: 1.0
-  dynamic_obstacle_radius: 0.25
+  # 真实数据路径
+  map_path: "data/processed/maps/navigation_map.npy"
+  trajectory_path: "data/processed/trajectories/multi_obstacles.json"
+
+  # 机器人参数（单位：米）
+  robot_radius: 50.0  # 机器人半径50m
+  v_max: 20.0  # 最大线速度（米/秒），海船约5-15节(2.5-7.5m/s)
+  w_max: 0.1  # 最大角速度（弧度/秒）
+
+  # 动态障碍物参数
+  dynamic_obstacle_radius: 50.0  # 船舶半径50m（粗分辨率下可见）
+
+  # 观测参数
   use_local_patch: true
-  patch_size: 21
+  patch_size: 21  # 21x21像素局部视野，约2.5km x 2.5km范围
   include_dynamic_in_patch: true
   include_nearest_dynamic: true
   nearest_dynamic_k: 3
-  dt: 0.1
-  max_episode_steps: 500
+
+  # 仿真参数
+  dt: 5.0  # 仿真时间步长（秒），AIS原始间隔120s，但RL需要更细粒度
+  max_episode_steps: 500  # 5s * 500 = 2500s ≈ 42分钟最大episode
 
   # 奖励参数
   goal_reward: 100.0
   collision_penalty: -100.0
   step_penalty: -0.1
   progress_weight: 2.0
-  safe_distance: 0.5
+  safe_distance: 100.0  # 安全距离100m
   safe_distance_penalty: -5.0
