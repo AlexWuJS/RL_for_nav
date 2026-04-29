@@ -82,6 +82,25 @@ class MyCarEnv(gym.Env):
     def _get_robot_position(self):
         return self.usv_pos.copy(), self.usv_yaw
 
+    def get_planner_state(self):
+        """Return a read-only snapshot used by evaluation-time action optimizers."""
+        current_pos, current_yaw = self._get_robot_position()
+        return {
+            "position": current_pos.copy(),
+            "yaw": float(current_yaw),
+            "velocity": self.velocity.copy(),
+            "target_position": self.target_pos.copy(),
+            "frenet_transform": self.frenet_transform,
+            "scan": self.latest_scan,
+            "action_low": self.action_space.low.copy(),
+            "action_high": self.action_space.high.copy(),
+            "dt": float(self.dt),
+            "mass": float(self.mass),
+            "damping": float(self.damping),
+            "max_laser_range": float(self.max_laser_range),
+            "last_action": self.last_action.copy() if hasattr(self, "last_action") else np.zeros(2, dtype=np.float32),
+        }
+
     def _scan_callback(self, msg):
         self.latest_scan = msg
 
@@ -228,7 +247,22 @@ class MyCarEnv(gym.Env):
         # 11. 锁定 MDP 步长为仿真时间 10Hz
         self.rate.sleep()
 
-        return obs, reward, terminated, truncated, {}
+        info = {
+            "current_position": self.current_pos.copy(),
+            "current_yaw": float(self.current_yaw),
+            "target_position": self.target_pos.copy(),
+            "distance_to_goal": float(dist_to_goal),
+            "distance_remaining": float(distance_remaining),
+            "frenet_s": float(frenet_s),
+            "frenet_d": float(frenet_d),
+            "heading_to_path": float(heading_to_path),
+            "min_laser_dist": float(min_laser_dist),
+            "is_success": bool(distance_remaining < self.goal_reach_threshold),
+            "is_collision": bool(min_laser_dist < 0.25),
+            "is_timeout": bool(truncated),
+        }
+
+        return obs, reward, terminated, truncated, info
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
