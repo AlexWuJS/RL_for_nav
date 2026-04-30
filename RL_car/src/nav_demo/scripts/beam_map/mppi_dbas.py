@@ -1,6 +1,6 @@
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -20,6 +20,7 @@ class MPPIDBaSConfig:
     min_noise_scale: float = 0.3
     max_noise_scale: float = 1.5
     max_action_delta: Tuple[float, float] = (0.25, 0.25)
+    mppi_max_action_delta: Tuple[float, float] = (0.50, 0.75)
     action_low: Tuple[float, float] = (-1.0, -1.0)
     action_high: Tuple[float, float] = (2.0, 1.0)
     goal_weight: float = 0.8
@@ -45,6 +46,12 @@ class MPPIDBaSConfig:
     hard_brake_surge: float = 0.0
     fallback_yaw: float = 0.65
     fallback_min_clearance_delta: float = 0.08
+    residual_low: Tuple[float, float] = (-0.25, -0.35)
+    residual_high: Tuple[float, float] = (0.15, 0.35)
+    action_lag_alpha: float = 0.35
+    mppi_min_score_gain: float = 0.05
+    fallback_score_margin: float = 0.02
+    teacher_only: bool = False
     enable_mppi: bool = True
     enable_fallback: bool = True
     seed: Optional[int] = None
@@ -58,17 +65,18 @@ class MPPIDBaSOptimizer:
         self.rng = np.random.default_rng(self.config.seed)
         self.last_action = np.zeros(2, dtype=np.float32)
         self.last_noise_scale = 1.0
+        self.best_sequence: Optional[np.ndarray] = None
 
     def reset(self) -> None:
         self.last_action = np.zeros(2, dtype=np.float32)
         self.last_noise_scale = 1.0
+        self.best_sequence = None
 
     def optimize(self, base_action: Any, planner_state: Dict[str, Any]) -> Tuple[np.ndarray, Dict[str, float]]:
         cfg = self.config
         base_action = self._clip_action(base_action)
         radar = self._scan_risk_summary(planner_state)
         obstacles = self._scan_to_obstacle_points(planner_state)
-        position = np.asarray(planner_state["position"], dtype=float)
         current_min_dist = radar["global_min"]
         base_sequence = np.tile(base_action.reshape(1, 2), (cfg.horizon, 1))
         base_metrics = self._rollout_metrics(base_sequence, base_action, planner_state, obstacles)
@@ -83,102 +91,348 @@ class MPPIDBaSOptimizer:
                 "base_safe",
             )
 
-        if not cfg.enable_mppi:
-            return self._fallback_or_base(base_action, base_metrics, planner_state, obstacles, radar, "mppi_disabled")
-
-        noise_scale = self._adaptive_noise_scale(current_min_dist)
-        noise_std = np.asarray(cfg.base_noise_std, dtype=float) * noise_scale
-        max_delta = np.asarray(cfg.max_action_delta, dtype=float)
-        lower = np.maximum(np.asarray(cfg.action_low, dtype=float), base_action - max_delta)
-        upper = np.minimum(np.asarray(cfg.action_high, dtype=float), base_action + max_delta)
-
-        noise = self.rng.normal(
-            loc=0.0,
-            scale=noise_std,
-            size=(cfg.num_samples, cfg.horizon, 2),
-        )
-        noise[:, 0, :] = np.clip(noise[:, 0, :], -max_delta, max_delta)
-        action_sequences = np.clip(base_action.reshape(1, 1, 2) + noise, lower, upper)
-
-        costs = np.zeros(cfg.num_samples, dtype=float)
-        min_distances = np.full(cfg.num_samples, float(planner_state.get("max_laser_range", 10.0)), dtype=float)
-        dbas_costs = np.zeros(cfg.num_samples, dtype=float)
-        ttc_costs = np.zeros(cfg.num_samples, dtype=float)
-        out_of_bounds_costs = np.zeros(cfg.num_samples, dtype=float)
-
-        for sample_idx in range(cfg.num_samples):
-            sample_cost, sample_min_dist, sample_dbas_cost, sample_ttc_cost, sample_oob_cost = self._rollout_cost(
-                action_sequences[sample_idx],
-                base_action,
-                planner_state,
-                obstacles,
-            )
-            costs[sample_idx] = sample_cost
-            min_distances[sample_idx] = sample_min_dist
-            dbas_costs[sample_idx] = sample_dbas_cost
-            ttc_costs[sample_idx] = sample_ttc_cost
-            out_of_bounds_costs[sample_idx] = sample_oob_cost
-
-        weights = self._mppi_weights(costs)
-        correction = np.sum(weights[:, None] * noise[:, 0, :], axis=0)
-        correction = np.clip(correction, -max_delta, max_delta)
-        optimized_action = np.clip(base_action + correction, lower, upper)
-        optimized_action = self._clip_action(optimized_action)
-        candidate_sequence = np.tile(optimized_action.reshape(1, 2), (cfg.horizon, 1))
-        candidate_metrics = self._rollout_metrics(candidate_sequence, base_action, planner_state, obstacles)
-        accept, decision_reason = self._accept_candidate(base_metrics, candidate_metrics, optimized_action, base_action)
         fallback_action = base_action
         fallback_metrics = base_metrics
         fallback_active = False
         fallback_accept = False
-        action_source = "mppi" if accept else "sac"
-        executed_action = optimized_action if accept else base_action
-
-        if not accept and cfg.enable_fallback and self._fallback_should_run(base_metrics, radar):
+        fallback_reason = "fallback_not_needed"
+        if cfg.enable_fallback and self._fallback_should_run(base_metrics, radar):
             fallback_active = True
             fallback_action = self._fallback_action(base_action, planner_state, radar)
             fallback_sequence = np.tile(fallback_action.reshape(1, 2), (cfg.horizon, 1))
             fallback_metrics = self._rollout_metrics(fallback_sequence, base_action, planner_state, obstacles)
             fallback_accept, fallback_reason = self._accept_fallback(base_metrics, fallback_metrics)
-            if fallback_accept:
-                executed_action = fallback_action
-                action_source = "fallback"
-                decision_reason = fallback_reason
-            else:
-                decision_reason = f"{decision_reason}|{fallback_reason}"
+
+        if not cfg.enable_mppi:
+            executed = fallback_action if fallback_accept else base_action
+            source = "fallback" if fallback_accept else "sac"
+            self.last_action = executed.astype(np.float32)
+            return executed.astype(np.float32), self._make_decision_debug(
+                base_action=base_action,
+                executed_action=executed,
+                candidate_action=base_action,
+                base_metrics=base_metrics,
+                candidate_metrics=base_metrics,
+                fallback_action=fallback_action,
+                fallback_metrics=fallback_metrics,
+                radar=radar,
+                costs=np.array([base_metrics["total_cost"]]),
+                min_distances=np.array([base_metrics["min_distance"]]),
+                dbas_costs=np.array([base_metrics["dbas_cost"]]),
+                ttc_costs=np.array([base_metrics["ttc_cost"]]),
+                out_of_bounds_costs=np.array([base_metrics["out_of_bounds_cost"]]),
+                noise_scale=0.0,
+                mppi_active=False,
+                mppi_accept=False,
+                action_source=source,
+                decision_reason=f"mppi_disabled|{fallback_reason}",
+                fallback_active=fallback_active,
+                fallback_accept=fallback_accept,
+                selected_reason=f"select_{source}",
+                reject_reason="mppi_disabled",
+                prior_type="none",
+                warm_start_used=False,
+                teacher_mppi_would_accept=False,
+            )
+
+        noise_scale = self._adaptive_noise_scale(current_min_dist)
+        action_sequences, prior_names, warm_start_used = self._sample_action_sequences(
+            base_action,
+            fallback_action,
+            noise_scale,
+        )
+        costs, min_distances, dbas_costs, ttc_costs, out_of_bounds_costs, rollout_metrics = self._evaluate_sequences(
+            action_sequences,
+            base_action,
+            planner_state,
+            obstacles,
+        )
+        best_idx = self._best_sequence_index(rollout_metrics)
+        best_sequence = action_sequences[best_idx]
+        optimized_action = self._clip_action(best_sequence[0])
+        candidate_metrics = rollout_metrics[best_idx]
+        prior_type = prior_names[best_idx]
+        self.best_sequence = best_sequence.copy()
+
+        accept, decision_reason = self._accept_candidate_against_baselines(
+            base_metrics,
+            fallback_metrics,
+            candidate_metrics,
+            optimized_action,
+            base_action,
+            fallback_accept,
+        )
+        teacher_mppi_would_accept = bool(accept)
+
+        if accept and not cfg.teacher_only:
+            executed_action = optimized_action
+            action_source = "mppi"
+            selected_reason = "select_mppi"
+            reject_reason = "none"
+        elif fallback_accept:
+            executed_action = fallback_action
+            action_source = "fallback"
+            selected_reason = "select_fallback"
+            reject_reason = "teacher_record_only" if accept and cfg.teacher_only else decision_reason
+        else:
+            executed_action = base_action
+            action_source = "sac"
+            selected_reason = "select_sac"
+            reject_reason = "teacher_record_only" if accept and cfg.teacher_only else decision_reason
 
         self.last_action = executed_action.astype(np.float32)
         self.last_noise_scale = float(noise_scale)
 
-        best_idx = int(np.argmin(costs))
+        debug = self._make_decision_debug(
+            base_action=base_action,
+            executed_action=executed_action,
+            candidate_action=optimized_action,
+            base_metrics=base_metrics,
+            candidate_metrics=candidate_metrics,
+            fallback_action=fallback_action,
+            fallback_metrics=fallback_metrics,
+            radar=radar,
+            costs=costs,
+            min_distances=min_distances,
+            dbas_costs=dbas_costs,
+            ttc_costs=ttc_costs,
+            out_of_bounds_costs=out_of_bounds_costs,
+            noise_scale=noise_scale,
+            mppi_active=True,
+            mppi_accept=accept and not cfg.teacher_only,
+            action_source=action_source,
+            decision_reason=decision_reason,
+            fallback_active=fallback_active,
+            fallback_accept=fallback_accept,
+            selected_reason=selected_reason,
+            reject_reason=reject_reason,
+            prior_type=prior_type,
+            warm_start_used=warm_start_used,
+            teacher_mppi_would_accept=teacher_mppi_would_accept,
+        )
+        return executed_action.astype(np.float32), debug
+
+    def _sample_action_sequences(
+        self,
+        base_action: np.ndarray,
+        fallback_action: np.ndarray,
+        noise_scale: float,
+    ) -> Tuple[np.ndarray, List[str], bool]:
+        cfg = self.config
+        priors = self._prior_sequences(base_action, fallback_action)
+        warm_start_used = False
+        if self.best_sequence is not None and self.best_sequence.shape == (cfg.horizon, 2):
+            shifted = np.vstack([self.best_sequence[1:], base_action.reshape(1, 2)])
+            priors.append(("warm_start", shifted))
+            warm_start_used = True
+
+        per_prior = max(1, int(math.ceil(cfg.num_samples / len(priors))))
+        sequences: List[np.ndarray] = []
+        names: List[str] = []
+        residual_low = np.asarray(cfg.residual_low, dtype=float)
+        residual_high = np.asarray(cfg.residual_high, dtype=float)
+        noise_std = np.asarray(cfg.base_noise_std, dtype=float) * noise_scale
+
+        for prior_name, prior_sequence in priors:
+            clipped_prior = self._clip_sequence(prior_sequence)
+            sequences.append(clipped_prior)
+            names.append(prior_name)
+            for _ in range(per_prior - 1):
+                residual = self.rng.normal(0.0, noise_std, size=(cfg.horizon, 2))
+                residual = np.clip(residual, residual_low, residual_high)
+                residual[0] = np.clip(residual[0], residual_low, residual_high)
+                sequences.append(self._clip_sequence(clipped_prior + residual))
+                names.append(prior_name)
+
+        return np.asarray(sequences[: cfg.num_samples], dtype=float), names[: cfg.num_samples], warm_start_used
+
+    def _prior_sequences(self, base_action: np.ndarray, fallback_action: np.ndarray) -> List[Tuple[str, np.ndarray]]:
+        cfg = self.config
+        brake = self._clip_action([min(base_action[0], cfg.hard_brake_surge), 0.0])
+        left_escape = self._clip_action([min(base_action[0], cfg.fallback_surge), cfg.fallback_yaw])
+        right_escape = self._clip_action([min(base_action[0], cfg.fallback_surge), -cfg.fallback_yaw])
+        return [
+            ("sac_prior", np.tile(base_action.reshape(1, 2), (cfg.horizon, 1))),
+            ("brake_prior", np.tile(brake.reshape(1, 2), (cfg.horizon, 1))),
+            ("left_escape_prior", np.tile(left_escape.reshape(1, 2), (cfg.horizon, 1))),
+            ("right_escape_prior", np.tile(right_escape.reshape(1, 2), (cfg.horizon, 1))),
+            ("fallback_prior", np.tile(fallback_action.reshape(1, 2), (cfg.horizon, 1))),
+        ]
+
+    def _clip_sequence(self, sequence: np.ndarray) -> np.ndarray:
+        return np.clip(
+            np.asarray(sequence, dtype=float),
+            np.asarray(self.config.action_low, dtype=float),
+            np.asarray(self.config.action_high, dtype=float),
+        )
+
+    def _evaluate_sequences(
+        self,
+        action_sequences: np.ndarray,
+        base_action: np.ndarray,
+        planner_state: Dict[str, Any],
+        obstacles: Optional[np.ndarray],
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[Dict[str, float]]]:
+        count = len(action_sequences)
+        costs = np.zeros(count, dtype=float)
+        min_distances = np.full(count, float(planner_state.get("max_laser_range", 10.0)), dtype=float)
+        dbas_costs = np.zeros(count, dtype=float)
+        ttc_costs = np.zeros(count, dtype=float)
+        out_of_bounds_costs = np.zeros(count, dtype=float)
+        metrics: List[Dict[str, float]] = []
+
+        for sample_idx, sequence in enumerate(action_sequences):
+            sample_metrics = self._rollout_metrics(sequence, base_action, planner_state, obstacles)
+            metrics.append(sample_metrics)
+            costs[sample_idx] = sample_metrics["total_cost"]
+            min_distances[sample_idx] = sample_metrics["min_distance"]
+            dbas_costs[sample_idx] = sample_metrics["dbas_cost"]
+            ttc_costs[sample_idx] = sample_metrics["ttc_cost"]
+            out_of_bounds_costs[sample_idx] = sample_metrics["out_of_bounds_cost"]
+
+        return costs, min_distances, dbas_costs, ttc_costs, out_of_bounds_costs, metrics
+
+    def _best_sequence_index(self, metrics: List[Dict[str, float]]) -> int:
+        return min(range(len(metrics)), key=lambda idx: self._selection_key(metrics[idx]))
+
+    def _selection_key(self, metrics: Dict[str, float]) -> Tuple[float, float, float, float, float, float]:
+        return (
+            float(metrics["collision_risk"]),
+            float(metrics["out_of_bounds_risk"]),
+            float(metrics["ttc_cost"]),
+            -float(metrics["min_distance"]),
+            float(metrics["max_lateral_error"]),
+            float(metrics["total_cost"]),
+        )
+
+    def _candidate_score(self, metrics: Dict[str, float]) -> float:
+        collision_penalty = 1000.0 * float(metrics["collision_risk"])
+        oob_penalty = 500.0 * float(metrics["out_of_bounds_risk"])
+        return float(
+            collision_penalty
+            + oob_penalty
+            + 25.0 * metrics["ttc_cost"]
+            - 2.0 * metrics["min_distance"]
+            + 2.0 * metrics["max_lateral_error"]
+            - 0.5 * metrics["progress"]
+            + 0.02 * metrics["total_cost"]
+        )
+
+    def _accept_candidate_against_baselines(
+        self,
+        base_metrics: Dict[str, float],
+        fallback_metrics: Dict[str, float],
+        candidate_metrics: Dict[str, float],
+        optimized_action: np.ndarray,
+        base_action: np.ndarray,
+        fallback_accept: bool,
+    ) -> Tuple[bool, str]:
+        candidate_ok, candidate_reason = self._accept_candidate(
+            base_metrics,
+            candidate_metrics,
+            optimized_action,
+            base_action,
+        )
+        if not candidate_ok:
+            return False, candidate_reason
+
+        if fallback_accept:
+            if candidate_metrics["collision_risk"] > fallback_metrics["collision_risk"]:
+                return False, "reject_worse_than_fallback_collision"
+            if candidate_metrics["out_of_bounds_risk"] > fallback_metrics["out_of_bounds_risk"]:
+                return False, "reject_worse_than_fallback_oob"
+            if candidate_metrics["max_lateral_error"] > fallback_metrics["max_lateral_error"] + self.config.max_lateral_worsening:
+                return False, "reject_worse_than_fallback_oob"
+            if candidate_metrics["progress"] < fallback_metrics["progress"] - self.config.max_progress_loss:
+                return False, "reject_worse_than_fallback_progress"
+            fallback_score = self._candidate_score(fallback_metrics)
+            candidate_score = self._candidate_score(candidate_metrics)
+            if candidate_score > fallback_score - self.config.fallback_score_margin:
+                return False, "reject_not_better_than_fallback"
+
+        base_score = self._candidate_score(base_metrics)
+        candidate_score = self._candidate_score(candidate_metrics)
+        if candidate_score > base_score - self.config.mppi_min_score_gain:
+            return False, "reject_no_score_gain"
+        return True, "accept_candidate_selection"
+
+    def _make_decision_debug(
+        self,
+        base_action: np.ndarray,
+        executed_action: np.ndarray,
+        candidate_action: np.ndarray,
+        base_metrics: Dict[str, float],
+        candidate_metrics: Dict[str, float],
+        fallback_action: np.ndarray,
+        fallback_metrics: Dict[str, float],
+        radar: Dict[str, float],
+        costs: np.ndarray,
+        min_distances: np.ndarray,
+        dbas_costs: np.ndarray,
+        ttc_costs: np.ndarray,
+        out_of_bounds_costs: np.ndarray,
+        noise_scale: float,
+        mppi_active: bool,
+        mppi_accept: bool,
+        action_source: str,
+        decision_reason: str,
+        fallback_active: bool,
+        fallback_accept: bool,
+        selected_reason: str,
+        reject_reason: str,
+        prior_type: str,
+        warm_start_used: bool,
+        teacher_mppi_would_accept: bool,
+    ) -> Dict[str, float]:
         action_delta = executed_action - base_action
-        debug = {
+        fallback_delta = fallback_action - base_action
+        return {
             "raw_action_surge": float(base_action[0]),
             "raw_action_yaw": float(base_action[1]),
             "optimized_action_surge": float(executed_action[0]),
             "optimized_action_yaw": float(executed_action[1]),
-            "candidate_action_surge": float(optimized_action[0]),
-            "candidate_action_yaw": float(optimized_action[1]),
+            "candidate_action_surge": float(candidate_action[0]),
+            "candidate_action_yaw": float(candidate_action[1]),
+            "fallback_action_surge": float(fallback_action[0]),
+            "fallback_action_yaw": float(fallback_action[1]),
             "action_delta_surge": float(action_delta[0]),
             "action_delta_yaw": float(action_delta[1]),
             "action_delta_norm": float(np.linalg.norm(action_delta)),
-            "mppi_cost": float(costs[best_idx]),
-            "mppi_mean_cost": float(np.mean(costs)),
-            "dbas_cost": float(dbas_costs[best_idx]),
-            "dbas_mean_cost": float(np.mean(dbas_costs)),
-            "ttc_cost": float(ttc_costs[best_idx]),
-            "out_of_bounds_cost": float(out_of_bounds_costs[best_idx]),
-            "min_predicted_obstacle_distance": float(min_distances[best_idx]),
-            "current_obstacle_distance": float(current_min_dist),
+            "fallback_delta_norm": float(np.linalg.norm(fallback_delta)),
+            "mppi_cost": float(candidate_metrics["total_cost"]),
+            "mppi_mean_cost": float(np.mean(costs)) if len(costs) else 0.0,
+            "dbas_cost": float(candidate_metrics["dbas_cost"]),
+            "dbas_mean_cost": float(np.mean(dbas_costs)) if len(dbas_costs) else 0.0,
+            "ttc_cost": float(candidate_metrics["ttc_cost"]),
+            "out_of_bounds_cost": float(candidate_metrics["out_of_bounds_cost"]),
+            "min_predicted_obstacle_distance": float(candidate_metrics["min_distance"]),
+            "current_obstacle_distance": float(radar["global_min"]),
             "exploration_noise_scale": float(noise_scale),
-            "mppi_active": True,
-            "mppi_accept": bool(accept),
-            "mppi_reject": bool(not accept),
+            "mppi_active": bool(mppi_active),
+            "mppi_accept": bool(mppi_accept),
+            "mppi_reject": bool(mppi_active and not mppi_accept),
             "mppi_decision_reason": decision_reason,
+            "selected_reason": selected_reason,
+            "reject_reason": reject_reason,
+            "mppi_prior_type": prior_type,
+            "mppi_warm_start_used": bool(warm_start_used),
+            "teacher_mppi_would_accept": bool(teacher_mppi_would_accept),
             "fallback_active": bool(fallback_active),
             "fallback_accept": bool(fallback_accept),
             "action_source": action_source,
             "terminal_source": action_source,
+            "candidate_sac_score": float(self._candidate_score(base_metrics)),
+            "candidate_fallback_score": float(self._candidate_score(fallback_metrics)),
+            "candidate_mppi_score": float(self._candidate_score(candidate_metrics)),
+            "sac_pred_collision": bool(base_metrics["collision_risk"] > 0.0),
+            "fallback_pred_collision": bool(fallback_metrics["collision_risk"] > 0.0),
+            "mppi_pred_collision": bool(candidate_metrics["collision_risk"] > 0.0),
+            "sac_pred_out_of_bounds": bool(base_metrics["out_of_bounds_risk"] > 0.0),
+            "fallback_pred_out_of_bounds": bool(fallback_metrics["out_of_bounds_risk"] > 0.0),
+            "mppi_pred_out_of_bounds": bool(candidate_metrics["out_of_bounds_risk"] > 0.0),
+            "sac_min_obstacle_distance": float(base_metrics["min_distance"]),
+            "fallback_min_obstacle_distance": float(fallback_metrics["min_distance"]),
+            "mppi_min_obstacle_distance": float(candidate_metrics["min_distance"]),
             "base_risk": float(base_metrics["risk_score"]),
             "candidate_risk": float(candidate_metrics["risk_score"]),
             "fallback_risk": float(fallback_metrics["risk_score"]),
@@ -199,7 +453,6 @@ class MPPIDBaSOptimizer:
             "right_clearance": float(radar["right_min"]),
             "global_obstacle_distance": float(radar["global_min"]),
         }
-        return executed_action.astype(np.float32), debug
 
     def _rollout_cost(
         self,
@@ -246,7 +499,8 @@ class MPPIDBaSOptimizer:
         max_heading_error = 0.0
 
         for action in action_sequence:
-            control_input = np.array([float(action[0]), 0.0, float(action[1])], dtype=float)
+            effective_action = cfg.action_lag_alpha * prev_action + (1.0 - cfg.action_lag_alpha) * action
+            control_input = np.array([float(effective_action[0]), 0.0, float(effective_action[1])], dtype=float)
             acceleration = (control_input / mass) - (damping * velocity)
             velocity = velocity + acceleration * dt
 
@@ -298,7 +552,7 @@ class MPPIDBaSOptimizer:
             total_dbas_cost += dbas_cost
             total_ttc_cost += ttc_cost
             total_oob_cost += out_of_bounds_cost
-            prev_action = action
+            prev_action = effective_action
 
         final_dist_to_goal = float(np.linalg.norm(target - position))
         progress = start_dist_to_goal - final_dist_to_goal
@@ -363,7 +617,7 @@ class MPPIDBaSOptimizer:
     ) -> Tuple[bool, str]:
         cfg = self.config
         action_delta = np.abs(optimized_action - base_action)
-        if np.any(action_delta > np.asarray(cfg.max_action_delta, dtype=float) + 1e-6):
+        if np.any(action_delta > np.asarray(cfg.mppi_max_action_delta, dtype=float) + 1e-6):
             return False, "reject_trust_region"
         if candidate_metrics["collision_risk"] > base_metrics["collision_risk"]:
             return False, "reject_collision_risk"
@@ -498,12 +752,18 @@ class MPPIDBaSOptimizer:
             "right_min": max_range,
         }
         base_metrics = base_metrics or {
+            "total_cost": 0.0,
             "risk_score": 0.0,
             "min_distance": current_min_dist,
+            "dbas_cost": 0.0,
             "ttc_cost": 0.0,
+            "out_of_bounds_cost": 0.0,
             "max_lateral_error": 0.0,
             "progress": 0.0,
+            "collision_risk": 0.0,
+            "out_of_bounds_risk": 0.0,
         }
+        base_score = self._candidate_score(base_metrics)
         return {
             "raw_action_surge": float(base_action[0]),
             "raw_action_yaw": float(base_action[1]),
@@ -527,10 +787,27 @@ class MPPIDBaSOptimizer:
             "mppi_accept": False,
             "mppi_reject": False,
             "mppi_decision_reason": reason,
+            "selected_reason": "select_sac",
+            "reject_reason": reason,
+            "mppi_prior_type": "none",
+            "mppi_warm_start_used": False,
+            "teacher_mppi_would_accept": False,
             "fallback_active": False,
             "fallback_accept": False,
             "action_source": "sac",
             "terminal_source": "sac",
+            "candidate_sac_score": float(base_score),
+            "candidate_fallback_score": float(base_score),
+            "candidate_mppi_score": float(base_score),
+            "sac_pred_collision": bool(base_metrics["collision_risk"] > 0.0),
+            "fallback_pred_collision": bool(base_metrics["collision_risk"] > 0.0),
+            "mppi_pred_collision": bool(base_metrics["collision_risk"] > 0.0),
+            "sac_pred_out_of_bounds": bool(base_metrics["out_of_bounds_risk"] > 0.0),
+            "fallback_pred_out_of_bounds": bool(base_metrics["out_of_bounds_risk"] > 0.0),
+            "mppi_pred_out_of_bounds": bool(base_metrics["out_of_bounds_risk"] > 0.0),
+            "sac_min_obstacle_distance": float(base_metrics["min_distance"]),
+            "fallback_min_obstacle_distance": float(base_metrics["min_distance"]),
+            "mppi_min_obstacle_distance": float(base_metrics["min_distance"]),
             "base_risk": float(base_metrics["risk_score"]),
             "candidate_risk": float(base_metrics["risk_score"]),
             "fallback_risk": float(base_metrics["risk_score"]),

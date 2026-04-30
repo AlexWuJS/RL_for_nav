@@ -24,6 +24,10 @@ def unwrap_env(env):
 def config_for_mode(mode: str, seed: int) -> MPPIDBaSConfig:
     if mode == "shield_only":
         return MPPIDBaSConfig(seed=seed, enable_mppi=False, enable_fallback=True)
+    if mode == "hybrid_mppi":
+        return MPPIDBaSConfig(seed=seed, enable_mppi=True, enable_fallback=True)
+    if mode == "mppi_teacher":
+        return MPPIDBaSConfig(seed=seed, enable_mppi=True, enable_fallback=True, teacher_only=True)
     if mode == "trust_mppi":
         return MPPIDBaSConfig(seed=seed, dbas_weight=0.0, risk_activation_distance=10.0, enable_fallback=False)
     if mode == "trust_mppi_dbas":
@@ -151,6 +155,17 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
                 "reject_out_of_bounds": float(reason == "reject_out_of_bounds"),
                 "reject_progress_loss": float(reason == "reject_progress_loss"),
                 "reject_no_safety_gain": float(reason == "reject_no_safety_gain"),
+                "teacher_mppi_would_accept": float(bool(info.get("teacher_mppi_would_accept", False))),
+                "mppi_warm_start_used": float(bool(info.get("mppi_warm_start_used", False))),
+                "sac_pred_collision": float(bool(info.get("sac_pred_collision", False))),
+                "fallback_pred_collision": float(bool(info.get("fallback_pred_collision", False))),
+                "mppi_pred_collision": float(bool(info.get("mppi_pred_collision", False))),
+                "sac_pred_out_of_bounds": float(bool(info.get("sac_pred_out_of_bounds", False))),
+                "fallback_pred_out_of_bounds": float(bool(info.get("fallback_pred_out_of_bounds", False))),
+                "mppi_pred_out_of_bounds": float(bool(info.get("mppi_pred_out_of_bounds", False))),
+                "candidate_sac_score": float(info.get("candidate_sac_score", 0.0)),
+                "candidate_fallback_score": float(info.get("candidate_fallback_score", 0.0)),
+                "candidate_mppi_score": float(info.get("candidate_mppi_score", 0.0)),
                 "source_sac": float(info.get("action_source", "sac") == "sac"),
                 "source_mppi": float(info.get("action_source", "sac") == "mppi"),
                 "source_fallback": float(info.get("action_source", "sac") == "fallback"),
@@ -174,9 +189,26 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
             "mppi_accept": int(bool(info.get("mppi_accept", False))),
             "mppi_reject": int(bool(info.get("mppi_reject", False))),
             "mppi_decision_reason": info.get("mppi_decision_reason", "none"),
+            "selected_reason": info.get("selected_reason", "none"),
+            "reject_reason": info.get("reject_reason", "none"),
+            "mppi_prior_type": info.get("mppi_prior_type", "none"),
+            "mppi_warm_start_used": int(bool(info.get("mppi_warm_start_used", False))),
+            "teacher_mppi_would_accept": int(bool(info.get("teacher_mppi_would_accept", False))),
             "fallback_active": int(bool(info.get("fallback_active", False))),
             "fallback_accept": int(bool(info.get("fallback_accept", False))),
             "action_source": info.get("action_source", "sac"),
+            "candidate_sac_score": float(info.get("candidate_sac_score", 0.0)),
+            "candidate_fallback_score": float(info.get("candidate_fallback_score", 0.0)),
+            "candidate_mppi_score": float(info.get("candidate_mppi_score", 0.0)),
+            "sac_pred_collision": int(bool(info.get("sac_pred_collision", False))),
+            "fallback_pred_collision": int(bool(info.get("fallback_pred_collision", False))),
+            "mppi_pred_collision": int(bool(info.get("mppi_pred_collision", False))),
+            "sac_pred_out_of_bounds": int(bool(info.get("sac_pred_out_of_bounds", False))),
+            "fallback_pred_out_of_bounds": int(bool(info.get("fallback_pred_out_of_bounds", False))),
+            "mppi_pred_out_of_bounds": int(bool(info.get("mppi_pred_out_of_bounds", False))),
+            "sac_min_obstacle_distance": float(info.get("sac_min_obstacle_distance", metrics["min_scan_distance"])),
+            "fallback_min_obstacle_distance": float(info.get("fallback_min_obstacle_distance", metrics["min_scan_distance"])),
+            "mppi_min_obstacle_distance": float(info.get("mppi_min_obstacle_distance", metrics["min_scan_distance"])),
             "base_risk": float(info.get("base_risk", 0.0)),
             "candidate_risk": float(info.get("candidate_risk", 0.0)),
             "fallback_risk": float(info.get("fallback_risk", 0.0)),
@@ -239,6 +271,17 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
                 "reject_out_of_bounds": mean_debug(mppi_debug, "reject_out_of_bounds"),
                 "reject_progress_loss": mean_debug(mppi_debug, "reject_progress_loss"),
                 "reject_no_safety_gain": mean_debug(mppi_debug, "reject_no_safety_gain"),
+                "mean_teacher_mppi_would_accept": mean_debug(mppi_debug, "teacher_mppi_would_accept"),
+                "mean_mppi_warm_start_used": mean_debug(mppi_debug, "mppi_warm_start_used"),
+                "mean_sac_pred_collision": mean_debug(mppi_debug, "sac_pred_collision"),
+                "mean_fallback_pred_collision": mean_debug(mppi_debug, "fallback_pred_collision"),
+                "mean_mppi_pred_collision": mean_debug(mppi_debug, "mppi_pred_collision"),
+                "mean_sac_pred_out_of_bounds": mean_debug(mppi_debug, "sac_pred_out_of_bounds"),
+                "mean_fallback_pred_out_of_bounds": mean_debug(mppi_debug, "fallback_pred_out_of_bounds"),
+                "mean_mppi_pred_out_of_bounds": mean_debug(mppi_debug, "mppi_pred_out_of_bounds"),
+                "mean_candidate_sac_score": mean_debug(mppi_debug, "candidate_sac_score"),
+                "mean_candidate_fallback_score": mean_debug(mppi_debug, "candidate_fallback_score"),
+                "mean_candidate_mppi_score": mean_debug(mppi_debug, "candidate_mppi_score"),
                 "mean_source_sac": mean_debug(mppi_debug, "source_sac"),
                 "mean_source_mppi": mean_debug(mppi_debug, "source_mppi"),
                 "mean_source_fallback": mean_debug(mppi_debug, "source_fallback"),
@@ -359,7 +402,17 @@ def parse_args():
     parser.add_argument("--episodes", type=int, default=30)
     parser.add_argument(
         "--mode",
-        choices=["baseline", "shield_only", "mppi_dbas", "trust_mppi", "trust_mppi_dbas", "both", "ablation"],
+        choices=[
+            "baseline",
+            "shield_only",
+            "hybrid_mppi",
+            "mppi_teacher",
+            "mppi_dbas",
+            "trust_mppi",
+            "trust_mppi_dbas",
+            "both",
+            "ablation",
+        ],
         default="both",
     )
     parser.add_argument("--output-dir", default="./comparison_results")
@@ -374,9 +427,9 @@ def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     if args.mode == "both":
-        modes = ["baseline", "mppi_dbas"]
+        modes = ["baseline", "hybrid_mppi"]
     elif args.mode == "ablation":
-        modes = ["baseline", "shield_only", "mppi_dbas", "trust_mppi", "trust_mppi_dbas"]
+        modes = ["baseline", "shield_only", "hybrid_mppi", "mppi_teacher", "mppi_dbas", "trust_mppi", "trust_mppi_dbas"]
     else:
         modes = [args.mode]
 
