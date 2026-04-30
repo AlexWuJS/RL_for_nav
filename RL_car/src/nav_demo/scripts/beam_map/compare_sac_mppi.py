@@ -22,10 +22,12 @@ def unwrap_env(env):
 
 
 def config_for_mode(mode: str, seed: int) -> MPPIDBaSConfig:
+    if mode == "shield_only":
+        return MPPIDBaSConfig(seed=seed, enable_mppi=False, enable_fallback=True)
     if mode == "trust_mppi":
-        return MPPIDBaSConfig(seed=seed, dbas_weight=0.0, risk_activation_distance=10.0)
+        return MPPIDBaSConfig(seed=seed, dbas_weight=0.0, risk_activation_distance=10.0, enable_fallback=False)
     if mode == "trust_mppi_dbas":
-        return MPPIDBaSConfig(seed=seed, risk_activation_distance=10.0)
+        return MPPIDBaSConfig(seed=seed, risk_activation_distance=10.0, enable_fallback=False)
     return MPPIDBaSConfig(seed=seed)
 
 
@@ -132,6 +134,7 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
         mppi_active = float(bool(info.get("mppi_active", False)))
         mppi_active_flags.append(mppi_active)
         if info.get("mppi_dbas_enabled"):
+            reason = str(info.get("mppi_decision_reason", "none"))
             mppi_debug.append({
                 "dbas_cost": float(info.get("dbas_cost", 0.0)),
                 "ttc_cost": float(info.get("ttc_cost", 0.0)),
@@ -140,6 +143,17 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
                 "current_obstacle_distance": float(info.get("current_obstacle_distance", 0.0)),
                 "min_predicted_obstacle_distance": float(info.get("min_predicted_obstacle_distance", 0.0)),
                 "exploration_noise_scale": float(info.get("exploration_noise_scale", 0.0)),
+                "mppi_accept": float(bool(info.get("mppi_accept", False))),
+                "mppi_reject": float(bool(info.get("mppi_reject", False))),
+                "fallback_active": float(bool(info.get("fallback_active", False))),
+                "fallback_accept": float(bool(info.get("fallback_accept", False))),
+                "reject_collision_risk": float(reason == "reject_collision_risk"),
+                "reject_out_of_bounds": float(reason == "reject_out_of_bounds"),
+                "reject_progress_loss": float(reason == "reject_progress_loss"),
+                "reject_no_safety_gain": float(reason == "reject_no_safety_gain"),
+                "source_sac": float(info.get("action_source", "sac") == "sac"),
+                "source_mppi": float(info.get("action_source", "sac") == "mppi"),
+                "source_fallback": float(info.get("action_source", "sac") == "fallback"),
             })
 
         trace_rows.append({
@@ -157,6 +171,30 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
             "action_delta_norm": float(info.get("action_delta_norm", 0.0)),
             "current_obstacle_distance": float(info.get("current_obstacle_distance", metrics["min_scan_distance"])),
             "mppi_active": mppi_active,
+            "mppi_accept": int(bool(info.get("mppi_accept", False))),
+            "mppi_reject": int(bool(info.get("mppi_reject", False))),
+            "mppi_decision_reason": info.get("mppi_decision_reason", "none"),
+            "fallback_active": int(bool(info.get("fallback_active", False))),
+            "fallback_accept": int(bool(info.get("fallback_accept", False))),
+            "action_source": info.get("action_source", "sac"),
+            "base_risk": float(info.get("base_risk", 0.0)),
+            "candidate_risk": float(info.get("candidate_risk", 0.0)),
+            "fallback_risk": float(info.get("fallback_risk", 0.0)),
+            "base_min_distance": float(info.get("base_min_distance", metrics["min_scan_distance"])),
+            "candidate_min_distance": float(info.get("candidate_min_distance", metrics["min_scan_distance"])),
+            "fallback_min_distance": float(info.get("fallback_min_distance", metrics["min_scan_distance"])),
+            "base_ttc_cost": float(info.get("base_ttc_cost", 0.0)),
+            "candidate_ttc_cost": float(info.get("candidate_ttc_cost", 0.0)),
+            "fallback_ttc_cost": float(info.get("fallback_ttc_cost", 0.0)),
+            "base_max_lateral_error": float(info.get("base_max_lateral_error", 0.0)),
+            "candidate_max_lateral_error": float(info.get("candidate_max_lateral_error", 0.0)),
+            "fallback_max_lateral_error": float(info.get("fallback_max_lateral_error", 0.0)),
+            "base_progress": float(info.get("base_progress", 0.0)),
+            "candidate_progress": float(info.get("candidate_progress", 0.0)),
+            "fallback_progress": float(info.get("fallback_progress", 0.0)),
+            "front_obstacle_distance": float(info.get("front_obstacle_distance", metrics["min_scan_distance"])),
+            "left_clearance": float(info.get("left_clearance", metrics["min_scan_distance"])),
+            "right_clearance": float(info.get("right_clearance", metrics["min_scan_distance"])),
             "terminal_reason": info.get("terminal_reason", "running"),
         })
         step_idx += 1
@@ -193,8 +231,23 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
                 "mean_action_change": float(np.mean(action_changes)) if action_changes else 0.0,
                 "mean_raw_action_change": float(np.mean(raw_action_changes)) if raw_action_changes else 0.0,
                 "mean_mppi_active": float(np.mean(mppi_active_flags)) if mppi_active_flags else 0.0,
+                "mean_mppi_accept": mean_debug(mppi_debug, "mppi_accept"),
+                "mean_mppi_reject": mean_debug(mppi_debug, "mppi_reject"),
+                "mean_fallback_active": mean_debug(mppi_debug, "fallback_active"),
+                "mean_fallback_accept": mean_debug(mppi_debug, "fallback_accept"),
+                "reject_collision_risk": mean_debug(mppi_debug, "reject_collision_risk"),
+                "reject_out_of_bounds": mean_debug(mppi_debug, "reject_out_of_bounds"),
+                "reject_progress_loss": mean_debug(mppi_debug, "reject_progress_loss"),
+                "reject_no_safety_gain": mean_debug(mppi_debug, "reject_no_safety_gain"),
+                "mean_source_sac": mean_debug(mppi_debug, "source_sac"),
+                "mean_source_mppi": mean_debug(mppi_debug, "source_mppi"),
+                "mean_source_fallback": mean_debug(mppi_debug, "source_fallback"),
                 "mean_action_delta_norm": mean_debug(mppi_debug, "action_delta_norm"),
                 "mean_current_obstacle_distance": mean_debug(mppi_debug, "current_obstacle_distance"),
+                "mean_front_obstacle_distance": mean_trace(trace_rows, "front_obstacle_distance"),
+                "mean_left_clearance": mean_trace(trace_rows, "left_clearance"),
+                "mean_right_clearance": mean_trace(trace_rows, "right_clearance"),
+                "terminal_source": terminal_source_from_trace(trace_rows),
                 "mean_dbas_cost": mean_debug(mppi_debug, "dbas_cost"),
                 "mean_ttc_cost": mean_debug(mppi_debug, "ttc_cost"),
                 "mean_out_of_bounds_cost": mean_debug(mppi_debug, "out_of_bounds_cost"),
@@ -207,6 +260,17 @@ def mean_debug(rows: List[Dict[str, float]], key: str) -> float:
     if not rows:
         return 0.0
     return float(np.mean([row[key] for row in rows]))
+
+
+def mean_trace(rows: List[Dict[str, Any]], key: str) -> float:
+    values = [float(row[key]) for row in rows if key in row]
+    return float(np.mean(values)) if values else 0.0
+
+
+def terminal_source_from_trace(rows: List[Dict[str, Any]]) -> str:
+    if not rows:
+        return "unknown"
+    return str(rows[-1].get("action_source", "unknown"))
 
 
 def run_mode(args, mode: str) -> List[Dict[str, Any]]:
@@ -295,7 +359,7 @@ def parse_args():
     parser.add_argument("--episodes", type=int, default=30)
     parser.add_argument(
         "--mode",
-        choices=["baseline", "mppi_dbas", "trust_mppi", "trust_mppi_dbas", "both", "ablation"],
+        choices=["baseline", "shield_only", "mppi_dbas", "trust_mppi", "trust_mppi_dbas", "both", "ablation"],
         default="both",
     )
     parser.add_argument("--output-dir", default="./comparison_results")
@@ -312,7 +376,7 @@ def main():
     if args.mode == "both":
         modes = ["baseline", "mppi_dbas"]
     elif args.mode == "ablation":
-        modes = ["baseline", "trust_mppi", "trust_mppi_dbas", "mppi_dbas"]
+        modes = ["baseline", "shield_only", "mppi_dbas", "trust_mppi", "trust_mppi_dbas"]
     else:
         modes = [args.mode]
 
