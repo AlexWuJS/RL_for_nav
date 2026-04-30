@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.0.2)
+cmake_minimum_required(VERSION 3.5)
 project(urdf02_gazebo)
 
 ## Compile as C++11, supported in ROS Kinetic and newer
@@ -165,12 +165,6 @@ include_directories(
 #   scripts/my_python_script
 #   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 # )
-
-## Install elliptical motion controller script so it is available in devel/lib
-catkin_install_python(PROGRAMS
-  scripts/elliptical_motion_controller.py
-  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
-)
 
 ## Mark executables for installation
 ## See http://docs.ros.org/melodic/api/catkin/html/howto/format1/building_executables.html
