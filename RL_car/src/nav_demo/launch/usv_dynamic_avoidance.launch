@@ -1,5 +1,5 @@
 <launch>
-  <arg name="world_name" default="$(find urdf02_gazebo)/worlds/box_house.world" />
+  <arg name="world_name" default="$(find urdf02_gazebo)/worlds/usv_dynamic_avoidance.world" />
   <arg name="scenario_json" default="$(find nav_demo)/scripts/beam_map/data/processed/trajectories/ais_scenario.json" />
   <arg name="max_active_obstacles" default="5" />
   <arg name="time_scale" default="1.0" />
