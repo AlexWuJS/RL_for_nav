@@ -7,6 +7,7 @@ from sensor_msgs.msg import LaserScan
 from gazebo_msgs.msg import ModelState, ModelStates
 from gazebo_msgs.srv import SetModelState, GetModelState, SpawnModel
 from geometry_msgs.msg import Pose
+from nav_msgs.msg import Path
 from visualization_msgs.msg import Marker, MarkerArray
 import math
 import tf.transformations
@@ -20,6 +21,10 @@ class MyCarEnv(gym.Env):
             rospy.init_node('my_car_rl_node', anonymous=True)
         except rospy.ROSException:
             pass
+
+        self.global_path_topic = rospy.get_param('~global_path_topic', '/global_path')
+        self.scenario_json = rospy.get_param('~scenario_json', '')
+        self.max_active_obstacles = int(rospy.get_param('~max_active_obstacles', 5))
         
         self.action_space = spaces.Box(low=np.array([-1.0, -1.0]),
                                        high=np.array([2.0, 1.0]),
@@ -74,7 +79,13 @@ class MyCarEnv(gym.Env):
         # 机器人状态异步回调缓存
         self.usv_pos = np.array([0.0, 0.0])
         self.usv_yaw = 0.0
+        self.dynamic_obstacle_models = []
         rospy.Subscriber('/gazebo/model_states', ModelStates, self._model_states_callback, queue_size=1)
+
+        # Future global-path interface. The current training stage keeps the
+        # existing sampled start/goal behavior when no path has been received.
+        self.latest_global_path = None
+        rospy.Subscriber(self.global_path_topic, Path, self._global_path_callback, queue_size=1)
 
         # ROS 仿真时间频率控制器（锁定 MDP 步长为 10Hz，对应 dt=0.1）
         self.rate = rospy.Rate(10)
@@ -84,6 +95,9 @@ class MyCarEnv(gym.Env):
 
     def _scan_callback(self, msg):
         self.latest_scan = msg
+
+    def _global_path_callback(self, msg):
+        self.latest_global_path = msg
 
     def _model_states_callback(self, msg):
         try:
@@ -95,6 +109,7 @@ class MyCarEnv(gym.Env):
             self.usv_yaw = yaw
         except ValueError:
             pass
+        self.dynamic_obstacle_models = [name for name in msg.name if name.startswith('ais_ship_')]
 
     def step(self, action):
         # 1. 解析动作为控制输入 (欠驱动 USV: action[0]=Surge期望, action[1]=Yaw期望)

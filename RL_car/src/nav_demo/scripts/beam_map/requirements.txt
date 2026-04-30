@@ -1,0 +1,7 @@
+gymnasium
+numpy
+pandas
+PyYAML
+stable-baselines3
+torch
+xlrd

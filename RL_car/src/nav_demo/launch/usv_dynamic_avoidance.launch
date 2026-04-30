@@ -1,0 +1,31 @@
+<launch>
+  <arg name="world_name" default="$(find urdf02_gazebo)/worlds/box_house.world" />
+  <arg name="scenario_json" default="$(find nav_demo)/scripts/beam_map/data/processed/trajectories/ais_scenario.json" />
+  <arg name="max_active_obstacles" default="5" />
+  <arg name="time_scale" default="1.0" />
+  <arg name="global_path_topic" default="/global_path" />
+  <arg name="start_training" default="false" />
+
+  <param name="robot_description" command="$(find xacro)/xacro $(find urdf02_gazebo)/urdf/car.urdf.xacro" />
+
+  <include file="$(find gazebo_ros)/launch/empty_world.launch">
+    <arg name="world_name" value="$(arg world_name)" />
+  </include>
+
+  <node pkg="gazebo_ros" type="spawn_model" name="spawn_usv"
+        args="-urdf -model usv -param robot_description" output="screen" />
+
+  <node pkg="nav_demo" type="beam_map/ais_dynamic_obstacle_node.py"
+        name="ais_dynamic_obstacles" output="screen">
+    <param name="scenario_json" value="$(arg scenario_json)" />
+    <param name="max_active_obstacles" value="$(arg max_active_obstacles)" />
+    <param name="time_scale" value="$(arg time_scale)" />
+  </node>
+
+  <group if="$(arg start_training)">
+    <node pkg="nav_demo" type="beam_map/train.py" name="sac_train" output="screen"
+          args="--env_type gazebo">
+      <param name="global_path_topic" value="$(arg global_path_topic)" />
+    </node>
+  </group>
+</launch>

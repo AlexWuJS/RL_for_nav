@@ -1,32 +1,50 @@
-# 忽略训练的模型权重和压缩包 (太大了)
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ROS/catkin build products
+build/
+devel/
+install/
+.catkin_tools/
+.ros/
+log/
+logs/
+
+# Training outputs and model checkpoints
 *.zip
 *.pth
 *.pt
 *.pkl
 *.ckpt
-
-# 忽略 Python 缓存 (必须忽略)
-__pycache__/
-*.pyc
-
-# 忽略 TensorBoard 日志和训练日志
 events.out.tfevents*
-logs/
 training_results/
-
-# 忽略数据文件
-*.npz
-*.csv
-*.zip
-training_results/
+training_grid_results/
+training_usv_v2_results/
 training_frenet_results/
 results_avoid/
 results_avoid_sac/
 results_nav/
-logs/
 3_ppo_nav_car_log/
 3_sac_nav_car_log/
+3_sac_grid_log/
 log_avoid/
 log_nav/
 log_sac/
 sac_nav_car_log/
+
+# Generated debug artifacts
+*.npz
+*.csv
+*_debug.png
+overlay_*.png
+training_*result*.png
+**/data/processed/trajectories/*.json
+!**/data/processed/trajectories/ais_scenario.json
+!**/data/processed/trajectories/.gitkeep
+
+# Editor/local files
+.vscode/
+*.save

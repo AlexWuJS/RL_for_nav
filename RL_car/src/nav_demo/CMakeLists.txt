@@ -9,9 +9,13 @@ project(nav_demo)
 ## is used, also find other catkin packages
 find_package(catkin REQUIRED COMPONENTS
   amcl
+  gazebo_msgs
   gmapping
   map_server
   move_base
+  nav_msgs
+  rospy
+  visualization_msgs
 )
 
 ## System dependencies are found with CMake's conventions
@@ -106,7 +110,7 @@ find_package(catkin REQUIRED COMPONENTS
 catkin_package(
 #  INCLUDE_DIRS include
 #  LIBRARIES nav_demo
-#  CATKIN_DEPENDS amcl gmapping map_server move_base
+  CATKIN_DEPENDS amcl gazebo_msgs gmapping map_server move_base nav_msgs rospy visualization_msgs
 #  DEPENDS system_lib
 )
 
@@ -164,6 +168,11 @@ include_directories(
 #   scripts/my_python_script
 #   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 # )
+catkin_install_python(PROGRAMS
+  scripts/beam_map/ais_dynamic_obstacle_node.py
+  scripts/beam_map/train.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}/beam_map
+)
 
 ## Mark executables for installation
 ## See http://docs.ros.org/melodic/api/catkin/html/howto/format1/building_executables.html
