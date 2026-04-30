@@ -2,6 +2,8 @@ import argparse
 import csv
 import json
 import os
+import subprocess
+import sys
 from typing import Any, Dict, List
 
 import numpy as np
@@ -22,12 +24,44 @@ def unwrap_env(env):
 
 
 def config_for_mode(mode: str, seed: int) -> MPPIDBaSConfig:
+    if mode == "sac_mppi":
+        return MPPIDBaSConfig(
+            seed=seed,
+            use_reward_aligned_cost=True,
+            always_run_mppi=True,
+            execute_mppi=True,
+            final_safety_check=False,
+            enable_fallback=False,
+            residual_low=(-0.20, -0.25),
+            residual_high=(0.10, 0.25),
+        )
+    if mode == "sac_mppi_safe":
+        return MPPIDBaSConfig(
+            seed=seed,
+            use_reward_aligned_cost=True,
+            always_run_mppi=True,
+            execute_mppi=True,
+            final_safety_check=True,
+            enable_fallback=False,
+            residual_low=(-0.20, -0.25),
+            residual_high=(0.10, 0.25),
+        )
     if mode == "shield_only":
         return MPPIDBaSConfig(seed=seed, enable_mppi=False, enable_fallback=True)
     if mode == "hybrid_mppi":
         return MPPIDBaSConfig(seed=seed, enable_mppi=True, enable_fallback=True)
     if mode == "mppi_teacher":
-        return MPPIDBaSConfig(seed=seed, enable_mppi=True, enable_fallback=True, teacher_only=True)
+        return MPPIDBaSConfig(
+            seed=seed,
+            use_reward_aligned_cost=True,
+            always_run_mppi=True,
+            execute_mppi=False,
+            final_safety_check=True,
+            enable_fallback=False,
+            teacher_only=True,
+            residual_low=(-0.20, -0.25),
+            residual_high=(0.10, 0.25),
+        )
     if mode == "trust_mppi":
         return MPPIDBaSConfig(seed=seed, dbas_weight=0.0, risk_activation_distance=10.0, enable_fallback=False)
     if mode == "trust_mppi_dbas":
@@ -166,6 +200,11 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
                 "candidate_sac_score": float(info.get("candidate_sac_score", 0.0)),
                 "candidate_fallback_score": float(info.get("candidate_fallback_score", 0.0)),
                 "candidate_mppi_score": float(info.get("candidate_mppi_score", 0.0)),
+                "predicted_reward_sac": float(info.get("predicted_reward_sac", 0.0)),
+                "predicted_reward_mppi": float(info.get("predicted_reward_mppi", 0.0)),
+                "predicted_reward_delta": float(info.get("predicted_reward_delta", 0.0)),
+                "reward_prediction_error": float(info.get("predicted_reward_delta", 0.0) - float(rewards[0])),
+                "mppi_selected": float(bool(info.get("mppi_selected", False))),
                 "source_sac": float(info.get("action_source", "sac") == "sac"),
                 "source_mppi": float(info.get("action_source", "sac") == "mppi"),
                 "source_fallback": float(info.get("action_source", "sac") == "fallback"),
@@ -191,12 +230,21 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
             "mppi_decision_reason": info.get("mppi_decision_reason", "none"),
             "selected_reason": info.get("selected_reason", "none"),
             "reject_reason": info.get("reject_reason", "none"),
+            "mppi_rejected_reason": info.get("mppi_rejected_reason", info.get("reject_reason", "none")),
             "mppi_prior_type": info.get("mppi_prior_type", "none"),
             "mppi_warm_start_used": int(bool(info.get("mppi_warm_start_used", False))),
             "teacher_mppi_would_accept": int(bool(info.get("teacher_mppi_would_accept", False))),
+            "mppi_selected": int(bool(info.get("mppi_selected", False))),
             "fallback_active": int(bool(info.get("fallback_active", False))),
             "fallback_accept": int(bool(info.get("fallback_accept", False))),
             "action_source": info.get("action_source", "sac"),
+            "predicted_reward_sac": float(info.get("predicted_reward_sac", 0.0)),
+            "predicted_reward_mppi": float(info.get("predicted_reward_mppi", 0.0)),
+            "predicted_reward_delta": float(info.get("predicted_reward_delta", 0.0)),
+            "actual_step_reward": float(rewards[0]),
+            "reward_prediction_error": float(info.get("predicted_reward_delta", 0.0) - float(rewards[0])),
+            "sac_rollout_terminal": info.get("sac_rollout_terminal", "none"),
+            "mppi_rollout_terminal": info.get("mppi_rollout_terminal", "none"),
             "candidate_sac_score": float(info.get("candidate_sac_score", 0.0)),
             "candidate_fallback_score": float(info.get("candidate_fallback_score", 0.0)),
             "candidate_mppi_score": float(info.get("candidate_mppi_score", 0.0)),
@@ -282,6 +330,11 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
                 "mean_candidate_sac_score": mean_debug(mppi_debug, "candidate_sac_score"),
                 "mean_candidate_fallback_score": mean_debug(mppi_debug, "candidate_fallback_score"),
                 "mean_candidate_mppi_score": mean_debug(mppi_debug, "candidate_mppi_score"),
+                "mean_predicted_reward_sac": mean_debug(mppi_debug, "predicted_reward_sac"),
+                "mean_predicted_reward_mppi": mean_debug(mppi_debug, "predicted_reward_mppi"),
+                "mean_predicted_reward_delta": mean_debug(mppi_debug, "predicted_reward_delta"),
+                "mean_reward_prediction_error": mean_debug(mppi_debug, "reward_prediction_error"),
+                "mean_mppi_selected": mean_debug(mppi_debug, "mppi_selected"),
                 "mean_source_sac": mean_debug(mppi_debug, "source_sac"),
                 "mean_source_mppi": mean_debug(mppi_debug, "source_mppi"),
                 "mean_source_fallback": mean_debug(mppi_debug, "source_fallback"),
@@ -404,6 +457,8 @@ def parse_args():
         "--mode",
         choices=[
             "baseline",
+            "sac_mppi",
+            "sac_mppi_safe",
             "shield_only",
             "hybrid_mppi",
             "mppi_teacher",
@@ -420,6 +475,9 @@ def parse_args():
     parser.add_argument("--frame-stack", type=int, default=4, help="Use 4 for models trained by beam_map/train.py; use 1 for plain models.")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--stochastic", action="store_true", help="Use stochastic SAC actions during evaluation.")
+    parser.add_argument("--plot", action="store_true", help="Generate comparison plots after evaluation.")
+    parser.add_argument("--plot-dir", default=None, help="Directory for plots. Defaults to <output-dir>/plots.")
+    parser.add_argument("--plot-max-steps", type=int, default=180)
     return parser.parse_args()
 
 
@@ -427,9 +485,9 @@ def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     if args.mode == "both":
-        modes = ["baseline", "hybrid_mppi"]
+        modes = ["baseline", "sac_mppi_safe"]
     elif args.mode == "ablation":
-        modes = ["baseline", "shield_only", "hybrid_mppi", "mppi_teacher", "mppi_dbas", "trust_mppi", "trust_mppi_dbas"]
+        modes = ["baseline", "sac_mppi", "sac_mppi_safe", "mppi_teacher"]
     else:
         modes = [args.mode]
 
@@ -446,6 +504,22 @@ def main():
         json.dump(summary, f, indent=2, ensure_ascii=False)
 
     print(json.dumps(summary, indent=2, ensure_ascii=False))
+    if args.plot:
+        plot_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plot_comparison_curves.py")
+        plot_dir = args.plot_dir or os.path.join(args.output_dir, "plots")
+        subprocess.run(
+            [
+                sys.executable,
+                plot_script,
+                "--result-dir",
+                args.output_dir,
+                "--output-dir",
+                plot_dir,
+                "--max-steps",
+                str(args.plot_max_steps),
+            ],
+            check=True,
+        )
 
 
 if __name__ == "__main__":

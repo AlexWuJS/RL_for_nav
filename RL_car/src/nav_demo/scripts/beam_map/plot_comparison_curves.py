@@ -11,7 +11,11 @@ import numpy as np
 
 MODE_COLORS = {
     "baseline": "#2f6fdd",
+    "sac_mppi": "#17becf",
+    "sac_mppi_safe": "#1f9e89",
     "shield_only": "#2ca02c",
+    "hybrid_mppi": "#8c564b",
+    "mppi_teacher": "#e377c2",
     "mppi_dbas": "#d62728",
     "trust_mppi": "#9467bd",
     "trust_mppi_dbas": "#ff7f0e",
@@ -204,6 +208,33 @@ def plot_trace_curves(result_dir: str, output_dir: str, max_steps: int) -> None:
     plt.close(fig)
 
 
+def plot_reward_alignment(result_dir: str, output_dir: str, max_steps: int) -> None:
+    files_by_mode = trace_files(result_dir)
+    if not files_by_mode:
+        return
+    metrics = [
+        ("predicted_reward_delta", "Predicted Reward Delta"),
+        ("reward_prediction_error", "Reward Prediction Error"),
+        ("mppi_selected", "MPPI Selected Fraction"),
+    ]
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    for ax, (key, title) in zip(axes, metrics):
+        for mode, files in files_by_mode.items():
+            if mode == "baseline":
+                continue
+            xs, ys = mean_trace_series(files, key, max_steps)
+            if len(xs) == 0:
+                continue
+            ax.plot(xs, ys, label=mode, color=color_for(mode), linewidth=1.6)
+        ax.set_title(title)
+        ax.set_xlabel("Step")
+        ax.grid(alpha=0.3)
+    axes[0].legend()
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, "reward_alignment_curves.png"), dpi=160)
+    plt.close(fig)
+
+
 def plot_action_source(result_dir: str, output_dir: str, max_steps: int) -> None:
     files_by_mode = trace_files(result_dir)
     modes = [mode for mode in files_by_mode if mode != "baseline"]
@@ -257,6 +288,7 @@ def main() -> None:
     plot_episode_curves(rows_by_mode, output_dir)
     plot_terminal_outcomes(rows_by_mode, output_dir)
     plot_trace_curves(result_dir, output_dir, args.max_steps)
+    plot_reward_alignment(result_dir, output_dir, args.max_steps)
     plot_action_source(result_dir, output_dir, args.max_steps)
     print(f"Saved comparison plots to: {output_dir}")
 

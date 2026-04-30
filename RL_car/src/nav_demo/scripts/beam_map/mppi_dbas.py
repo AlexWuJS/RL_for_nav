@@ -4,6 +4,23 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+try:
+    from frenet_utils import frenet_reward
+except ImportError:
+    def frenet_reward(delta_s: float, frenet_d: float, heading_error: float) -> dict:
+        abs_d = abs(frenet_d)
+        lateral_penalty = 0.0 if abs_d <= 0.5 else max(-(abs_d - 0.5) * 1.5, -5.0)
+        heading_penalty = -(abs(heading_error) / math.pi) * 1.5
+        total = delta_s * 30.0 + lateral_penalty + heading_penalty
+        return {
+            "total": total,
+            "components": {
+                "s_progress": delta_s * 30.0,
+                "lateral_deviation": lateral_penalty,
+                "heading_penalty": heading_penalty,
+            },
+        }
+
 
 @dataclass
 class MPPIDBaSConfig:
@@ -48,9 +65,24 @@ class MPPIDBaSConfig:
     fallback_min_clearance_delta: float = 0.08
     residual_low: Tuple[float, float] = (-0.25, -0.35)
     residual_high: Tuple[float, float] = (0.15, 0.35)
+    reward_aligned_residual_low: Tuple[float, float] = (-0.20, -0.25)
+    reward_aligned_residual_high: Tuple[float, float] = (0.10, 0.25)
     action_lag_alpha: float = 0.35
     mppi_min_score_gain: float = 0.05
     fallback_score_margin: float = 0.02
+    use_reward_aligned_cost: bool = False
+    always_run_mppi: bool = False
+    execute_mppi: bool = True
+    final_safety_check: bool = True
+    reward_improvement_threshold: float = 0.05
+    emergency_brake_distance: float = 0.35
+    env_safe_distance: float = 0.45
+    env_out_of_bounds_limit: float = 3.0
+    env_goal_threshold: float = 0.4
+    env_terminal_reward: float = 100.0
+    env_success_reward: float = 1000.0
+    env_frenet_reward_scale: float = 2.5
+    hard_safety_penalty: float = 1000.0
     teacher_only: bool = False
     enable_mppi: bool = True
     enable_fallback: bool = True
@@ -75,6 +107,9 @@ class MPPIDBaSOptimizer:
     def optimize(self, base_action: Any, planner_state: Dict[str, Any]) -> Tuple[np.ndarray, Dict[str, float]]:
         cfg = self.config
         base_action = self._clip_action(base_action)
+        if cfg.use_reward_aligned_cost:
+            return self._optimize_reward_aligned(base_action, planner_state)
+
         radar = self._scan_risk_summary(planner_state)
         obstacles = self._scan_to_obstacle_points(planner_state)
         current_min_dist = radar["global_min"]
@@ -211,6 +246,420 @@ class MPPIDBaSOptimizer:
             teacher_mppi_would_accept=teacher_mppi_would_accept,
         )
         return executed_action.astype(np.float32), debug
+
+    def _optimize_reward_aligned(
+        self,
+        base_action: np.ndarray,
+        planner_state: Dict[str, Any],
+    ) -> Tuple[np.ndarray, Dict[str, float]]:
+        cfg = self.config
+        radar = self._scan_risk_summary(planner_state)
+        obstacles = self._scan_to_obstacle_points(planner_state)
+        base_sequence = np.tile(base_action.reshape(1, 2), (cfg.horizon, 1))
+        base_metrics = self._reward_aligned_rollout(base_sequence, base_action, planner_state, obstacles)
+
+        if not cfg.always_run_mppi and not self._base_action_needs_filter(base_metrics, radar):
+            self.last_action = base_action.astype(np.float32)
+            return base_action.astype(np.float32), self._make_reward_aligned_debug(
+                base_action=base_action,
+                executed_action=base_action,
+                candidate_action=base_action,
+                base_metrics=base_metrics,
+                candidate_metrics=base_metrics,
+                radar=radar,
+                mppi_active=False,
+                mppi_selected=False,
+                selected_reason="select_sac",
+                reject_reason="base_safe",
+                prior_type="none",
+                warm_start_used=False,
+                noise_scale=0.0,
+            )
+
+        if not cfg.enable_mppi:
+            executed = self._emergency_brake_action(base_action) if self._emergency_brake_needed(base_metrics, base_metrics, radar) else base_action
+            source = "fallback" if not np.allclose(executed, base_action) else "sac"
+            self.last_action = executed.astype(np.float32)
+            return executed.astype(np.float32), self._make_reward_aligned_debug(
+                base_action=base_action,
+                executed_action=executed,
+                candidate_action=base_action,
+                base_metrics=base_metrics,
+                candidate_metrics=base_metrics,
+                radar=radar,
+                mppi_active=False,
+                mppi_selected=False,
+                selected_reason=f"select_{source}",
+                reject_reason="mppi_disabled",
+                prior_type="none",
+                warm_start_used=False,
+                noise_scale=0.0,
+            )
+
+        noise_scale = self._adaptive_noise_scale(radar["global_min"])
+        action_sequences, prior_names, warm_start_used = self._sample_sac_centered_sequences(base_action, noise_scale)
+        metrics = [
+            self._reward_aligned_rollout(sequence, base_action, planner_state, obstacles)
+            for sequence in action_sequences
+        ]
+        best_idx = int(np.argmin([metric["total_cost"] for metric in metrics]))
+        best_sequence = action_sequences[best_idx]
+        candidate_action = self._clip_action(best_sequence[0])
+        candidate_metrics = metrics[best_idx]
+        self.best_sequence = best_sequence.copy()
+
+        reward_delta = candidate_metrics["predicted_reward"] - base_metrics["predicted_reward"]
+        trust_ok = self._trust_region_ok(candidate_action, base_action)
+        safety_ok = self._final_safety_ok(candidate_metrics) if cfg.final_safety_check else True
+        reward_ok = reward_delta >= cfg.reward_improvement_threshold
+        mppi_would_select = bool(reward_ok and trust_ok and safety_ok)
+
+        if cfg.teacher_only:
+            executed_action = base_action
+            action_source = "sac"
+            selected_reason = "select_sac"
+            reject_reason = "teacher_record_only" if mppi_would_select else self._reward_aligned_reject_reason(
+                reward_ok, trust_ok, safety_ok
+            )
+            mppi_selected = False
+        elif cfg.execute_mppi and mppi_would_select:
+            executed_action = candidate_action
+            action_source = "mppi"
+            selected_reason = "select_mppi"
+            reject_reason = "none"
+            mppi_selected = True
+        else:
+            executed_action = base_action
+            action_source = "sac"
+            selected_reason = "select_sac"
+            reject_reason = self._reward_aligned_reject_reason(reward_ok, trust_ok, safety_ok)
+            mppi_selected = False
+
+        if cfg.final_safety_check and self._emergency_brake_needed(base_metrics, candidate_metrics, radar):
+            executed_action = self._emergency_brake_action(base_action)
+            action_source = "fallback"
+            selected_reason = "select_emergency_brake"
+            reject_reason = "emergency_brake"
+            mppi_selected = False
+
+        self.last_action = executed_action.astype(np.float32)
+        self.last_noise_scale = float(noise_scale)
+        debug = self._make_reward_aligned_debug(
+            base_action=base_action,
+            executed_action=executed_action,
+            candidate_action=candidate_action,
+            base_metrics=base_metrics,
+            candidate_metrics=candidate_metrics,
+            radar=radar,
+            mppi_active=True,
+            mppi_selected=mppi_selected,
+            selected_reason=selected_reason,
+            reject_reason=reject_reason,
+            prior_type=prior_names[best_idx],
+            warm_start_used=warm_start_used,
+            noise_scale=noise_scale,
+        )
+        debug["action_source"] = action_source
+        debug["terminal_source"] = action_source
+        return executed_action.astype(np.float32), debug
+
+    def _sample_sac_centered_sequences(
+        self,
+        base_action: np.ndarray,
+        noise_scale: float,
+    ) -> Tuple[np.ndarray, List[str], bool]:
+        cfg = self.config
+        residual_low = np.asarray(cfg.reward_aligned_residual_low, dtype=float)
+        residual_high = np.asarray(cfg.reward_aligned_residual_high, dtype=float)
+        noise_std = np.asarray(cfg.base_noise_std, dtype=float) * noise_scale
+        sequences: List[np.ndarray] = [np.tile(base_action.reshape(1, 2), (cfg.horizon, 1))]
+        names: List[str] = ["sac_prior"]
+        warm_start_used = False
+
+        if self.best_sequence is not None and self.best_sequence.shape == (cfg.horizon, 2):
+            shifted = np.vstack([self.best_sequence[1:], base_action.reshape(1, 2)])
+            shifted = np.clip(
+                shifted,
+                base_action.reshape(1, 2) + residual_low.reshape(1, 2),
+                base_action.reshape(1, 2) + residual_high.reshape(1, 2),
+            )
+            sequences.append(self._clip_sequence(shifted))
+            names.append("warm_start")
+            warm_start_used = True
+
+        while len(sequences) < cfg.num_samples:
+            residual = self.rng.normal(0.0, noise_std, size=(cfg.horizon, 2))
+            residual = np.clip(residual, residual_low, residual_high)
+            sequences.append(self._clip_sequence(base_action.reshape(1, 1, 2) + residual)[0])
+            names.append("sac_residual")
+
+        return np.asarray(sequences[: cfg.num_samples], dtype=float), names[: cfg.num_samples], warm_start_used
+
+    def _reward_aligned_rollout(
+        self,
+        action_sequence: np.ndarray,
+        base_action: np.ndarray,
+        planner_state: Dict[str, Any],
+        obstacles: Optional[np.ndarray],
+    ) -> Dict[str, float]:
+        cfg = self.config
+        dt = float(planner_state.get("dt", 0.1))
+        mass = float(planner_state.get("mass", 2.0))
+        damping = float(planner_state.get("damping", 0.5))
+        position = np.asarray(planner_state["position"], dtype=float).copy()
+        start_position = position.copy()
+        yaw = float(planner_state.get("yaw", 0.0))
+        velocity = np.asarray(planner_state.get("velocity", [0.0, 0.0, 0.0]), dtype=float).copy()
+        target = np.asarray(planner_state.get("target_position", position), dtype=float)
+        frenet_transform = planner_state.get("frenet_transform")
+        max_laser_range = float(planner_state.get("max_laser_range", 10.0))
+        prev_action = np.asarray(planner_state.get("last_action", self.last_action), dtype=float).reshape(-1)[:2]
+
+        if frenet_transform is not None:
+            prev_s, _ = frenet_transform.cartesian_to_frenet(position)
+            start_s = float(prev_s)
+            path_length = float(frenet_transform.path_length)
+        else:
+            prev_s = 0.0
+            start_s = 0.0
+            path_length = float(np.linalg.norm(target - position) + 1.0)
+
+        predicted_reward = 0.0
+        hard_safety_penalty = 0.0
+        total_dbas_cost = 0.0
+        total_ttc_cost = 0.0
+        total_oob_cost = 0.0
+        min_distance = max_laser_range
+        max_lateral_error = 0.0
+        max_heading_error = 0.0
+        terminal = "running"
+        terminal_step = -1
+
+        for step_idx, action in enumerate(action_sequence):
+            effective_action = cfg.action_lag_alpha * prev_action + (1.0 - cfg.action_lag_alpha) * action
+            control_input = np.array([float(effective_action[0]), 0.0, float(effective_action[1])], dtype=float)
+            acceleration = (control_input / mass) - (damping * velocity)
+            velocity = velocity + acceleration * dt
+            yaw = self._wrap_angle(yaw + velocity[2] * dt)
+            heading_vec = np.array([math.cos(yaw), math.sin(yaw)], dtype=float)
+            position = position + heading_vec * velocity[0] * dt
+
+            dist_to_goal = float(np.linalg.norm(target - position))
+            if frenet_transform is not None:
+                frenet_s, frenet_d = frenet_transform.cartesian_to_frenet(position)
+                heading_error = float(frenet_transform.get_heading_error(yaw, frenet_s))
+                distance_remaining = max(float(path_length - frenet_s), 0.0)
+            else:
+                frenet_s = prev_s + max(0.0, float(velocity[0] * dt))
+                frenet_d = 0.0
+                heading_error = 0.0
+                distance_remaining = dist_to_goal
+
+            delta_s = float(frenet_s - prev_s)
+            lateral_error = abs(float(frenet_d))
+            max_lateral_error = max(max_lateral_error, lateral_error)
+            max_heading_error = max(max_heading_error, abs(float(heading_error)))
+
+            obstacle_dist = self._min_obstacle_distance(position, obstacles, planner_state)
+            min_distance = min(min_distance, obstacle_dist)
+            dbas_cost = self._dbas_cost(obstacle_dist)
+            ttc_cost = self._ttc_cost(position, heading_vec * velocity[0], obstacles)
+            total_dbas_cost += dbas_cost
+            total_ttc_cost += ttc_cost
+
+            if obstacle_dist < cfg.collision_distance:
+                predicted_reward -= cfg.env_terminal_reward
+                hard_safety_penalty += cfg.hard_safety_penalty
+                terminal = "collision"
+                terminal_step = step_idx
+                break
+            if lateral_error > cfg.env_out_of_bounds_limit:
+                predicted_reward -= cfg.env_terminal_reward
+                hard_safety_penalty += cfg.hard_safety_penalty
+                total_oob_cost += (lateral_error - cfg.env_out_of_bounds_limit) ** 2 + 1.0
+                terminal = "out_of_bounds"
+                terminal_step = step_idx
+                break
+            if distance_remaining < cfg.env_goal_threshold:
+                predicted_reward += cfg.env_success_reward
+                terminal = "success"
+                terminal_step = step_idx
+                break
+
+            env_reward = frenet_reward(delta_s, float(frenet_d), heading_error)["total"] * cfg.env_frenet_reward_scale
+            if obstacle_dist < cfg.env_safe_distance:
+                penalty = math.exp(5.0 * (cfg.env_safe_distance - obstacle_dist)) - 1.0
+                env_reward -= min(penalty, 10.0)
+            env_reward -= abs(action[0] - prev_action[0]) * 0.2 + abs(action[1] - prev_action[1]) * 0.1
+            env_reward -= 0.1
+            predicted_reward += env_reward
+            prev_s = frenet_s
+            prev_action = effective_action
+
+        trust_delta = action_sequence - base_action.reshape(1, 2)
+        trust_region_cost = float(np.mean(np.sum(trust_delta * trust_delta, axis=1)))
+        total_cost = (
+            -predicted_reward
+            + hard_safety_penalty
+            + cfg.trust_region_weight * trust_region_cost
+            + 0.25 * cfg.dbas_weight * total_dbas_cost
+            + 0.25 * cfg.ttc_weight * total_ttc_cost
+            + cfg.out_of_bounds_weight * total_oob_cost
+        )
+        if frenet_transform is not None:
+            progress = float(prev_s - start_s)
+        else:
+            progress = float(np.linalg.norm(target - start_position) - np.linalg.norm(target - position))
+        collision_risk = 1.0 if terminal == "collision" or min_distance < cfg.collision_distance else 0.0
+        out_of_bounds_risk = 1.0 if terminal == "out_of_bounds" or max_lateral_error > cfg.env_out_of_bounds_limit else 0.0
+        risk_score = 10.0 * collision_risk + 4.0 * out_of_bounds_risk + total_ttc_cost + 0.2 * total_dbas_cost
+
+        return {
+            "total_cost": float(total_cost),
+            "predicted_reward": float(predicted_reward),
+            "hard_safety_penalty": float(hard_safety_penalty),
+            "trust_region_cost": float(trust_region_cost),
+            "min_distance": float(min_distance),
+            "dbas_cost": float(total_dbas_cost),
+            "ttc_cost": float(total_ttc_cost),
+            "out_of_bounds_cost": float(total_oob_cost),
+            "max_lateral_error": float(max_lateral_error),
+            "max_heading_error": float(max_heading_error),
+            "progress": float(progress),
+            "final_distance_to_goal": float(np.linalg.norm(target - position)),
+            "risk_score": float(risk_score),
+            "collision_risk": float(collision_risk),
+            "out_of_bounds_risk": float(out_of_bounds_risk),
+            "rollout_terminal": terminal,
+            "rollout_terminal_step": float(terminal_step),
+        }
+
+    def _trust_region_ok(self, candidate_action: np.ndarray, base_action: np.ndarray) -> bool:
+        action_delta = np.abs(candidate_action - base_action)
+        return bool(np.all(action_delta <= np.asarray(self.config.mppi_max_action_delta, dtype=float) + 1e-6))
+
+    def _final_safety_ok(self, candidate_metrics: Dict[str, float]) -> bool:
+        return bool(
+            candidate_metrics["collision_risk"] <= 0.0
+            and candidate_metrics["out_of_bounds_risk"] <= 0.0
+            and candidate_metrics["min_distance"] >= self.config.collision_distance
+        )
+
+    def _emergency_brake_needed(
+        self,
+        base_metrics: Dict[str, float],
+        candidate_metrics: Dict[str, float],
+        radar: Dict[str, float],
+    ) -> bool:
+        if radar["global_min"] < self.config.emergency_brake_distance:
+            return True
+        return bool(base_metrics["collision_risk"] > 0.0 and candidate_metrics["collision_risk"] > 0.0)
+
+    def _emergency_brake_action(self, base_action: np.ndarray) -> np.ndarray:
+        action = base_action.astype(float).copy()
+        action[0] = min(action[0], self.config.hard_brake_surge)
+        action[1] = 0.0
+        return self._clip_action(action)
+
+    @staticmethod
+    def _reward_aligned_reject_reason(reward_ok: bool, trust_ok: bool, safety_ok: bool) -> str:
+        if not safety_ok:
+            return "reject_hard_safety"
+        if not trust_ok:
+            return "reject_trust_region"
+        if not reward_ok:
+            return "reject_no_reward_gain"
+        return "reject_disabled"
+
+    def _make_reward_aligned_debug(
+        self,
+        base_action: np.ndarray,
+        executed_action: np.ndarray,
+        candidate_action: np.ndarray,
+        base_metrics: Dict[str, float],
+        candidate_metrics: Dict[str, float],
+        radar: Dict[str, float],
+        mppi_active: bool,
+        mppi_selected: bool,
+        selected_reason: str,
+        reject_reason: str,
+        prior_type: str,
+        warm_start_used: bool,
+        noise_scale: float,
+    ) -> Dict[str, float]:
+        action_delta = executed_action - base_action
+        predicted_reward_delta = candidate_metrics["predicted_reward"] - base_metrics["predicted_reward"]
+        source = "mppi" if mppi_selected else ("fallback" if selected_reason == "select_emergency_brake" else "sac")
+        return {
+            "raw_action_surge": float(base_action[0]),
+            "raw_action_yaw": float(base_action[1]),
+            "optimized_action_surge": float(executed_action[0]),
+            "optimized_action_yaw": float(executed_action[1]),
+            "candidate_action_surge": float(candidate_action[0]),
+            "candidate_action_yaw": float(candidate_action[1]),
+            "action_delta_surge": float(action_delta[0]),
+            "action_delta_yaw": float(action_delta[1]),
+            "action_delta_norm": float(np.linalg.norm(action_delta)),
+            "mppi_cost": float(candidate_metrics["total_cost"]),
+            "dbas_cost": float(candidate_metrics["dbas_cost"]),
+            "ttc_cost": float(candidate_metrics["ttc_cost"]),
+            "out_of_bounds_cost": float(candidate_metrics["out_of_bounds_cost"]),
+            "min_predicted_obstacle_distance": float(candidate_metrics["min_distance"]),
+            "current_obstacle_distance": float(radar["global_min"]),
+            "exploration_noise_scale": float(noise_scale),
+            "mppi_active": bool(mppi_active),
+            "mppi_accept": bool(mppi_selected),
+            "mppi_reject": bool(mppi_active and not mppi_selected),
+            "mppi_selected": bool(mppi_selected),
+            "mppi_decision_reason": selected_reason if mppi_selected else reject_reason,
+            "selected_reason": selected_reason,
+            "reject_reason": reject_reason,
+            "mppi_rejected_reason": reject_reason,
+            "mppi_prior_type": prior_type,
+            "mppi_warm_start_used": bool(warm_start_used),
+            "teacher_mppi_would_accept": bool(predicted_reward_delta >= self.config.reward_improvement_threshold),
+            "fallback_active": selected_reason == "select_emergency_brake",
+            "fallback_accept": selected_reason == "select_emergency_brake",
+            "action_source": source,
+            "terminal_source": source,
+            "predicted_reward_sac": float(base_metrics["predicted_reward"]),
+            "predicted_reward_mppi": float(candidate_metrics["predicted_reward"]),
+            "predicted_reward_delta": float(predicted_reward_delta),
+            "reward_prediction_error": 0.0,
+            "sac_rollout_terminal": base_metrics["rollout_terminal"],
+            "mppi_rollout_terminal": candidate_metrics["rollout_terminal"],
+            "candidate_sac_score": float(base_metrics["total_cost"]),
+            "candidate_fallback_score": float(base_metrics["total_cost"]),
+            "candidate_mppi_score": float(candidate_metrics["total_cost"]),
+            "sac_pred_collision": bool(base_metrics["collision_risk"] > 0.0),
+            "fallback_pred_collision": bool(base_metrics["collision_risk"] > 0.0),
+            "mppi_pred_collision": bool(candidate_metrics["collision_risk"] > 0.0),
+            "sac_pred_out_of_bounds": bool(base_metrics["out_of_bounds_risk"] > 0.0),
+            "fallback_pred_out_of_bounds": bool(base_metrics["out_of_bounds_risk"] > 0.0),
+            "mppi_pred_out_of_bounds": bool(candidate_metrics["out_of_bounds_risk"] > 0.0),
+            "sac_min_obstacle_distance": float(base_metrics["min_distance"]),
+            "fallback_min_obstacle_distance": float(base_metrics["min_distance"]),
+            "mppi_min_obstacle_distance": float(candidate_metrics["min_distance"]),
+            "base_risk": float(base_metrics["risk_score"]),
+            "candidate_risk": float(candidate_metrics["risk_score"]),
+            "fallback_risk": float(base_metrics["risk_score"]),
+            "base_min_distance": float(base_metrics["min_distance"]),
+            "candidate_min_distance": float(candidate_metrics["min_distance"]),
+            "fallback_min_distance": float(base_metrics["min_distance"]),
+            "base_ttc_cost": float(base_metrics["ttc_cost"]),
+            "candidate_ttc_cost": float(candidate_metrics["ttc_cost"]),
+            "fallback_ttc_cost": float(base_metrics["ttc_cost"]),
+            "base_max_lateral_error": float(base_metrics["max_lateral_error"]),
+            "candidate_max_lateral_error": float(candidate_metrics["max_lateral_error"]),
+            "fallback_max_lateral_error": float(base_metrics["max_lateral_error"]),
+            "base_progress": float(base_metrics["progress"]),
+            "candidate_progress": float(candidate_metrics["progress"]),
+            "fallback_progress": float(base_metrics["progress"]),
+            "front_obstacle_distance": float(radar["front_min"]),
+            "left_clearance": float(radar["left_min"]),
+            "right_clearance": float(radar["right_min"]),
+            "global_obstacle_distance": float(radar["global_min"]),
+        }
 
     def _sample_action_sequences(
         self,
