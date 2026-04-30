@@ -175,6 +175,7 @@ class MyCarEnv(gym.Env):
         terminated = False
         truncated = False
         reward = 0.0
+        terminal_reason = "running"
         self.step_count += 1
 
         # 获取最小障碍物距离
@@ -199,16 +200,19 @@ class MyCarEnv(gym.Env):
         if min_laser_dist < 0.25:
             reward = -100.0
             terminated = True
+            terminal_reason = "collision"
             print("Collision detected!")
             
         elif abs(frenet_d) > max_frenet_d_allowed:  # 越界死亡逻辑
             reward = -100.0
             terminated = True
+            terminal_reason = "out_of_bounds"
             print(f"Out of bounds! Deviated {frenet_d:.2f}m from path.")
             
         elif distance_remaining < self.goal_reach_threshold:
             reward = +1000.0
             terminated = True
+            terminal_reason = "success"
             print("Goal reached!")
             
         else:
@@ -237,6 +241,8 @@ class MyCarEnv(gym.Env):
         # 8. 超时截断判断
         if self.step_count >= self.max_steps:
             truncated = True
+            if terminal_reason == "running":
+                terminal_reason = "timeout"
             print(f"Timeout at {self.step_count} steps.")
 
         # 9. 更新上一帧的 s 值
@@ -260,6 +266,8 @@ class MyCarEnv(gym.Env):
             "is_success": bool(distance_remaining < self.goal_reach_threshold),
             "is_collision": bool(min_laser_dist < 0.25),
             "is_timeout": bool(truncated),
+            "is_out_of_bounds": bool(terminal_reason == "out_of_bounds"),
+            "terminal_reason": terminal_reason,
         }
 
         return obs, reward, terminated, truncated, info

@@ -21,19 +21,27 @@ def unwrap_env(env):
     return current
 
 
-def make_env(use_mppi: bool, seed: int, log_dir: str):
+def config_for_mode(mode: str, seed: int) -> MPPIDBaSConfig:
+    if mode == "trust_mppi":
+        return MPPIDBaSConfig(seed=seed, dbas_weight=0.0, risk_activation_distance=10.0)
+    if mode == "trust_mppi_dbas":
+        return MPPIDBaSConfig(seed=seed, risk_activation_distance=10.0)
+    return MPPIDBaSConfig(seed=seed)
+
+
+def make_env(mode: str, seed: int, log_dir: str):
     def _init():
         env = MyCarEnv()
-        if use_mppi:
-            env = MppiDbaSActionWrapper(env, MPPIDBaSConfig(seed=seed))
-        env = Monitor(env, filename=os.path.join(log_dir, "mppi_dbas" if use_mppi else "baseline"))
+        if mode != "baseline":
+            env = MppiDbaSActionWrapper(env, config_for_mode(mode, seed))
+        env = Monitor(env, filename=os.path.join(log_dir, mode))
         return env
 
     return _init
 
 
-def build_eval_env(use_mppi: bool, seed: int, log_dir: str, frame_stack: int):
-    env = DummyVecEnv([make_env(use_mppi, seed, log_dir)])
+def build_eval_env(mode: str, seed: int, log_dir: str, frame_stack: int):
+    env = DummyVecEnv([make_env(mode, seed, log_dir)])
     if frame_stack > 1:
         env = VecFrameStack(env, n_stack=frame_stack)
     return env
@@ -72,7 +80,7 @@ def get_metric_state(vec_env) -> Dict[str, float]:
     }
 
 
-def run_episode(model: SAC, vec_env, deterministic: bool) -> Dict[str, Any]:
+def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx: int, trace_dir: str) -> Dict[str, Any]:
     obs = vec_env.reset()
     episode_reward = 0.0
     path_length = 0.0
@@ -80,11 +88,14 @@ def run_episode(model: SAC, vec_env, deterministic: bool) -> Dict[str, Any]:
     frenet_errors: List[float] = []
     action_changes: List[float] = []
     raw_action_changes: List[float] = []
+    mppi_active_flags: List[float] = []
     mppi_debug: List[Dict[str, float]] = []
+    trace_rows: List[Dict[str, Any]] = []
     prev_pos = None
     prev_action = None
     prev_raw_action = None
     last_info: Dict[str, Any] = {}
+    step_idx = 0
 
     while True:
         action, _ = model.predict(obs, deterministic=deterministic)
@@ -118,27 +129,62 @@ def run_episode(model: SAC, vec_env, deterministic: bool) -> Dict[str, Any]:
         prev_action = executed_action
         prev_raw_action = raw_action
 
+        mppi_active = float(bool(info.get("mppi_active", False)))
+        mppi_active_flags.append(mppi_active)
         if info.get("mppi_dbas_enabled"):
             mppi_debug.append({
                 "dbas_cost": float(info.get("dbas_cost", 0.0)),
+                "ttc_cost": float(info.get("ttc_cost", 0.0)),
+                "out_of_bounds_cost": float(info.get("out_of_bounds_cost", 0.0)),
+                "action_delta_norm": float(info.get("action_delta_norm", 0.0)),
+                "current_obstacle_distance": float(info.get("current_obstacle_distance", 0.0)),
                 "min_predicted_obstacle_distance": float(info.get("min_predicted_obstacle_distance", 0.0)),
                 "exploration_noise_scale": float(info.get("exploration_noise_scale", 0.0)),
             })
+
+        trace_rows.append({
+            "step": step_idx,
+            "reward": float(rewards[0]),
+            "x": float(pos[0]),
+            "y": float(pos[1]),
+            "distance_to_goal": float(metrics["distance_to_goal"]),
+            "frenet_abs_d": float(metrics["frenet_abs_d"]),
+            "min_scan_distance": float(metrics["min_scan_distance"]),
+            "raw_surge": float(raw_action[0]),
+            "raw_yaw": float(raw_action[1]),
+            "optimized_surge": float(executed_action[0]),
+            "optimized_yaw": float(executed_action[1]),
+            "action_delta_norm": float(info.get("action_delta_norm", 0.0)),
+            "current_obstacle_distance": float(info.get("current_obstacle_distance", metrics["min_scan_distance"])),
+            "mppi_active": mppi_active,
+            "terminal_reason": info.get("terminal_reason", "running"),
+        })
+        step_idx += 1
 
         if bool(dones[0]):
             final_step_count = int(metrics.get("step_count", getattr(env, "step_count", 0)))
             if "episode" in last_info and isinstance(last_info["episode"], dict):
                 final_step_count = int(last_info["episode"].get("l", final_step_count))
-            terminated_by_success = bool(last_info.get("is_success", metrics["distance_to_goal"] < getattr(env, "goal_reach_threshold", 0.4)))
-            collision = bool(last_info.get("is_collision", min_scan_distance < 0.25))
-            timeout = bool(last_info.get("TimeLimit.truncated", False)) or (
-                not terminated_by_success and not collision and bool(last_info.get("is_timeout", final_step_count >= getattr(env, "max_steps", 0)))
+            terminal_reason = str(last_info.get("terminal_reason", "unknown"))
+            terminated_by_success = terminal_reason == "success" or bool(
+                last_info.get("is_success", metrics["distance_to_goal"] < getattr(env, "goal_reach_threshold", 0.4))
             )
+            collision = terminal_reason == "collision" or bool(last_info.get("is_collision", min_scan_distance < 0.25))
+            out_of_bounds = terminal_reason == "out_of_bounds" or bool(last_info.get("is_out_of_bounds", False))
+            timeout = terminal_reason == "timeout" or bool(last_info.get("TimeLimit.truncated", False)) or (
+                not terminated_by_success
+                and not collision
+                and not out_of_bounds
+                and bool(last_info.get("is_timeout", final_step_count >= getattr(env, "max_steps", 0)))
+            )
+            write_csv(os.path.join(trace_dir, f"{mode}_episode_{episode_idx:03d}.csv"), trace_rows)
             return {
                 "reward": episode_reward,
                 "success": int(terminated_by_success),
                 "collision": int(collision),
+                "out_of_bounds": int(out_of_bounds),
                 "timeout": int(timeout),
+                "terminal_reason": terminal_reason,
                 "steps": final_step_count,
                 "duration": float(final_step_count * metrics["dt"]),
                 "path_length": path_length,
@@ -146,7 +192,12 @@ def run_episode(model: SAC, vec_env, deterministic: bool) -> Dict[str, Any]:
                 "mean_frenet_abs_d": float(np.mean(frenet_errors)) if frenet_errors else 0.0,
                 "mean_action_change": float(np.mean(action_changes)) if action_changes else 0.0,
                 "mean_raw_action_change": float(np.mean(raw_action_changes)) if raw_action_changes else 0.0,
+                "mean_mppi_active": float(np.mean(mppi_active_flags)) if mppi_active_flags else 0.0,
+                "mean_action_delta_norm": mean_debug(mppi_debug, "action_delta_norm"),
+                "mean_current_obstacle_distance": mean_debug(mppi_debug, "current_obstacle_distance"),
                 "mean_dbas_cost": mean_debug(mppi_debug, "dbas_cost"),
+                "mean_ttc_cost": mean_debug(mppi_debug, "ttc_cost"),
+                "mean_out_of_bounds_cost": mean_debug(mppi_debug, "out_of_bounds_cost"),
                 "mean_min_predicted_obstacle_distance": mean_debug(mppi_debug, "min_predicted_obstacle_distance"),
                 "mean_exploration_noise_scale": mean_debug(mppi_debug, "exploration_noise_scale"),
             }
@@ -159,23 +210,26 @@ def mean_debug(rows: List[Dict[str, float]], key: str) -> float:
 
 
 def run_mode(args, mode: str) -> List[Dict[str, Any]]:
-    use_mppi = mode == "mppi_dbas"
     log_dir = os.path.join(args.output_dir, "monitor_logs")
+    trace_dir = os.path.join(args.output_dir, "traces")
     os.makedirs(log_dir, exist_ok=True)
-    vec_env = build_eval_env(use_mppi, args.seed, log_dir, args.frame_stack)
+    os.makedirs(trace_dir, exist_ok=True)
+    vec_env = build_eval_env(mode, args.seed, log_dir, args.frame_stack)
     model = SAC.load(args.model, env=vec_env, device=args.device)
 
     rows = []
     for episode_idx in range(args.episodes):
         np.random.seed(args.seed + episode_idx)
-        row = run_episode(model, vec_env, deterministic=not args.stochastic)
+        row = run_episode(model, vec_env, deterministic=not args.stochastic, mode=mode, episode_idx=episode_idx, trace_dir=trace_dir)
         row["episode"] = episode_idx
+        row["seed"] = args.seed + episode_idx
         row["mode"] = mode
         rows.append(row)
         print(
             f"[{mode}] episode={episode_idx + 1}/{args.episodes} "
             f"success={row['success']} collision={row['collision']} "
-            f"reward={row['reward']:.2f} min_obs={row['min_obstacle_distance']:.2f}"
+            f"oob={row['out_of_bounds']} reward={row['reward']:.2f} "
+            f"delta={row['mean_action_delta_norm']:.3f} active={row['mean_mppi_active']:.2f}"
         )
 
     vec_env.close()
@@ -198,17 +252,52 @@ def summarize(rows: List[Dict[str, Any]]) -> Dict[str, float]:
     numeric_keys = [key for key, value in rows[0].items() if isinstance(value, (int, float))]
     summary = {"episodes": len(rows)}
     for key in numeric_keys:
-        if key == "episode":
+        if key in ("episode", "seed"):
             continue
         summary[f"mean_{key}"] = float(np.mean([float(row[key]) for row in rows]))
     return summary
+
+
+def paired_summary(all_rows: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+    baseline = {row["episode"]: row for row in all_rows.get("baseline", [])}
+    result: Dict[str, Any] = {}
+    for mode, rows in all_rows.items():
+        if mode == "baseline":
+            continue
+        pairs = []
+        for row in rows:
+            base = baseline.get(row["episode"])
+            if base is None:
+                continue
+            pairs.append({
+                "episode": row["episode"],
+                "seed": row["seed"],
+                "reward_delta": row["reward"] - base["reward"],
+                "success_delta": row["success"] - base["success"],
+                "collision_delta": row["collision"] - base["collision"],
+                "out_of_bounds_delta": row["out_of_bounds"] - base["out_of_bounds"],
+                "min_obstacle_distance_delta": row["min_obstacle_distance"] - base["min_obstacle_distance"],
+            })
+        result[mode] = {
+            "pairs": len(pairs),
+            "mean_reward_delta": float(np.mean([p["reward_delta"] for p in pairs])) if pairs else 0.0,
+            "mean_success_delta": float(np.mean([p["success_delta"] for p in pairs])) if pairs else 0.0,
+            "mean_collision_delta": float(np.mean([p["collision_delta"] for p in pairs])) if pairs else 0.0,
+            "mean_out_of_bounds_delta": float(np.mean([p["out_of_bounds_delta"] for p in pairs])) if pairs else 0.0,
+            "mean_min_obstacle_distance_delta": float(np.mean([p["min_obstacle_distance_delta"] for p in pairs])) if pairs else 0.0,
+        }
+    return result
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Compare SAC baseline and SAC+MPPI-DBaS for USV navigation.")
     parser.add_argument("--model", required=True, help="Path to a trained SAC model zip.")
     parser.add_argument("--episodes", type=int, default=30)
-    parser.add_argument("--mode", choices=["baseline", "mppi_dbas", "both"], default="both")
+    parser.add_argument(
+        "--mode",
+        choices=["baseline", "mppi_dbas", "trust_mppi", "trust_mppi_dbas", "both", "ablation"],
+        default="both",
+    )
     parser.add_argument("--output-dir", default="./comparison_results")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--frame-stack", type=int, default=4, help="Use 4 for models trained by beam_map/train.py; use 1 for plain models.")
@@ -220,14 +309,22 @@ def parse_args():
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
-    modes = ["baseline", "mppi_dbas"] if args.mode == "both" else [args.mode]
+    if args.mode == "both":
+        modes = ["baseline", "mppi_dbas"]
+    elif args.mode == "ablation":
+        modes = ["baseline", "trust_mppi", "trust_mppi_dbas", "mppi_dbas"]
+    else:
+        modes = [args.mode]
 
+    all_rows: Dict[str, List[Dict[str, Any]]] = {}
     summary = {}
     for mode in modes:
         rows = run_mode(args, mode)
+        all_rows[mode] = rows
         write_csv(os.path.join(args.output_dir, f"{mode}_metrics.csv"), rows)
         summary[mode] = summarize(rows)
 
+    summary["paired"] = paired_summary(all_rows)
     with open(os.path.join(args.output_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
 
