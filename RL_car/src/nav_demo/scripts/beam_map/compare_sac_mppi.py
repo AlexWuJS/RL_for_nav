@@ -132,6 +132,7 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
         mppi_active = float(bool(info.get("mppi_active", False)))
         mppi_active_flags.append(mppi_active)
         if info.get("mppi_dbas_enabled"):
+            reason = str(info.get("mppi_decision_reason", "none"))
             mppi_debug.append({
                 "dbas_cost": float(info.get("dbas_cost", 0.0)),
                 "ttc_cost": float(info.get("ttc_cost", 0.0)),
@@ -140,6 +141,12 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
                 "current_obstacle_distance": float(info.get("current_obstacle_distance", 0.0)),
                 "min_predicted_obstacle_distance": float(info.get("min_predicted_obstacle_distance", 0.0)),
                 "exploration_noise_scale": float(info.get("exploration_noise_scale", 0.0)),
+                "mppi_accept": float(bool(info.get("mppi_accept", False))),
+                "mppi_reject": float(bool(info.get("mppi_reject", False))),
+                "reject_collision_risk": float(reason == "reject_collision_risk"),
+                "reject_out_of_bounds": float(reason == "reject_out_of_bounds"),
+                "reject_progress_loss": float(reason == "reject_progress_loss"),
+                "reject_no_safety_gain": float(reason == "reject_no_safety_gain"),
             })
 
         trace_rows.append({
@@ -157,6 +164,19 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
             "action_delta_norm": float(info.get("action_delta_norm", 0.0)),
             "current_obstacle_distance": float(info.get("current_obstacle_distance", metrics["min_scan_distance"])),
             "mppi_active": mppi_active,
+            "mppi_accept": int(bool(info.get("mppi_accept", False))),
+            "mppi_reject": int(bool(info.get("mppi_reject", False))),
+            "mppi_decision_reason": info.get("mppi_decision_reason", "none"),
+            "base_risk": float(info.get("base_risk", 0.0)),
+            "candidate_risk": float(info.get("candidate_risk", 0.0)),
+            "base_min_distance": float(info.get("base_min_distance", metrics["min_scan_distance"])),
+            "candidate_min_distance": float(info.get("candidate_min_distance", metrics["min_scan_distance"])),
+            "base_ttc_cost": float(info.get("base_ttc_cost", 0.0)),
+            "candidate_ttc_cost": float(info.get("candidate_ttc_cost", 0.0)),
+            "base_max_lateral_error": float(info.get("base_max_lateral_error", 0.0)),
+            "candidate_max_lateral_error": float(info.get("candidate_max_lateral_error", 0.0)),
+            "base_progress": float(info.get("base_progress", 0.0)),
+            "candidate_progress": float(info.get("candidate_progress", 0.0)),
             "terminal_reason": info.get("terminal_reason", "running"),
         })
         step_idx += 1
@@ -193,6 +213,12 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
                 "mean_action_change": float(np.mean(action_changes)) if action_changes else 0.0,
                 "mean_raw_action_change": float(np.mean(raw_action_changes)) if raw_action_changes else 0.0,
                 "mean_mppi_active": float(np.mean(mppi_active_flags)) if mppi_active_flags else 0.0,
+                "mean_mppi_accept": mean_debug(mppi_debug, "mppi_accept"),
+                "mean_mppi_reject": mean_debug(mppi_debug, "mppi_reject"),
+                "reject_collision_risk": mean_debug(mppi_debug, "reject_collision_risk"),
+                "reject_out_of_bounds": mean_debug(mppi_debug, "reject_out_of_bounds"),
+                "reject_progress_loss": mean_debug(mppi_debug, "reject_progress_loss"),
+                "reject_no_safety_gain": mean_debug(mppi_debug, "reject_no_safety_gain"),
                 "mean_action_delta_norm": mean_debug(mppi_debug, "action_delta_norm"),
                 "mean_current_obstacle_distance": mean_debug(mppi_debug, "current_obstacle_distance"),
                 "mean_dbas_cost": mean_debug(mppi_debug, "dbas_cost"),

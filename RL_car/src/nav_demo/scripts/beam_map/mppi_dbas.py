@@ -32,6 +32,9 @@ class MPPIDBaSConfig:
     smoothness_weight: float = 0.5
     ttc_weight: float = 2.0
     ttc_horizon: float = 2.0
+    safety_distance_margin: float = 0.03
+    max_progress_loss: float = 0.15
+    max_lateral_worsening: float = 0.10
     out_of_bounds_limit: float = 2.5
     out_of_bounds_weight: float = 80.0
     front_sector_half_angle: float = 1.35
@@ -57,10 +60,17 @@ class MPPIDBaSOptimizer:
         obstacles = self._scan_to_obstacle_points(planner_state)
         position = np.asarray(planner_state["position"], dtype=float)
         current_min_dist = self._min_obstacle_distance(position, obstacles, planner_state)
+        base_sequence = np.tile(base_action.reshape(1, 2), (cfg.horizon, 1))
+        base_metrics = self._rollout_metrics(base_sequence, base_action, planner_state, obstacles)
 
-        if current_min_dist >= cfg.risk_activation_distance:
+        if not self._base_action_needs_filter(base_metrics, current_min_dist):
             self.last_action = base_action.astype(np.float32)
-            return base_action.astype(np.float32), self._make_passthrough_debug(base_action, current_min_dist)
+            return base_action.astype(np.float32), self._make_passthrough_debug(
+                base_action,
+                current_min_dist,
+                base_metrics,
+                "base_safe",
+            )
 
         noise_scale = self._adaptive_noise_scale(current_min_dist)
         noise_std = np.asarray(cfg.base_noise_std, dtype=float) * noise_scale
@@ -100,17 +110,23 @@ class MPPIDBaSOptimizer:
         correction = np.clip(correction, -max_delta, max_delta)
         optimized_action = np.clip(base_action + correction, lower, upper)
         optimized_action = self._clip_action(optimized_action)
+        candidate_sequence = np.tile(optimized_action.reshape(1, 2), (cfg.horizon, 1))
+        candidate_metrics = self._rollout_metrics(candidate_sequence, base_action, planner_state, obstacles)
+        accept, decision_reason = self._accept_candidate(base_metrics, candidate_metrics, optimized_action, base_action)
+        executed_action = optimized_action if accept else base_action
 
-        self.last_action = optimized_action.astype(np.float32)
+        self.last_action = executed_action.astype(np.float32)
         self.last_noise_scale = float(noise_scale)
 
         best_idx = int(np.argmin(costs))
-        action_delta = optimized_action - base_action
+        action_delta = executed_action - base_action
         debug = {
             "raw_action_surge": float(base_action[0]),
             "raw_action_yaw": float(base_action[1]),
-            "optimized_action_surge": float(optimized_action[0]),
-            "optimized_action_yaw": float(optimized_action[1]),
+            "optimized_action_surge": float(executed_action[0]),
+            "optimized_action_yaw": float(executed_action[1]),
+            "candidate_action_surge": float(optimized_action[0]),
+            "candidate_action_yaw": float(optimized_action[1]),
             "action_delta_surge": float(action_delta[0]),
             "action_delta_yaw": float(action_delta[1]),
             "action_delta_norm": float(np.linalg.norm(action_delta)),
@@ -124,8 +140,21 @@ class MPPIDBaSOptimizer:
             "current_obstacle_distance": float(current_min_dist),
             "exploration_noise_scale": float(noise_scale),
             "mppi_active": True,
+            "mppi_accept": bool(accept),
+            "mppi_reject": bool(not accept),
+            "mppi_decision_reason": decision_reason,
+            "base_risk": float(base_metrics["risk_score"]),
+            "candidate_risk": float(candidate_metrics["risk_score"]),
+            "base_min_distance": float(base_metrics["min_distance"]),
+            "candidate_min_distance": float(candidate_metrics["min_distance"]),
+            "base_ttc_cost": float(base_metrics["ttc_cost"]),
+            "candidate_ttc_cost": float(candidate_metrics["ttc_cost"]),
+            "base_max_lateral_error": float(base_metrics["max_lateral_error"]),
+            "candidate_max_lateral_error": float(candidate_metrics["max_lateral_error"]),
+            "base_progress": float(base_metrics["progress"]),
+            "candidate_progress": float(candidate_metrics["progress"]),
         }
-        return optimized_action.astype(np.float32), debug
+        return executed_action.astype(np.float32), debug
 
     def _rollout_cost(
         self,
@@ -134,6 +163,22 @@ class MPPIDBaSOptimizer:
         planner_state: Dict[str, Any],
         obstacles: Optional[np.ndarray],
     ) -> Tuple[float, float, float, float, float]:
+        metrics = self._rollout_metrics(action_sequence, base_action, planner_state, obstacles)
+        return (
+            metrics["total_cost"],
+            metrics["min_distance"],
+            metrics["dbas_cost"],
+            metrics["ttc_cost"],
+            metrics["out_of_bounds_cost"],
+        )
+
+    def _rollout_metrics(
+        self,
+        action_sequence: np.ndarray,
+        base_action: np.ndarray,
+        planner_state: Dict[str, Any],
+        obstacles: Optional[np.ndarray],
+    ) -> Dict[str, float]:
         cfg = self.config
         dt = float(planner_state.get("dt", 0.1))
         mass = float(planner_state.get("mass", 2.0))
@@ -152,6 +197,8 @@ class MPPIDBaSOptimizer:
         total_ttc_cost = 0.0
         total_oob_cost = 0.0
         min_distance = max_laser_range
+        max_lateral_error = 0.0
+        max_heading_error = 0.0
 
         for action in action_sequence:
             control_input = np.array([float(action[0]), 0.0, float(action[1])], dtype=float)
@@ -171,6 +218,8 @@ class MPPIDBaSOptimizer:
                 frenet_s, frenet_d = frenet_transform.cartesian_to_frenet(position)
                 lateral_error = abs(float(frenet_d))
                 heading_error = abs(float(frenet_transform.get_heading_error(yaw, frenet_s)))
+                max_lateral_error = max(max_lateral_error, lateral_error)
+                max_heading_error = max(max_heading_error, heading_error)
                 if lateral_error > cfg.out_of_bounds_limit:
                     out_of_bounds_cost = (lateral_error - cfg.out_of_bounds_limit) ** 2 + 1.0
 
@@ -206,14 +255,96 @@ class MPPIDBaSOptimizer:
             total_oob_cost += out_of_bounds_cost
             prev_action = action
 
-        return total_cost, min_distance, total_dbas_cost, total_ttc_cost, total_oob_cost
+        final_dist_to_goal = float(np.linalg.norm(target - position))
+        progress = start_dist_to_goal - final_dist_to_goal
+        collision_risk = 1.0 if min_distance < cfg.collision_distance else 0.0
+        safety_violation = max(0.0, cfg.safe_distance - min_distance)
+        out_of_bounds_risk = 1.0 if max_lateral_error > cfg.out_of_bounds_limit else 0.0
+        risk_score = (
+            10.0 * collision_risk
+            + 4.0 * out_of_bounds_risk
+            + 2.0 * safety_violation
+            + total_ttc_cost
+            + 0.2 * total_dbas_cost
+        )
 
-    def _make_passthrough_debug(self, base_action: np.ndarray, current_min_dist: float) -> Dict[str, float]:
+        return {
+            "total_cost": float(total_cost),
+            "min_distance": float(min_distance),
+            "dbas_cost": float(total_dbas_cost),
+            "ttc_cost": float(total_ttc_cost),
+            "out_of_bounds_cost": float(total_oob_cost),
+            "max_lateral_error": float(max_lateral_error),
+            "max_heading_error": float(max_heading_error),
+            "progress": float(progress),
+            "final_distance_to_goal": float(final_dist_to_goal),
+            "risk_score": float(risk_score),
+            "collision_risk": float(collision_risk),
+            "out_of_bounds_risk": float(out_of_bounds_risk),
+        }
+
+    def _base_action_needs_filter(self, base_metrics: Dict[str, float], current_min_dist: float) -> bool:
+        cfg = self.config
+        if current_min_dist < cfg.collision_distance:
+            return True
+        if base_metrics["min_distance"] < cfg.safe_distance:
+            return True
+        if base_metrics["ttc_cost"] > 0.0:
+            return True
+        if base_metrics["out_of_bounds_risk"] > 0.0:
+            return True
+        return False
+
+    def _accept_candidate(
+        self,
+        base_metrics: Dict[str, float],
+        candidate_metrics: Dict[str, float],
+        optimized_action: np.ndarray,
+        base_action: np.ndarray,
+    ) -> Tuple[bool, str]:
+        cfg = self.config
+        action_delta = np.abs(optimized_action - base_action)
+        if np.any(action_delta > np.asarray(cfg.max_action_delta, dtype=float) + 1e-6):
+            return False, "reject_trust_region"
+        if candidate_metrics["collision_risk"] > base_metrics["collision_risk"]:
+            return False, "reject_collision_risk"
+        if candidate_metrics["min_distance"] < cfg.collision_distance:
+            return False, "reject_collision_risk"
+        if candidate_metrics["out_of_bounds_risk"] > 0.0:
+            return False, "reject_out_of_bounds"
+        if candidate_metrics["max_lateral_error"] > base_metrics["max_lateral_error"] + cfg.max_lateral_worsening:
+            return False, "reject_out_of_bounds"
+        if candidate_metrics["progress"] < base_metrics["progress"] - cfg.max_progress_loss:
+            return False, "reject_progress_loss"
+
+        distance_gain = candidate_metrics["min_distance"] - base_metrics["min_distance"]
+        ttc_gain = base_metrics["ttc_cost"] - candidate_metrics["ttc_cost"]
+        risk_gain = base_metrics["risk_score"] - candidate_metrics["risk_score"]
+        if distance_gain >= cfg.safety_distance_margin or ttc_gain > 1e-6 or risk_gain > 0.05:
+            return True, "accept_safety_gain"
+        return False, "reject_no_safety_gain"
+
+    def _make_passthrough_debug(
+        self,
+        base_action: np.ndarray,
+        current_min_dist: float,
+        base_metrics: Optional[Dict[str, float]] = None,
+        reason: str = "base_safe",
+    ) -> Dict[str, float]:
+        base_metrics = base_metrics or {
+            "risk_score": 0.0,
+            "min_distance": current_min_dist,
+            "ttc_cost": 0.0,
+            "max_lateral_error": 0.0,
+            "progress": 0.0,
+        }
         return {
             "raw_action_surge": float(base_action[0]),
             "raw_action_yaw": float(base_action[1]),
             "optimized_action_surge": float(base_action[0]),
             "optimized_action_yaw": float(base_action[1]),
+            "candidate_action_surge": float(base_action[0]),
+            "candidate_action_yaw": float(base_action[1]),
             "action_delta_surge": 0.0,
             "action_delta_yaw": 0.0,
             "action_delta_norm": 0.0,
@@ -227,6 +358,19 @@ class MPPIDBaSOptimizer:
             "current_obstacle_distance": float(current_min_dist),
             "exploration_noise_scale": 0.0,
             "mppi_active": False,
+            "mppi_accept": False,
+            "mppi_reject": False,
+            "mppi_decision_reason": reason,
+            "base_risk": float(base_metrics["risk_score"]),
+            "candidate_risk": float(base_metrics["risk_score"]),
+            "base_min_distance": float(base_metrics["min_distance"]),
+            "candidate_min_distance": float(base_metrics["min_distance"]),
+            "base_ttc_cost": float(base_metrics["ttc_cost"]),
+            "candidate_ttc_cost": float(base_metrics["ttc_cost"]),
+            "base_max_lateral_error": float(base_metrics["max_lateral_error"]),
+            "candidate_max_lateral_error": float(base_metrics["max_lateral_error"]),
+            "base_progress": float(base_metrics["progress"]),
+            "candidate_progress": float(base_metrics["progress"]),
         }
 
     def _mppi_weights(self, costs: np.ndarray) -> np.ndarray:
