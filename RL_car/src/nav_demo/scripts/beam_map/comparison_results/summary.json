@@ -1,0 +1,36 @@
+{
+  "baseline": {
+    "episodes": 30,
+    "mean_reward": 1129.465136597585,
+    "mean_success": 0.7,
+    "mean_collision": 0.1,
+    "mean_timeout": 0.0,
+    "mean_steps": 100.3,
+    "mean_duration": 10.030000000000003,
+    "mean_path_length": 8.841126317891472,
+    "mean_min_obstacle_distance": 1.3620813302695751,
+    "mean_mean_frenet_abs_d": 1.8640447527009087,
+    "mean_mean_action_change": 0.15175252144346318,
+    "mean_mean_raw_action_change": 0.15175252144346318,
+    "mean_mean_dbas_cost": 0.0,
+    "mean_mean_min_predicted_obstacle_distance": 0.0,
+    "mean_mean_exploration_noise_scale": 0.0
+  },
+  "mppi_dbas": {
+    "episodes": 30,
+    "mean_reward": 494.3182968576749,
+    "mean_success": 0.26666666666666666,
+    "mean_collision": 0.3,
+    "mean_timeout": 0.0,
+    "mean_steps": 12.266666666666667,
+    "mean_duration": 1.2266666666666668,
+    "mean_path_length": 8.448913611688361,
+    "mean_min_obstacle_distance": 1.035558819025755,
+    "mean_mean_frenet_abs_d": 0.8436692495135202,
+    "mean_mean_action_change": 0.7164765232549074,
+    "mean_mean_raw_action_change": 0.7341817408337146,
+    "mean_mean_dbas_cost": 7.5265765077726545,
+    "mean_mean_min_predicted_obstacle_distance": 2.305070013964825,
+    "mean_mean_exploration_noise_scale": 0.5045278723566625
+  }
+}
