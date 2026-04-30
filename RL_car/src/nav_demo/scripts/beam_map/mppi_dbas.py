@@ -14,7 +14,8 @@ class MPPIDBaSConfig:
     lambda_: float = 1.5
     safe_distance: float = 0.55
     collision_distance: float = 0.25
-    risk_activation_distance: float = 1.2
+    risk_activation_distance: float = 1.8
+    fallback_trigger_distance: float = 0.8
     base_noise_std: Tuple[float, float] = (0.12, 0.14)
     min_noise_scale: float = 0.3
     max_noise_scale: float = 1.5
@@ -35,9 +36,17 @@ class MPPIDBaSConfig:
     safety_distance_margin: float = 0.03
     max_progress_loss: float = 0.15
     max_lateral_worsening: float = 0.10
+    fallback_max_lateral_worsening: float = 0.05
     out_of_bounds_limit: float = 2.5
     out_of_bounds_weight: float = 80.0
-    front_sector_half_angle: float = 1.35
+    front_sector_half_angle: float = 1.75
+    obstacle_sector_half_angle: float = 2.35
+    fallback_surge: float = 0.15
+    hard_brake_surge: float = 0.0
+    fallback_yaw: float = 0.65
+    fallback_min_clearance_delta: float = 0.08
+    enable_mppi: bool = True
+    enable_fallback: bool = True
     seed: Optional[int] = None
 
 
@@ -57,20 +66,25 @@ class MPPIDBaSOptimizer:
     def optimize(self, base_action: Any, planner_state: Dict[str, Any]) -> Tuple[np.ndarray, Dict[str, float]]:
         cfg = self.config
         base_action = self._clip_action(base_action)
+        radar = self._scan_risk_summary(planner_state)
         obstacles = self._scan_to_obstacle_points(planner_state)
         position = np.asarray(planner_state["position"], dtype=float)
-        current_min_dist = self._min_obstacle_distance(position, obstacles, planner_state)
+        current_min_dist = radar["global_min"]
         base_sequence = np.tile(base_action.reshape(1, 2), (cfg.horizon, 1))
         base_metrics = self._rollout_metrics(base_sequence, base_action, planner_state, obstacles)
 
-        if not self._base_action_needs_filter(base_metrics, current_min_dist):
+        if not self._base_action_needs_filter(base_metrics, radar):
             self.last_action = base_action.astype(np.float32)
             return base_action.astype(np.float32), self._make_passthrough_debug(
                 base_action,
                 current_min_dist,
                 base_metrics,
+                radar,
                 "base_safe",
             )
+
+        if not cfg.enable_mppi:
+            return self._fallback_or_base(base_action, base_metrics, planner_state, obstacles, radar, "mppi_disabled")
 
         noise_scale = self._adaptive_noise_scale(current_min_dist)
         noise_std = np.asarray(cfg.base_noise_std, dtype=float) * noise_scale
@@ -113,7 +127,25 @@ class MPPIDBaSOptimizer:
         candidate_sequence = np.tile(optimized_action.reshape(1, 2), (cfg.horizon, 1))
         candidate_metrics = self._rollout_metrics(candidate_sequence, base_action, planner_state, obstacles)
         accept, decision_reason = self._accept_candidate(base_metrics, candidate_metrics, optimized_action, base_action)
+        fallback_action = base_action
+        fallback_metrics = base_metrics
+        fallback_active = False
+        fallback_accept = False
+        action_source = "mppi" if accept else "sac"
         executed_action = optimized_action if accept else base_action
+
+        if not accept and cfg.enable_fallback and self._fallback_should_run(base_metrics, radar):
+            fallback_active = True
+            fallback_action = self._fallback_action(base_action, planner_state, radar)
+            fallback_sequence = np.tile(fallback_action.reshape(1, 2), (cfg.horizon, 1))
+            fallback_metrics = self._rollout_metrics(fallback_sequence, base_action, planner_state, obstacles)
+            fallback_accept, fallback_reason = self._accept_fallback(base_metrics, fallback_metrics)
+            if fallback_accept:
+                executed_action = fallback_action
+                action_source = "fallback"
+                decision_reason = fallback_reason
+            else:
+                decision_reason = f"{decision_reason}|{fallback_reason}"
 
         self.last_action = executed_action.astype(np.float32)
         self.last_noise_scale = float(noise_scale)
@@ -143,16 +175,29 @@ class MPPIDBaSOptimizer:
             "mppi_accept": bool(accept),
             "mppi_reject": bool(not accept),
             "mppi_decision_reason": decision_reason,
+            "fallback_active": bool(fallback_active),
+            "fallback_accept": bool(fallback_accept),
+            "action_source": action_source,
+            "terminal_source": action_source,
             "base_risk": float(base_metrics["risk_score"]),
             "candidate_risk": float(candidate_metrics["risk_score"]),
+            "fallback_risk": float(fallback_metrics["risk_score"]),
             "base_min_distance": float(base_metrics["min_distance"]),
             "candidate_min_distance": float(candidate_metrics["min_distance"]),
+            "fallback_min_distance": float(fallback_metrics["min_distance"]),
             "base_ttc_cost": float(base_metrics["ttc_cost"]),
             "candidate_ttc_cost": float(candidate_metrics["ttc_cost"]),
+            "fallback_ttc_cost": float(fallback_metrics["ttc_cost"]),
             "base_max_lateral_error": float(base_metrics["max_lateral_error"]),
             "candidate_max_lateral_error": float(candidate_metrics["max_lateral_error"]),
+            "fallback_max_lateral_error": float(fallback_metrics["max_lateral_error"]),
             "base_progress": float(base_metrics["progress"]),
             "candidate_progress": float(candidate_metrics["progress"]),
+            "fallback_progress": float(fallback_metrics["progress"]),
+            "front_obstacle_distance": float(radar["front_min"]),
+            "left_clearance": float(radar["left_min"]),
+            "right_clearance": float(radar["right_min"]),
+            "global_obstacle_distance": float(radar["global_min"]),
         }
         return executed_action.astype(np.float32), debug
 
@@ -283,15 +328,29 @@ class MPPIDBaSOptimizer:
             "out_of_bounds_risk": float(out_of_bounds_risk),
         }
 
-    def _base_action_needs_filter(self, base_metrics: Dict[str, float], current_min_dist: float) -> bool:
+    def _base_action_needs_filter(self, base_metrics: Dict[str, float], radar: Dict[str, float]) -> bool:
         cfg = self.config
-        if current_min_dist < cfg.collision_distance:
+        if radar["global_min"] < cfg.fallback_trigger_distance:
+            return True
+        if radar["front_min"] < cfg.risk_activation_distance:
             return True
         if base_metrics["min_distance"] < cfg.safe_distance:
             return True
         if base_metrics["ttc_cost"] > 0.0:
             return True
         if base_metrics["out_of_bounds_risk"] > 0.0:
+            return True
+        return False
+
+    def _fallback_should_run(self, base_metrics: Dict[str, float], radar: Dict[str, float]) -> bool:
+        cfg = self.config
+        if radar["global_min"] < cfg.fallback_trigger_distance:
+            return True
+        if base_metrics["collision_risk"] > 0.0:
+            return True
+        if base_metrics["min_distance"] < cfg.safe_distance:
+            return True
+        if base_metrics["ttc_cost"] > 0.0:
             return True
         return False
 
@@ -324,13 +383,120 @@ class MPPIDBaSOptimizer:
             return True, "accept_safety_gain"
         return False, "reject_no_safety_gain"
 
+    def _accept_fallback(self, base_metrics: Dict[str, float], fallback_metrics: Dict[str, float]) -> Tuple[bool, str]:
+        cfg = self.config
+        if fallback_metrics["out_of_bounds_risk"] > 0.0:
+            return False, "fallback_reject_out_of_bounds"
+        if fallback_metrics["max_lateral_error"] > base_metrics["max_lateral_error"] + cfg.fallback_max_lateral_worsening:
+            return False, "fallback_reject_out_of_bounds"
+        risk_gain = base_metrics["risk_score"] - fallback_metrics["risk_score"]
+        distance_gain = fallback_metrics["min_distance"] - base_metrics["min_distance"]
+        ttc_gain = base_metrics["ttc_cost"] - fallback_metrics["ttc_cost"]
+        if risk_gain > 0.0 or distance_gain >= 0.0 or ttc_gain > 0.0:
+            return True, "fallback_accept_safety"
+        return False, "fallback_reject_no_safety_gain"
+
+    def _fallback_or_base(
+        self,
+        base_action: np.ndarray,
+        base_metrics: Dict[str, float],
+        planner_state: Dict[str, Any],
+        obstacles: Optional[np.ndarray],
+        radar: Dict[str, float],
+        reason: str,
+    ) -> Tuple[np.ndarray, Dict[str, float]]:
+        if not self.config.enable_fallback or not self._fallback_should_run(base_metrics, radar):
+            self.last_action = base_action.astype(np.float32)
+            return base_action.astype(np.float32), self._make_passthrough_debug(
+                base_action, radar["global_min"], base_metrics, radar, reason
+            )
+        fallback_action = self._fallback_action(base_action, planner_state, radar)
+        fallback_sequence = np.tile(fallback_action.reshape(1, 2), (self.config.horizon, 1))
+        fallback_metrics = self._rollout_metrics(fallback_sequence, base_action, planner_state, obstacles)
+        accept, fallback_reason = self._accept_fallback(base_metrics, fallback_metrics)
+        executed = fallback_action if accept else base_action
+        self.last_action = executed.astype(np.float32)
+        action_delta = executed - base_action
+        debug = self._make_passthrough_debug(executed, radar["global_min"], base_metrics, radar, fallback_reason)
+        debug.update({
+            "raw_action_surge": float(base_action[0]),
+            "raw_action_yaw": float(base_action[1]),
+            "optimized_action_surge": float(executed[0]),
+            "optimized_action_yaw": float(executed[1]),
+            "action_delta_surge": float(action_delta[0]),
+            "action_delta_yaw": float(action_delta[1]),
+            "action_delta_norm": float(np.linalg.norm(action_delta)),
+            "fallback_active": True,
+            "fallback_accept": bool(accept),
+            "action_source": "fallback" if accept else "sac",
+            "terminal_source": "fallback" if accept else "sac",
+            "fallback_risk": float(fallback_metrics["risk_score"]),
+            "fallback_min_distance": float(fallback_metrics["min_distance"]),
+            "fallback_ttc_cost": float(fallback_metrics["ttc_cost"]),
+            "fallback_max_lateral_error": float(fallback_metrics["max_lateral_error"]),
+            "fallback_progress": float(fallback_metrics["progress"]),
+        })
+        return executed.astype(np.float32), debug
+
+    def _fallback_action(self, base_action: np.ndarray, planner_state: Dict[str, Any], radar: Dict[str, float]) -> np.ndarray:
+        cfg = self.config
+        action = base_action.astype(float).copy()
+        action[0] = min(action[0], cfg.hard_brake_surge if radar["global_min"] < cfg.safe_distance else cfg.fallback_surge)
+
+        clearance_delta = radar["left_min"] - radar["right_min"]
+        if abs(clearance_delta) >= cfg.fallback_min_clearance_delta:
+            yaw = cfg.fallback_yaw if clearance_delta > 0.0 else -cfg.fallback_yaw
+        else:
+            yaw = self._yaw_toward_path_center(planner_state, default_yaw=0.0)
+            if abs(yaw) < 1e-6:
+                yaw = cfg.fallback_yaw if radar["left_min"] >= radar["right_min"] else -cfg.fallback_yaw
+
+        action[1] = yaw
+        candidate = self._clip_action(action)
+        if self._one_step_lateral_worsens(candidate, base_action, planner_state):
+            candidate[0] = min(candidate[0], cfg.hard_brake_surge)
+            candidate[1] = 0.5 * self._yaw_toward_path_center(planner_state, default_yaw=0.0)
+            candidate = self._clip_action(candidate)
+        return candidate
+
+    def _yaw_toward_path_center(self, planner_state: Dict[str, Any], default_yaw: float) -> float:
+        frenet_transform = planner_state.get("frenet_transform")
+        if frenet_transform is None:
+            return default_yaw
+        position = np.asarray(planner_state["position"], dtype=float)
+        _, frenet_d = frenet_transform.cartesian_to_frenet(position)
+        if abs(float(frenet_d)) < 0.05:
+            return default_yaw
+        return -math.copysign(self.config.fallback_yaw, float(frenet_d))
+
+    def _one_step_lateral_worsens(
+        self,
+        candidate_action: np.ndarray,
+        base_action: np.ndarray,
+        planner_state: Dict[str, Any],
+    ) -> bool:
+        frenet_transform = planner_state.get("frenet_transform")
+        if frenet_transform is None:
+            return False
+        base_metrics = self._rollout_metrics(np.tile(base_action.reshape(1, 2), (2, 1)), base_action, planner_state, None)
+        cand_metrics = self._rollout_metrics(np.tile(candidate_action.reshape(1, 2), (2, 1)), base_action, planner_state, None)
+        return cand_metrics["max_lateral_error"] > base_metrics["max_lateral_error"] + self.config.fallback_max_lateral_worsening
+
     def _make_passthrough_debug(
         self,
         base_action: np.ndarray,
         current_min_dist: float,
         base_metrics: Optional[Dict[str, float]] = None,
+        radar: Optional[Dict[str, float]] = None,
         reason: str = "base_safe",
     ) -> Dict[str, float]:
+        max_range = current_min_dist
+        radar = radar or {
+            "global_min": current_min_dist,
+            "front_min": max_range,
+            "left_min": max_range,
+            "right_min": max_range,
+        }
         base_metrics = base_metrics or {
             "risk_score": 0.0,
             "min_distance": current_min_dist,
@@ -361,16 +527,29 @@ class MPPIDBaSOptimizer:
             "mppi_accept": False,
             "mppi_reject": False,
             "mppi_decision_reason": reason,
+            "fallback_active": False,
+            "fallback_accept": False,
+            "action_source": "sac",
+            "terminal_source": "sac",
             "base_risk": float(base_metrics["risk_score"]),
             "candidate_risk": float(base_metrics["risk_score"]),
+            "fallback_risk": float(base_metrics["risk_score"]),
             "base_min_distance": float(base_metrics["min_distance"]),
             "candidate_min_distance": float(base_metrics["min_distance"]),
+            "fallback_min_distance": float(base_metrics["min_distance"]),
             "base_ttc_cost": float(base_metrics["ttc_cost"]),
             "candidate_ttc_cost": float(base_metrics["ttc_cost"]),
+            "fallback_ttc_cost": float(base_metrics["ttc_cost"]),
             "base_max_lateral_error": float(base_metrics["max_lateral_error"]),
             "candidate_max_lateral_error": float(base_metrics["max_lateral_error"]),
+            "fallback_max_lateral_error": float(base_metrics["max_lateral_error"]),
             "base_progress": float(base_metrics["progress"]),
             "candidate_progress": float(base_metrics["progress"]),
+            "fallback_progress": float(base_metrics["progress"]),
+            "front_obstacle_distance": float(radar["front_min"]),
+            "left_clearance": float(radar["left_min"]),
+            "right_clearance": float(radar["right_min"]),
+            "global_obstacle_distance": float(radar["global_min"]),
         }
 
     def _mppi_weights(self, costs: np.ndarray) -> np.ndarray:
@@ -427,7 +606,7 @@ class MPPIDBaSOptimizer:
         angle_min = float(getattr(scan, "angle_min", -math.pi))
         angle_increment = float(getattr(scan, "angle_increment", (2.0 * math.pi) / max(len(ranges), 1)))
         scan_angles = angle_min + np.arange(len(ranges), dtype=float) * angle_increment
-        forward_mask = np.abs(np.array([self._wrap_angle(a) for a in scan_angles])) <= self.config.front_sector_half_angle
+        forward_mask = np.abs(np.array([self._wrap_angle(a) for a in scan_angles])) <= self.config.obstacle_sector_half_angle
         valid = (ranges > 0.02) & (ranges < self.config.risk_activation_distance) & forward_mask
         if not np.any(valid):
             return None
@@ -435,6 +614,38 @@ class MPPIDBaSOptimizer:
         world_angles = float(planner_state.get("yaw", 0.0)) + scan_angles[valid]
         position = np.asarray(planner_state["position"], dtype=float)
         return position + np.column_stack((np.cos(world_angles), np.sin(world_angles))) * ranges[valid, None]
+
+    def _scan_risk_summary(self, planner_state: Dict[str, Any]) -> Dict[str, float]:
+        scan = planner_state.get("scan")
+        max_range = float(planner_state.get("max_laser_range", 10.0))
+        if scan is None or not hasattr(scan, "ranges"):
+            return {
+                "global_min": max_range,
+                "front_min": max_range,
+                "left_min": max_range,
+                "right_min": max_range,
+            }
+        ranges = np.asarray(scan.ranges, dtype=float)
+        ranges = np.nan_to_num(ranges, nan=max_range, posinf=max_range, neginf=max_range)
+        ranges = np.clip(ranges, 0.0, max_range)
+        angle_min = float(getattr(scan, "angle_min", -math.pi))
+        angle_increment = float(getattr(scan, "angle_increment", (2.0 * math.pi) / max(len(ranges), 1)))
+        angles = np.array([self._wrap_angle(a) for a in angle_min + np.arange(len(ranges), dtype=float) * angle_increment])
+        valid = ranges > 0.02
+
+        def sector_min(mask: np.ndarray) -> float:
+            sector = ranges[valid & mask]
+            return float(np.min(sector)) if sector.size else max_range
+
+        front_mask = np.abs(angles) <= self.config.front_sector_half_angle
+        left_mask = (angles > 0.0) & (angles <= self.config.obstacle_sector_half_angle)
+        right_mask = (angles < 0.0) & (angles >= -self.config.obstacle_sector_half_angle)
+        return {
+            "global_min": float(np.min(ranges[valid])) if np.any(valid) else max_range,
+            "front_min": sector_min(front_mask),
+            "left_min": sector_min(left_mask),
+            "right_min": sector_min(right_mask),
+        }
 
     def _min_obstacle_distance(
         self,
