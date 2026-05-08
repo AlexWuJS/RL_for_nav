@@ -1,5 +1,6 @@
 import argparse
 import csv
+import hashlib
 import json
 import os
 from collections import defaultdict
@@ -13,13 +14,29 @@ MODE_COLORS = {
     "baseline": "#2f6fdd",
     "sac_mppi": "#17becf",
     "sac_mppi_safe": "#1f9e89",
+    "shield_first": "#4c78a8",
     "shield_only": "#2ca02c",
+    "shield_mppi_teacher": "#b279a2",
+    "shield_mppi_execute": "#f58518",
     "hybrid_mppi": "#8c564b",
     "mppi_teacher": "#e377c2",
     "mppi_dbas": "#d62728",
     "trust_mppi": "#9467bd",
     "trust_mppi_dbas": "#ff7f0e",
 }
+
+FALLBACK_COLORS = [
+    "#1f77b4",
+    "#ff7f0e",
+    "#2ca02c",
+    "#d62728",
+    "#9467bd",
+    "#8c564b",
+    "#e377c2",
+    "#7f7f7f",
+    "#bcbd22",
+    "#17becf",
+]
 
 
 def read_csv_rows(path: str) -> List[Dict[str, str]]:
@@ -61,7 +78,10 @@ def ensure_dir(path: str) -> None:
 
 
 def color_for(mode: str) -> str:
-    return MODE_COLORS.get(mode, None)
+    if mode in MODE_COLORS:
+        return MODE_COLORS[mode]
+    digest = hashlib.sha1(mode.encode("utf-8")).digest()
+    return FALLBACK_COLORS[digest[0] % len(FALLBACK_COLORS)]
 
 
 def plot_summary_bars(summary: Dict, modes: Iterable[str], output_dir: str) -> None:

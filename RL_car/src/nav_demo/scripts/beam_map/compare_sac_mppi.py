@@ -547,7 +547,7 @@ def paired_summary(all_rows: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
 def parse_args():
     parser = argparse.ArgumentParser(description="Compare SAC baseline and SAC+MPPI-DBaS for USV navigation.")
     parser.add_argument("--model", required=True, help="Path to a trained SAC model zip.")
-    parser.add_argument("--episodes", type=int, default=30)
+    parser.add_argument("--episodes", "--episode", type=int, default=30)
     parser.add_argument(
         "--mode",
         choices=[
