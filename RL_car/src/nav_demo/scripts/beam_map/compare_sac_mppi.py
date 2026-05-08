@@ -7,6 +7,7 @@ import sys
 from typing import Any, Dict, List
 
 import numpy as np
+import gymnasium as gym
 from stable_baselines3 import SAC
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
@@ -18,6 +19,7 @@ from ros_env import MyCarEnv
 
 SHIELD_RESIDUAL_LOW = (-0.15, -0.18)
 SHIELD_RESIDUAL_HIGH = (0.06, 0.18)
+DICT_OBS_KEYS = {"radar_image", "kinematics"}
 
 
 def unwrap_env(env):
@@ -97,20 +99,85 @@ def config_for_mode(mode: str, seed: int) -> MPPIDBaSConfig:
     return MPPIDBaSConfig(seed=seed)
 
 
-def make_env(mode: str, seed: int, log_dir: str):
+class RadarDictObservationWrapper(gym.ObservationWrapper):
+    """Adapt the flat MyCarEnv observation to dict observations used by image models."""
+
+    def __init__(self, env: gym.Env, image_size: int = 256):
+        super().__init__(env)
+        self.image_size = int(image_size)
+        self.observation_space = gym.spaces.Dict(
+            {
+                "radar_image": gym.spaces.Box(
+                    low=0,
+                    high=255,
+                    shape=(1, self.image_size, self.image_size),
+                    dtype=np.uint8,
+                ),
+                "kinematics": gym.spaces.Box(
+                    low=-1.0,
+                    high=1.0,
+                    shape=(4,),
+                    dtype=np.float32,
+                ),
+            }
+        )
+
+    def observation(self, observation):
+        obs = np.asarray(observation, dtype=np.float32).reshape(-1)
+        if obs.size < 5:
+            laser = np.zeros(self.image_size, dtype=np.float32)
+            kinematics = np.zeros(4, dtype=np.float32)
+        else:
+            laser = obs[:-4]
+            kinematics = np.clip(obs[-4:], -1.0, 1.0).astype(np.float32)
+        radar_image = self._laser_to_image(laser)
+        return {"radar_image": radar_image, "kinematics": kinematics}
+
+    def _laser_to_image(self, laser: np.ndarray) -> np.ndarray:
+        laser = np.asarray(laser, dtype=np.float32).reshape(-1)
+        if laser.size == 0:
+            resized = np.ones(self.image_size, dtype=np.float32)
+        else:
+            laser = np.nan_to_num(laser, nan=1.0, posinf=1.0, neginf=0.0)
+            laser = np.clip(laser, 0.0, 1.0)
+            src_x = np.linspace(0.0, 1.0, laser.size)
+            dst_x = np.linspace(0.0, 1.0, self.image_size)
+            resized = np.interp(dst_x, src_x, laser).astype(np.float32)
+        image = np.tile(resized.reshape(1, self.image_size), (self.image_size, 1))
+        return np.rint(image.reshape(1, self.image_size, self.image_size) * 255.0).astype(np.uint8)
+
+    def get_planner_state(self):
+        return self.env.get_planner_state()
+
+
+def observation_space_kind(space) -> str:
+    if isinstance(space, gym.spaces.Dict) and DICT_OBS_KEYS.issubset(set(space.spaces.keys())):
+        return "dict"
+    return "flat"
+
+
+def resolve_obs_mode(requested_mode: str, model_space) -> str:
+    if requested_mode != "auto":
+        return requested_mode
+    return observation_space_kind(model_space)
+
+
+def make_env(mode: str, seed: int, log_dir: str, obs_mode: str):
     def _init():
         env = MyCarEnv()
         if mode != "baseline":
             env = MppiDbaSActionWrapper(env, config_for_mode(mode, seed))
+        if obs_mode == "dict":
+            env = RadarDictObservationWrapper(env)
         env = Monitor(env, filename=os.path.join(log_dir, mode))
         return env
 
     return _init
 
 
-def build_eval_env(mode: str, seed: int, log_dir: str, frame_stack: int):
-    env = DummyVecEnv([make_env(mode, seed, log_dir)])
-    if frame_stack > 1:
+def build_eval_env(mode: str, seed: int, log_dir: str, frame_stack: int, obs_mode: str):
+    env = DummyVecEnv([make_env(mode, seed, log_dir, obs_mode)])
+    if obs_mode == "flat" and frame_stack > 1:
         env = VecFrameStack(env, n_stack=frame_stack)
     return env
 
@@ -397,12 +464,12 @@ def terminal_source_from_trace(rows: List[Dict[str, Any]]) -> str:
     return str(rows[-1].get("action_source", "unknown"))
 
 
-def run_mode(args, mode: str) -> List[Dict[str, Any]]:
+def run_mode(args, mode: str, obs_mode: str) -> List[Dict[str, Any]]:
     log_dir = os.path.join(args.output_dir, "monitor_logs")
     trace_dir = os.path.join(args.output_dir, "traces")
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(trace_dir, exist_ok=True)
-    vec_env = build_eval_env(mode, args.seed, log_dir, args.frame_stack)
+    vec_env = build_eval_env(mode, args.seed, log_dir, args.frame_stack, obs_mode)
     model = SAC.load(args.model, env=vec_env, device=args.device)
 
     rows = []
@@ -504,6 +571,12 @@ def parse_args():
     parser.add_argument("--output-dir", default="./comparison_results")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--frame-stack", type=int, default=4, help="Use 4 for models trained by beam_map/train.py; use 1 for plain models.")
+    parser.add_argument(
+        "--obs-mode",
+        choices=["auto", "flat", "dict"],
+        default="auto",
+        help="auto detects the saved model observation space; dict adapts flat lidar obs to radar_image/kinematics.",
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--stochastic", action="store_true", help="Use stochastic SAC actions during evaluation.")
     parser.add_argument("--plot", action="store_true", help="Generate comparison plots after evaluation.")
@@ -515,6 +588,10 @@ def parse_args():
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
+    probe_model = SAC.load(args.model, env=None, device=args.device)
+    obs_mode = resolve_obs_mode(args.obs_mode, probe_model.observation_space)
+    if obs_mode == "dict" and args.frame_stack != 1:
+        print("[compare] Dict observation model detected; ignoring frame_stack and using radar_image/kinematics observations.")
     if args.mode == "both":
         modes = ["baseline", "shield_first"]
     elif args.mode == "ablation":
@@ -525,7 +602,7 @@ def main():
     all_rows: Dict[str, List[Dict[str, Any]]] = {}
     summary = {}
     for mode in modes:
-        rows = run_mode(args, mode)
+        rows = run_mode(args, mode, obs_mode)
         all_rows[mode] = rows
         write_csv(os.path.join(args.output_dir, f"{mode}_metrics.csv"), rows)
         summary[mode] = summarize(rows)
