@@ -16,6 +16,10 @@ from mppi_dbas_wrapper import MppiDbaSActionWrapper
 from ros_env import MyCarEnv
 
 
+SHIELD_RESIDUAL_LOW = (-0.15, -0.18)
+SHIELD_RESIDUAL_HIGH = (0.06, 0.18)
+
+
 def unwrap_env(env):
     current = env
     while hasattr(current, "env"):
@@ -24,6 +28,30 @@ def unwrap_env(env):
 
 
 def config_for_mode(mode: str, seed: int) -> MPPIDBaSConfig:
+    if mode in ("shield_first", "shield_mppi_execute", "mppi_dbas"):
+        return MPPIDBaSConfig(
+            seed=seed,
+            use_reward_aligned_cost=True,
+            always_run_mppi=False,
+            execute_mppi=True,
+            final_safety_check=True,
+            enable_fallback=True,
+            teacher_only=False,
+            reward_aligned_residual_low=SHIELD_RESIDUAL_LOW,
+            reward_aligned_residual_high=SHIELD_RESIDUAL_HIGH,
+        )
+    if mode == "shield_mppi_teacher":
+        return MPPIDBaSConfig(
+            seed=seed,
+            use_reward_aligned_cost=True,
+            always_run_mppi=False,
+            execute_mppi=False,
+            final_safety_check=True,
+            enable_fallback=True,
+            teacher_only=True,
+            reward_aligned_residual_low=SHIELD_RESIDUAL_LOW,
+            reward_aligned_residual_high=SHIELD_RESIDUAL_HIGH,
+        )
     if mode == "sac_mppi":
         return MPPIDBaSConfig(
             seed=seed,
@@ -32,8 +60,8 @@ def config_for_mode(mode: str, seed: int) -> MPPIDBaSConfig:
             execute_mppi=True,
             final_safety_check=False,
             enable_fallback=False,
-            residual_low=(-0.20, -0.25),
-            residual_high=(0.10, 0.25),
+            reward_aligned_residual_low=(-0.20, -0.25),
+            reward_aligned_residual_high=(0.10, 0.25),
         )
     if mode == "sac_mppi_safe":
         return MPPIDBaSConfig(
@@ -43,8 +71,8 @@ def config_for_mode(mode: str, seed: int) -> MPPIDBaSConfig:
             execute_mppi=True,
             final_safety_check=True,
             enable_fallback=False,
-            residual_low=(-0.20, -0.25),
-            residual_high=(0.10, 0.25),
+            reward_aligned_residual_low=(-0.20, -0.25),
+            reward_aligned_residual_high=(0.10, 0.25),
         )
     if mode == "shield_only":
         return MPPIDBaSConfig(seed=seed, enable_mppi=False, enable_fallback=True)
@@ -59,8 +87,8 @@ def config_for_mode(mode: str, seed: int) -> MPPIDBaSConfig:
             final_safety_check=True,
             enable_fallback=False,
             teacher_only=True,
-            residual_low=(-0.20, -0.25),
-            residual_high=(0.10, 0.25),
+            reward_aligned_residual_low=(-0.20, -0.25),
+            reward_aligned_residual_high=(0.10, 0.25),
         )
     if mode == "trust_mppi":
         return MPPIDBaSConfig(seed=seed, dbas_weight=0.0, risk_activation_distance=10.0, enable_fallback=False)
@@ -457,9 +485,12 @@ def parse_args():
         "--mode",
         choices=[
             "baseline",
+            "shield_first",
             "sac_mppi",
             "sac_mppi_safe",
             "shield_only",
+            "shield_mppi_teacher",
+            "shield_mppi_execute",
             "hybrid_mppi",
             "mppi_teacher",
             "mppi_dbas",
@@ -485,9 +516,9 @@ def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     if args.mode == "both":
-        modes = ["baseline", "sac_mppi_safe"]
+        modes = ["baseline", "shield_first"]
     elif args.mode == "ablation":
-        modes = ["baseline", "sac_mppi", "sac_mppi_safe", "mppi_teacher"]
+        modes = ["baseline", "shield_only", "shield_mppi_teacher", "shield_mppi_execute"]
     else:
         modes = [args.mode]
 

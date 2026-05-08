@@ -33,11 +33,11 @@ class MPPIDBaSConfig:
     collision_distance: float = 0.25
     risk_activation_distance: float = 1.8
     fallback_trigger_distance: float = 0.8
-    base_noise_std: Tuple[float, float] = (0.12, 0.14)
+    base_noise_std: Tuple[float, float] = (0.10, 0.10)
     min_noise_scale: float = 0.3
     max_noise_scale: float = 1.5
     max_action_delta: Tuple[float, float] = (0.25, 0.25)
-    mppi_max_action_delta: Tuple[float, float] = (0.50, 0.75)
+    mppi_max_action_delta: Tuple[float, float] = (0.25, 0.30)
     action_low: Tuple[float, float] = (-1.0, -1.0)
     action_high: Tuple[float, float] = (2.0, 1.0)
     goal_weight: float = 0.8
@@ -52,8 +52,8 @@ class MPPIDBaSConfig:
     ttc_weight: float = 2.0
     ttc_horizon: float = 2.0
     safety_distance_margin: float = 0.03
-    max_progress_loss: float = 0.15
-    max_lateral_worsening: float = 0.10
+    max_progress_loss: float = 0.02
+    max_lateral_worsening: float = 0.03
     fallback_max_lateral_worsening: float = 0.05
     out_of_bounds_limit: float = 2.5
     out_of_bounds_weight: float = 80.0
@@ -63,10 +63,10 @@ class MPPIDBaSConfig:
     hard_brake_surge: float = 0.0
     fallback_yaw: float = 0.65
     fallback_min_clearance_delta: float = 0.08
-    residual_low: Tuple[float, float] = (-0.25, -0.35)
-    residual_high: Tuple[float, float] = (0.15, 0.35)
-    reward_aligned_residual_low: Tuple[float, float] = (-0.20, -0.25)
-    reward_aligned_residual_high: Tuple[float, float] = (0.10, 0.25)
+    residual_low: Tuple[float, float] = (-0.18, -0.22)
+    residual_high: Tuple[float, float] = (0.08, 0.22)
+    reward_aligned_residual_low: Tuple[float, float] = (-0.15, -0.18)
+    reward_aligned_residual_high: Tuple[float, float] = (0.06, 0.18)
     action_lag_alpha: float = 0.35
     mppi_min_score_gain: float = 0.05
     fallback_score_margin: float = 0.02
@@ -83,6 +83,8 @@ class MPPIDBaSConfig:
     env_success_reward: float = 1000.0
     env_frenet_reward_scale: float = 2.5
     hard_safety_penalty: float = 1000.0
+    lateral_deadband: float = 0.5
+    lateral_soft_limit: float = 2.0
     teacher_only: bool = False
     enable_mppi: bool = True
     enable_fallback: bool = True
@@ -257,6 +259,11 @@ class MPPIDBaSOptimizer:
         obstacles = self._scan_to_obstacle_points(planner_state)
         base_sequence = np.tile(base_action.reshape(1, 2), (cfg.horizon, 1))
         base_metrics = self._reward_aligned_rollout(base_sequence, base_action, planner_state, obstacles)
+        fallback_action = base_action
+        fallback_metrics = base_metrics
+        fallback_active = False
+        fallback_accept = False
+        fallback_reason = "fallback_not_needed"
 
         if not cfg.always_run_mppi and not self._base_action_needs_filter(base_metrics, radar):
             self.last_action = base_action.astype(np.float32)
@@ -274,10 +281,23 @@ class MPPIDBaSOptimizer:
                 prior_type="none",
                 warm_start_used=False,
                 noise_scale=0.0,
+                fallback_metrics=fallback_metrics,
+                fallback_active=False,
+                fallback_accept=False,
+                teacher_mppi_would_accept=False,
             )
 
+        if cfg.enable_fallback and self._fallback_should_run(base_metrics, radar):
+            fallback_active = True
+            fallback_action = self._fallback_action(base_action, planner_state, radar)
+            fallback_sequence = np.tile(fallback_action.reshape(1, 2), (cfg.horizon, 1))
+            fallback_metrics = self._reward_aligned_rollout(fallback_sequence, base_action, planner_state, obstacles)
+            fallback_accept, fallback_reason = self._accept_fallback(base_metrics, fallback_metrics)
+
         if not cfg.enable_mppi:
-            executed = self._emergency_brake_action(base_action) if self._emergency_brake_needed(base_metrics, base_metrics, radar) else base_action
+            executed = fallback_action if fallback_accept else base_action
+            if self._emergency_brake_needed(base_metrics, base_metrics, radar):
+                executed = self._emergency_brake_action(base_action)
             source = "fallback" if not np.allclose(executed, base_action) else "sac"
             self.last_action = executed.astype(np.float32)
             return executed.astype(np.float32), self._make_reward_aligned_debug(
@@ -290,10 +310,14 @@ class MPPIDBaSOptimizer:
                 mppi_active=False,
                 mppi_selected=False,
                 selected_reason=f"select_{source}",
-                reject_reason="mppi_disabled",
+                reject_reason=f"mppi_disabled|{fallback_reason}",
                 prior_type="none",
                 warm_start_used=False,
                 noise_scale=0.0,
+                fallback_metrics=fallback_metrics,
+                fallback_active=fallback_active,
+                fallback_accept=fallback_accept,
+                teacher_mppi_would_accept=False,
             )
 
         noise_scale = self._adaptive_noise_scale(radar["global_min"])
@@ -308,19 +332,20 @@ class MPPIDBaSOptimizer:
         candidate_metrics = metrics[best_idx]
         self.best_sequence = best_sequence.copy()
 
-        reward_delta = candidate_metrics["predicted_reward"] - base_metrics["predicted_reward"]
-        trust_ok = self._trust_region_ok(candidate_action, base_action)
-        safety_ok = self._final_safety_ok(candidate_metrics) if cfg.final_safety_check else True
-        reward_ok = reward_delta >= cfg.reward_improvement_threshold
-        mppi_would_select = bool(reward_ok and trust_ok and safety_ok)
+        mppi_would_select, reject_reason = self._accept_reward_aligned_candidate(
+            base_metrics,
+            fallback_metrics,
+            candidate_metrics,
+            candidate_action,
+            base_action,
+            fallback_accept,
+        )
 
         if cfg.teacher_only:
             executed_action = base_action
             action_source = "sac"
             selected_reason = "select_sac"
-            reject_reason = "teacher_record_only" if mppi_would_select else self._reward_aligned_reject_reason(
-                reward_ok, trust_ok, safety_ok
-            )
+            reject_reason = "teacher_record_only" if mppi_would_select else reject_reason
             mppi_selected = False
         elif cfg.execute_mppi and mppi_would_select:
             executed_action = candidate_action
@@ -328,11 +353,15 @@ class MPPIDBaSOptimizer:
             selected_reason = "select_mppi"
             reject_reason = "none"
             mppi_selected = True
+        elif fallback_accept:
+            executed_action = fallback_action
+            action_source = "fallback"
+            selected_reason = "select_fallback"
+            mppi_selected = False
         else:
             executed_action = base_action
             action_source = "sac"
             selected_reason = "select_sac"
-            reject_reason = self._reward_aligned_reject_reason(reward_ok, trust_ok, safety_ok)
             mppi_selected = False
 
         if cfg.final_safety_check and self._emergency_brake_needed(base_metrics, candidate_metrics, radar):
@@ -358,6 +387,10 @@ class MPPIDBaSOptimizer:
             prior_type=prior_names[best_idx],
             warm_start_used=warm_start_used,
             noise_scale=noise_scale,
+            fallback_metrics=fallback_metrics,
+            fallback_active=fallback_active,
+            fallback_accept=fallback_accept,
+            teacher_mppi_would_accept=mppi_would_select,
         )
         debug["action_source"] = action_source
         debug["terminal_source"] = action_source
@@ -486,7 +519,11 @@ class MPPIDBaSOptimizer:
                 terminal_step = step_idx
                 break
 
-            env_reward = frenet_reward(delta_s, float(frenet_d), heading_error)["total"] * cfg.env_frenet_reward_scale
+            env_reward = (
+                delta_s * 30.0
+                - self._piecewise_lateral_penalty(lateral_error)
+                - (abs(float(heading_error)) / math.pi) * 1.5
+            ) * cfg.env_frenet_reward_scale
             if obstacle_dist < cfg.env_safe_distance:
                 penalty = math.exp(5.0 * (cfg.env_safe_distance - obstacle_dist)) - 1.0
                 env_reward -= min(penalty, 10.0)
@@ -538,6 +575,49 @@ class MPPIDBaSOptimizer:
         action_delta = np.abs(candidate_action - base_action)
         return bool(np.all(action_delta <= np.asarray(self.config.mppi_max_action_delta, dtype=float) + 1e-6))
 
+    def _accept_reward_aligned_candidate(
+        self,
+        base_metrics: Dict[str, float],
+        fallback_metrics: Dict[str, float],
+        candidate_metrics: Dict[str, float],
+        candidate_action: np.ndarray,
+        base_action: np.ndarray,
+        fallback_accept: bool,
+    ) -> Tuple[bool, str]:
+        cfg = self.config
+        reward_delta = candidate_metrics["predicted_reward"] - base_metrics["predicted_reward"]
+        if not self._trust_region_ok(candidate_action, base_action):
+            return False, "reject_trust_region"
+        if cfg.final_safety_check and not self._final_safety_ok(candidate_metrics):
+            return False, "reject_hard_safety"
+        if candidate_metrics["progress"] < base_metrics["progress"] - cfg.max_progress_loss:
+            return False, "reject_progress_loss"
+        if candidate_metrics["max_lateral_error"] > base_metrics["max_lateral_error"] + cfg.max_lateral_worsening:
+            return False, "reject_out_of_bounds"
+
+        safety_gain = (
+            candidate_metrics["min_distance"] >= base_metrics["min_distance"] + cfg.safety_distance_margin
+            or candidate_metrics["ttc_cost"] < base_metrics["ttc_cost"] - 1e-6
+            or candidate_metrics["risk_score"] < base_metrics["risk_score"] - 0.05
+        )
+        reward_gain = reward_delta >= cfg.reward_improvement_threshold
+        if not reward_gain:
+            return False, "reject_no_reward_gain"
+        if not safety_gain and not cfg.teacher_only:
+            return False, "reject_no_reward_gain" if not reward_gain else "reject_no_safety_gain"
+
+        if fallback_accept:
+            if candidate_metrics["risk_score"] >= fallback_metrics["risk_score"] - 1e-6:
+                return False, "reject_not_better_than_fallback"
+            if candidate_metrics["progress"] < fallback_metrics["progress"] - cfg.max_progress_loss:
+                return False, "reject_worse_than_fallback_progress"
+            if candidate_metrics["max_lateral_error"] > fallback_metrics["max_lateral_error"] + cfg.max_lateral_worsening:
+                return False, "reject_worse_than_fallback_oob"
+            if candidate_metrics["total_cost"] > fallback_metrics["total_cost"] - cfg.fallback_score_margin:
+                return False, "reject_not_better_than_fallback"
+
+        return True, "accept_reward_aligned_candidate"
+
     def _final_safety_ok(self, candidate_metrics: Dict[str, float]) -> bool:
         return bool(
             candidate_metrics["collision_risk"] <= 0.0
@@ -560,6 +640,21 @@ class MPPIDBaSOptimizer:
         action[0] = min(action[0], self.config.hard_brake_surge)
         action[1] = 0.0
         return self._clip_action(action)
+
+    def _piecewise_lateral_penalty(self, lateral_error: float) -> float:
+        cfg = self.config
+        lateral_error = abs(float(lateral_error))
+        if lateral_error <= cfg.lateral_deadband:
+            return 0.0
+        if lateral_error <= cfg.lateral_soft_limit:
+            normalized = (lateral_error - cfg.lateral_deadband) / max(
+                cfg.lateral_soft_limit - cfg.lateral_deadband,
+                1e-6,
+            )
+            return float(1.5 * normalized * normalized)
+        if lateral_error <= cfg.env_out_of_bounds_limit:
+            return float(1.5 + 6.0 * (lateral_error - cfg.lateral_soft_limit) ** 2)
+        return float(100.0 + 50.0 * (lateral_error - cfg.env_out_of_bounds_limit) ** 2)
 
     @staticmethod
     def _reward_aligned_reject_reason(reward_ok: bool, trust_ok: bool, safety_ok: bool) -> str:
@@ -586,10 +681,17 @@ class MPPIDBaSOptimizer:
         prior_type: str,
         warm_start_used: bool,
         noise_scale: float,
+        fallback_metrics: Optional[Dict[str, float]] = None,
+        fallback_active: bool = False,
+        fallback_accept: bool = False,
+        teacher_mppi_would_accept: bool = False,
     ) -> Dict[str, float]:
         action_delta = executed_action - base_action
         predicted_reward_delta = candidate_metrics["predicted_reward"] - base_metrics["predicted_reward"]
         source = "mppi" if mppi_selected else ("fallback" if selected_reason == "select_emergency_brake" else "sac")
+        if selected_reason == "select_fallback":
+            source = "fallback"
+        fallback_metrics = fallback_metrics or base_metrics
         return {
             "raw_action_surge": float(base_action[0]),
             "raw_action_yaw": float(base_action[1]),
@@ -617,9 +719,9 @@ class MPPIDBaSOptimizer:
             "mppi_rejected_reason": reject_reason,
             "mppi_prior_type": prior_type,
             "mppi_warm_start_used": bool(warm_start_used),
-            "teacher_mppi_would_accept": bool(predicted_reward_delta >= self.config.reward_improvement_threshold),
-            "fallback_active": selected_reason == "select_emergency_brake",
-            "fallback_accept": selected_reason == "select_emergency_brake",
+            "teacher_mppi_would_accept": bool(teacher_mppi_would_accept),
+            "fallback_active": bool(fallback_active or selected_reason == "select_emergency_brake"),
+            "fallback_accept": bool(fallback_accept or selected_reason == "select_emergency_brake"),
             "action_source": source,
             "terminal_source": source,
             "predicted_reward_sac": float(base_metrics["predicted_reward"]),
@@ -629,32 +731,32 @@ class MPPIDBaSOptimizer:
             "sac_rollout_terminal": base_metrics["rollout_terminal"],
             "mppi_rollout_terminal": candidate_metrics["rollout_terminal"],
             "candidate_sac_score": float(base_metrics["total_cost"]),
-            "candidate_fallback_score": float(base_metrics["total_cost"]),
+            "candidate_fallback_score": float(fallback_metrics["total_cost"]),
             "candidate_mppi_score": float(candidate_metrics["total_cost"]),
             "sac_pred_collision": bool(base_metrics["collision_risk"] > 0.0),
-            "fallback_pred_collision": bool(base_metrics["collision_risk"] > 0.0),
+            "fallback_pred_collision": bool(fallback_metrics["collision_risk"] > 0.0),
             "mppi_pred_collision": bool(candidate_metrics["collision_risk"] > 0.0),
             "sac_pred_out_of_bounds": bool(base_metrics["out_of_bounds_risk"] > 0.0),
-            "fallback_pred_out_of_bounds": bool(base_metrics["out_of_bounds_risk"] > 0.0),
+            "fallback_pred_out_of_bounds": bool(fallback_metrics["out_of_bounds_risk"] > 0.0),
             "mppi_pred_out_of_bounds": bool(candidate_metrics["out_of_bounds_risk"] > 0.0),
             "sac_min_obstacle_distance": float(base_metrics["min_distance"]),
-            "fallback_min_obstacle_distance": float(base_metrics["min_distance"]),
+            "fallback_min_obstacle_distance": float(fallback_metrics["min_distance"]),
             "mppi_min_obstacle_distance": float(candidate_metrics["min_distance"]),
             "base_risk": float(base_metrics["risk_score"]),
             "candidate_risk": float(candidate_metrics["risk_score"]),
-            "fallback_risk": float(base_metrics["risk_score"]),
+            "fallback_risk": float(fallback_metrics["risk_score"]),
             "base_min_distance": float(base_metrics["min_distance"]),
             "candidate_min_distance": float(candidate_metrics["min_distance"]),
-            "fallback_min_distance": float(base_metrics["min_distance"]),
+            "fallback_min_distance": float(fallback_metrics["min_distance"]),
             "base_ttc_cost": float(base_metrics["ttc_cost"]),
             "candidate_ttc_cost": float(candidate_metrics["ttc_cost"]),
-            "fallback_ttc_cost": float(base_metrics["ttc_cost"]),
+            "fallback_ttc_cost": float(fallback_metrics["ttc_cost"]),
             "base_max_lateral_error": float(base_metrics["max_lateral_error"]),
             "candidate_max_lateral_error": float(candidate_metrics["max_lateral_error"]),
-            "fallback_max_lateral_error": float(base_metrics["max_lateral_error"]),
+            "fallback_max_lateral_error": float(fallback_metrics["max_lateral_error"]),
             "base_progress": float(base_metrics["progress"]),
             "candidate_progress": float(candidate_metrics["progress"]),
-            "fallback_progress": float(base_metrics["progress"]),
+            "fallback_progress": float(fallback_metrics["progress"]),
             "front_obstacle_distance": float(radar["front_min"]),
             "left_clearance": float(radar["left_min"]),
             "right_clearance": float(radar["right_min"]),
@@ -786,6 +888,8 @@ class MPPIDBaSOptimizer:
             return False, candidate_reason
 
         if fallback_accept:
+            if candidate_metrics["risk_score"] >= fallback_metrics["risk_score"] - 1e-6:
+                return False, "reject_not_better_than_fallback"
             if candidate_metrics["collision_risk"] > fallback_metrics["collision_risk"]:
                 return False, "reject_worse_than_fallback_collision"
             if candidate_metrics["out_of_bounds_risk"] > fallback_metrics["out_of_bounds_risk"]:
