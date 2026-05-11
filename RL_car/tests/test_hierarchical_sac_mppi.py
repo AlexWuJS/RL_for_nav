@@ -1,0 +1,199 @@
+import math
+import sys
+import types
+import unittest
+from pathlib import Path
+
+import numpy as np
+
+
+BEAM_MAP_DIR = Path(__file__).resolve().parents[1] / "src" / "nav_demo" / "scripts" / "beam_map"
+sys.path.insert(0, str(BEAM_MAP_DIR))
+
+
+try:
+    import gymnasium  # noqa: F401
+except ModuleNotFoundError:
+    gymnasium = types.ModuleType("gymnasium")
+    spaces = types.ModuleType("gymnasium.spaces")
+
+    class Box:
+        def __init__(self, low, high, shape=None, dtype=np.float32):
+            self.low = np.full(shape, low, dtype=dtype) if shape is not None and np.isscalar(low) else np.asarray(low, dtype=dtype)
+            self.high = np.full(shape, high, dtype=dtype) if shape is not None and np.isscalar(high) else np.asarray(high, dtype=dtype)
+            self.shape = tuple(shape) if shape is not None else self.low.shape
+            self.dtype = dtype
+
+    class Env:
+        pass
+
+    class Wrapper:
+        def __init__(self, env):
+            self.env = env
+            self.observation_space = getattr(env, "observation_space", None)
+            self.action_space = getattr(env, "action_space", None)
+
+        @property
+        def unwrapped(self):
+            return getattr(self.env, "unwrapped", self.env)
+
+        def reset(self, **kwargs):
+            return self.env.reset(**kwargs)
+
+        def step(self, action):
+            return self.env.step(action)
+
+    spaces.Box = Box
+    gymnasium.Env = Env
+    gymnasium.Wrapper = Wrapper
+    gymnasium.spaces = spaces
+    sys.modules["gymnasium"] = gymnasium
+    sys.modules["gymnasium.spaces"] = spaces
+
+
+from hierarchical_mppi_wrapper import HierarchicalMppiWrapper, intent_to_params  # noqa: E402
+from mppi_dbas import MPPIDBaSConfig, MPPIDBaSOptimizer  # noqa: E402
+
+
+class FakeScan:
+    def __init__(self, ranges, angle_min=-math.pi / 2, angle_increment=math.pi / 4):
+        self.ranges = ranges
+        self.angle_min = angle_min
+        self.angle_increment = angle_increment
+
+
+class StraightFrenet:
+    path_length = 10.0
+
+    def cartesian_to_frenet(self, point):
+        return float(point[0]), float(point[1])
+
+    def get_heading_error(self, yaw, s):
+        return -float(yaw)
+
+
+def planner_state(scan_ranges=None, y=0.0):
+    return {
+        "position": np.array([0.0, y], dtype=float),
+        "yaw": 0.0,
+        "velocity": np.zeros(3, dtype=float),
+        "target_position": np.array([10.0, 0.0], dtype=float),
+        "frenet_transform": StraightFrenet(),
+        "scan": FakeScan(scan_ranges or [10.0, 10.0, 10.0, 10.0, 10.0]),
+        "dt": 0.1,
+        "mass": 2.0,
+        "damping": 0.5,
+        "max_laser_range": 10.0,
+        "last_action": np.array([0.5, 0.0], dtype=float),
+    }
+
+
+class FakeEnv:
+    def __init__(self):
+        self.action_space = gymnasium.spaces.Box(
+            low=np.array([-1.0, -1.0]),
+            high=np.array([2.0, 1.0]),
+            dtype=np.float32,
+        )
+        self.observation_space = gymnasium.spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float32)
+        self.last_action = None
+
+    def get_planner_state(self):
+        return planner_state()
+
+    def reset(self, **kwargs):
+        return np.zeros(4, dtype=np.float32), {}
+
+    def step(self, action):
+        self.last_action = np.asarray(action, dtype=np.float32)
+        return np.ones(4, dtype=np.float32), 1.0, False, False, {"terminal_reason": "running"}
+
+
+class FakeOptimizer:
+    def reset(self):
+        self.reset_called = True
+
+    def optimize_from_intent(self, intent, planner_state):
+        return np.array([0.7, -0.2], dtype=np.float32), {
+            "mppi_cost": 3.0,
+            "min_predicted_obstacle_distance": 1.2,
+            "mppi_pred_collision": False,
+            "mppi_pred_out_of_bounds": False,
+        }
+
+
+class HierarchicalSacMppiTests(unittest.TestCase):
+    def test_wrapper_exposes_four_dimensional_intent_action_space_and_executes_mppi_action(self):
+        env = FakeEnv()
+        wrapper = HierarchicalMppiWrapper(env, optimizer=FakeOptimizer())
+
+        self.assertEqual(wrapper.action_space.shape, (4,))
+        self.assertTrue(np.allclose(wrapper.action_space.low, -1.0))
+        self.assertTrue(np.allclose(wrapper.action_space.high, 1.0))
+
+        _, _, _, _, info = wrapper.step(np.array([0.0, -0.5, 0.25, 1.0], dtype=np.float32))
+
+        np.testing.assert_allclose(env.last_action, np.array([0.7, -0.2], dtype=np.float32))
+        self.assertEqual(info["action_source"], "hierarchical_mppi")
+        self.assertAlmostEqual(info["sac_intent_turn_bias"], -0.5)
+        self.assertAlmostEqual(info["mppi_executed_surge"], 0.7)
+        self.assertAlmostEqual(info["mppi_executed_yaw"], -0.2)
+
+    def test_intent_mapping_uses_expected_ranges(self):
+        params = intent_to_params(np.array([-1.0, 1.0, -1.0, 1.0], dtype=np.float32))
+
+        self.assertAlmostEqual(params["target_speed"], 0.0)
+        self.assertAlmostEqual(params["turn_bias"], 0.8)
+        self.assertAlmostEqual(params["path_weight"], 0.5)
+        self.assertAlmostEqual(params["safety_weight"], 4.0)
+
+    def test_intent_conditioned_mppi_outputs_bounded_action_and_debug(self):
+        optimizer = MPPIDBaSOptimizer(
+            MPPIDBaSConfig(seed=0, num_samples=8, horizon=4)
+        )
+
+        action, debug = optimizer.optimize_from_intent(np.array([1.0, 1.0, 0.0, 0.0]), planner_state())
+
+        self.assertEqual(action.shape, (2,))
+        self.assertGreaterEqual(action[0], -1.0)
+        self.assertLessEqual(action[0], 2.0)
+        self.assertGreaterEqual(action[1], -1.0)
+        self.assertLessEqual(action[1], 1.0)
+        self.assertEqual(debug["action_source"], "hierarchical_mppi")
+        self.assertIn("sac_intent_target_speed", debug)
+        self.assertIn("mppi_best_cost", debug)
+
+    def test_safety_and_path_intents_change_conditioned_cost(self):
+        optimizer = MPPIDBaSOptimizer(MPPIDBaSConfig(seed=0))
+        metrics = {
+            "total_cost": 1.0,
+            "dbas_cost": 2.0,
+            "ttc_cost": 1.0,
+            "out_of_bounds_cost": 0.5,
+            "max_lateral_error": 1.5,
+            "max_heading_error": 0.4,
+            "progress": 0.2,
+            "min_distance": 0.4,
+            "collision_risk": 0.0,
+            "out_of_bounds_risk": 0.0,
+        }
+        sequence = np.tile(np.array([0.4, 0.1], dtype=float), (4, 1))
+        prior = np.array([0.5, 0.0], dtype=float)
+
+        low_safety = {"target_speed": 0.5, "turn_bias": 0.0, "path_weight": 1.0, "safety_weight": 0.5}
+        high_safety = {**low_safety, "safety_weight": 4.0}
+        low_path = {"target_speed": 0.5, "turn_bias": 0.0, "path_weight": 0.5, "safety_weight": 1.0}
+        high_path = {**low_path, "path_weight": 3.0}
+
+        self.assertGreater(
+            optimizer._intent_conditioned_cost(metrics, sequence, prior, high_safety),
+            optimizer._intent_conditioned_cost(metrics, sequence, prior, low_safety),
+        )
+        self.assertGreater(
+            optimizer._intent_conditioned_cost(metrics, sequence, prior, high_path),
+            optimizer._intent_conditioned_cost(metrics, sequence, prior, low_path),
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

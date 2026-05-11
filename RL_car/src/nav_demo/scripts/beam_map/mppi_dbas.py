@@ -4,6 +4,25 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+
+def intent_to_params(intent: Any) -> Dict[str, float]:
+    """Map SAC's normalized high-level intent to MPPI priors and cost weights."""
+    values = np.asarray(intent, dtype=float).reshape(-1)
+    padded = np.zeros(4, dtype=float)
+    padded[: min(4, values.size)] = values[:4]
+    clipped = np.clip(padded, -1.0, 1.0)
+    return {
+        "target_speed": float(0.75 * (clipped[0] + 1.0)),
+        "turn_bias": float(0.8 * clipped[1]),
+        "path_weight": float(0.5 + 1.25 * (clipped[2] + 1.0)),
+        "safety_weight": float(0.5 + 1.75 * (clipped[3] + 1.0)),
+        "raw_target_speed": float(clipped[0]),
+        "raw_turn_bias": float(clipped[1]),
+        "raw_path_weight": float(clipped[2]),
+        "raw_safety_weight": float(clipped[3]),
+    }
+
+
 try:
     from frenet_utils import frenet_reward
 except ImportError:
@@ -395,6 +414,145 @@ class MPPIDBaSOptimizer:
         debug["action_source"] = action_source
         debug["terminal_source"] = action_source
         return executed_action.astype(np.float32), debug
+
+    def optimize_from_intent(self, intent: Any, planner_state: Dict[str, Any]) -> Tuple[np.ndarray, Dict[str, float]]:
+        """Run MPPI every step using SAC's high-level intent as the local prior."""
+        cfg = self.config
+        params = intent_to_params(intent)
+        prior_action = self._clip_action([params["target_speed"], params["turn_bias"]])
+        radar = self._scan_risk_summary(planner_state)
+        obstacles = self._scan_to_obstacle_points(planner_state)
+        noise_scale = self._adaptive_noise_scale(radar["global_min"])
+        action_sequences, prior_names, warm_start_used = self._sample_sac_centered_sequences(prior_action, noise_scale)
+
+        metrics = [self._rollout_metrics(sequence, prior_action, planner_state, obstacles) for sequence in action_sequences]
+        costs = np.asarray(
+            [
+                self._intent_conditioned_cost(metric, sequence, prior_action, params)
+                for metric, sequence in zip(metrics, action_sequences)
+            ],
+            dtype=float,
+        )
+        best_idx = int(np.argmin(costs))
+        best_sequence = action_sequences[best_idx]
+        executed_action = self._clip_action(best_sequence[0])
+        best_metrics = metrics[best_idx]
+        self.best_sequence = best_sequence.copy()
+        self.last_action = executed_action.astype(np.float32)
+        self.last_noise_scale = float(noise_scale)
+
+        debug = self._make_intent_debug(
+            intent=np.asarray(intent, dtype=float).reshape(-1),
+            params=params,
+            executed_action=executed_action,
+            prior_action=prior_action,
+            metrics=best_metrics,
+            costs=costs,
+            radar=radar,
+            prior_type=prior_names[best_idx],
+            warm_start_used=warm_start_used,
+            noise_scale=noise_scale,
+        )
+        return executed_action.astype(np.float32), debug
+
+    def _intent_conditioned_cost(
+        self,
+        metrics: Dict[str, float],
+        action_sequence: np.ndarray,
+        prior_action: np.ndarray,
+        params: Dict[str, float],
+    ) -> float:
+        sequence = np.asarray(action_sequence, dtype=float)
+        prior = np.asarray(prior_action, dtype=float).reshape(1, 2)
+        action_error = float(np.mean(np.sum((sequence - prior) ** 2, axis=1)))
+        speed_error = float(np.mean((sequence[:, 0] - params["target_speed"]) ** 2))
+        yaw_error = float(np.mean((sequence[:, 1] - params["turn_bias"]) ** 2))
+        path_cost = (
+            8.0 * float(metrics.get("max_lateral_error", 0.0)) ** 2
+            + 2.0 * float(metrics.get("max_heading_error", 0.0)) ** 2
+            - 4.0 * float(metrics.get("progress", 0.0))
+        )
+        safety_cost = (
+            6.0 * float(metrics.get("dbas_cost", 0.0))
+            + 4.0 * float(metrics.get("ttc_cost", 0.0))
+            + 25.0 * float(metrics.get("out_of_bounds_cost", 0.0))
+            + 500.0 * float(metrics.get("collision_risk", 0.0))
+            + 300.0 * float(metrics.get("out_of_bounds_risk", 0.0))
+            - 0.5 * float(metrics.get("min_distance", 0.0))
+        )
+        return float(
+            metrics.get("total_cost", 0.0)
+            + params["path_weight"] * path_cost
+            + params["safety_weight"] * safety_cost
+            + 5.0 * action_error
+            + 2.0 * speed_error
+            + 1.5 * yaw_error
+        )
+
+    def _make_intent_debug(
+        self,
+        intent: np.ndarray,
+        params: Dict[str, float],
+        executed_action: np.ndarray,
+        prior_action: np.ndarray,
+        metrics: Dict[str, float],
+        costs: np.ndarray,
+        radar: Dict[str, float],
+        prior_type: str,
+        warm_start_used: bool,
+        noise_scale: float,
+    ) -> Dict[str, float]:
+        padded = np.zeros(4, dtype=float)
+        padded[: min(4, intent.size)] = intent[:4]
+        return {
+            "action_source": "hierarchical_mppi",
+            "terminal_source": "hierarchical_mppi",
+            "mppi_dbas_enabled": True,
+            "mppi_active": True,
+            "mppi_accept": True,
+            "mppi_reject": False,
+            "mppi_decision_reason": "select_intent_mppi",
+            "selected_reason": "select_intent_mppi",
+            "reject_reason": "none",
+            "mppi_prior_type": prior_type,
+            "mppi_warm_start_used": bool(warm_start_used),
+            "exploration_noise_scale": float(noise_scale),
+            "sac_intent_target_speed": float(padded[0]),
+            "sac_intent_turn_bias": float(padded[1]),
+            "sac_intent_path_weight": float(padded[2]),
+            "sac_intent_safety_weight": float(padded[3]),
+            "intent_target_speed": float(params["target_speed"]),
+            "intent_turn_bias": float(params["turn_bias"]),
+            "intent_path_weight": float(params["path_weight"]),
+            "intent_safety_weight": float(params["safety_weight"]),
+            "raw_action_surge": float(prior_action[0]),
+            "raw_action_yaw": float(prior_action[1]),
+            "optimized_action_surge": float(executed_action[0]),
+            "optimized_action_yaw": float(executed_action[1]),
+            "mppi_executed_surge": float(executed_action[0]),
+            "mppi_executed_yaw": float(executed_action[1]),
+            "action_delta_surge": float(executed_action[0] - prior_action[0]),
+            "action_delta_yaw": float(executed_action[1] - prior_action[1]),
+            "action_delta_norm": float(np.linalg.norm(executed_action - prior_action)),
+            "mppi_cost": float(metrics["total_cost"]),
+            "mppi_best_cost": float(np.min(costs)) if len(costs) else float(metrics["total_cost"]),
+            "mppi_mean_cost": float(np.mean(costs)) if len(costs) else float(metrics["total_cost"]),
+            "dbas_cost": float(metrics["dbas_cost"]),
+            "ttc_cost": float(metrics["ttc_cost"]),
+            "out_of_bounds_cost": float(metrics["out_of_bounds_cost"]),
+            "min_predicted_obstacle_distance": float(metrics["min_distance"]),
+            "current_obstacle_distance": float(radar["global_min"]),
+            "mppi_pred_collision": bool(metrics["collision_risk"] > 0.0),
+            "mppi_pred_out_of_bounds": bool(metrics["out_of_bounds_risk"] > 0.0),
+            "mppi_min_obstacle_distance": float(metrics["min_distance"]),
+            "candidate_risk": float(metrics["risk_score"]),
+            "candidate_progress": float(metrics["progress"]),
+            "candidate_max_lateral_error": float(metrics["max_lateral_error"]),
+            "front_obstacle_distance": float(radar["front_min"]),
+            "left_clearance": float(radar["left_min"]),
+            "right_clearance": float(radar["right_min"]),
+            "global_obstacle_distance": float(radar["global_min"]),
+        }
 
     def _sample_sac_centered_sequences(
         self,

@@ -12,6 +12,7 @@ from stable_baselines3 import SAC
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
 
+from hierarchical_mppi_wrapper import HierarchicalMppiWrapper, hierarchical_mppi_config
 from mppi_dbas import MPPIDBaSConfig
 from mppi_dbas_wrapper import MppiDbaSActionWrapper
 from ros_env import MyCarEnv
@@ -165,7 +166,9 @@ def resolve_obs_mode(requested_mode: str, model_space) -> str:
 def make_env(mode: str, seed: int, log_dir: str, obs_mode: str):
     def _init():
         env = MyCarEnv()
-        if mode != "baseline":
+        if mode in ("hierarchical_mppi", "hierarchical_mppi_shield"):
+            env = HierarchicalMppiWrapper(env, config=hierarchical_mppi_config(seed=seed))
+        elif mode != "baseline":
             env = MppiDbaSActionWrapper(env, config_for_mode(mode, seed))
         if obs_mode == "dict":
             env = RadarDictObservationWrapper(env)
@@ -303,6 +306,11 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
                 "source_sac": float(info.get("action_source", "sac") == "sac"),
                 "source_mppi": float(info.get("action_source", "sac") == "mppi"),
                 "source_fallback": float(info.get("action_source", "sac") == "fallback"),
+                "source_hierarchical_mppi": float(info.get("action_source", "sac") == "hierarchical_mppi"),
+                "sac_intent_target_speed": float(info.get("sac_intent_target_speed", 0.0)),
+                "sac_intent_turn_bias": float(info.get("sac_intent_turn_bias", 0.0)),
+                "sac_intent_path_weight": float(info.get("sac_intent_path_weight", 0.0)),
+                "sac_intent_safety_weight": float(info.get("sac_intent_safety_weight", 0.0)),
             })
 
         trace_rows.append({
@@ -370,6 +378,15 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
             "front_obstacle_distance": float(info.get("front_obstacle_distance", metrics["min_scan_distance"])),
             "left_clearance": float(info.get("left_clearance", metrics["min_scan_distance"])),
             "right_clearance": float(info.get("right_clearance", metrics["min_scan_distance"])),
+            "sac_intent_target_speed": float(info.get("sac_intent_target_speed", 0.0)),
+            "sac_intent_turn_bias": float(info.get("sac_intent_turn_bias", 0.0)),
+            "sac_intent_path_weight": float(info.get("sac_intent_path_weight", 0.0)),
+            "sac_intent_safety_weight": float(info.get("sac_intent_safety_weight", 0.0)),
+            "intent_target_speed": float(info.get("intent_target_speed", 0.0)),
+            "intent_turn_bias": float(info.get("intent_turn_bias", 0.0)),
+            "intent_path_weight": float(info.get("intent_path_weight", 0.0)),
+            "intent_safety_weight": float(info.get("intent_safety_weight", 0.0)),
+            "mppi_best_cost": float(info.get("mppi_best_cost", info.get("mppi_cost", 0.0))),
             "terminal_reason": info.get("terminal_reason", "running"),
         })
         step_idx += 1
@@ -433,6 +450,11 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
                 "mean_source_sac": mean_debug(mppi_debug, "source_sac"),
                 "mean_source_mppi": mean_debug(mppi_debug, "source_mppi"),
                 "mean_source_fallback": mean_debug(mppi_debug, "source_fallback"),
+                "mean_source_hierarchical_mppi": mean_debug(mppi_debug, "source_hierarchical_mppi"),
+                "mean_sac_intent_target_speed": mean_debug(mppi_debug, "sac_intent_target_speed"),
+                "mean_sac_intent_turn_bias": mean_debug(mppi_debug, "sac_intent_turn_bias"),
+                "mean_sac_intent_path_weight": mean_debug(mppi_debug, "sac_intent_path_weight"),
+                "mean_sac_intent_safety_weight": mean_debug(mppi_debug, "sac_intent_safety_weight"),
                 "mean_action_delta_norm": mean_debug(mppi_debug, "action_delta_norm"),
                 "mean_current_obstacle_distance": mean_debug(mppi_debug, "current_obstacle_distance"),
                 "mean_front_obstacle_distance": mean_trace(trace_rows, "front_obstacle_distance"),
@@ -464,13 +486,13 @@ def terminal_source_from_trace(rows: List[Dict[str, Any]]) -> str:
     return str(rows[-1].get("action_source", "unknown"))
 
 
-def run_mode(args, mode: str, obs_mode: str) -> List[Dict[str, Any]]:
+def run_mode(args, mode: str, model_path: str, obs_mode: str) -> List[Dict[str, Any]]:
     log_dir = os.path.join(args.output_dir, "monitor_logs")
     trace_dir = os.path.join(args.output_dir, "traces")
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(trace_dir, exist_ok=True)
     vec_env = build_eval_env(mode, args.seed, log_dir, args.frame_stack, obs_mode)
-    model = SAC.load(args.model, env=vec_env, device=args.device)
+    model = SAC.load(model_path, env=vec_env, device=args.device)
 
     rows = []
     for episode_idx in range(args.episodes):
@@ -546,7 +568,9 @@ def paired_summary(all_rows: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Compare SAC baseline and SAC+MPPI-DBaS for USV navigation.")
-    parser.add_argument("--model", required=True, help="Path to a trained SAC model zip.")
+    parser.add_argument("--model", default=None, help="Path to a trained SAC model zip.")
+    parser.add_argument("--baseline-model", default=None, help="Path to the old pure SAC baseline model.")
+    parser.add_argument("--hierarchical-model", default=None, help="Path to the hierarchical SAC-MPPI model.")
     parser.add_argument("--episodes", "--episode", type=int, default=30)
     parser.add_argument(
         "--mode",
@@ -563,6 +587,9 @@ def parse_args():
             "mppi_dbas",
             "trust_mppi",
             "trust_mppi_dbas",
+            "hierarchical_mppi",
+            "hierarchical_mppi_shield",
+            "hierarchical_ablation",
             "both",
             "ablation",
         ],
@@ -585,24 +612,41 @@ def parse_args():
     return parser.parse_args()
 
 
+def model_path_for_mode(args, mode: str) -> str:
+    if mode in ("hierarchical_mppi", "hierarchical_mppi_shield"):
+        model_path = args.hierarchical_model or args.model
+    else:
+        model_path = args.baseline_model or args.model
+    if not model_path:
+        raise ValueError(f"No model path provided for mode '{mode}'. Use --model or the mode-specific model argument.")
+    return model_path
+
+
+def obs_mode_for_model(args, model_path: str) -> str:
+    probe_model = SAC.load(model_path, env=None, device=args.device)
+    return resolve_obs_mode(args.obs_mode, probe_model.observation_space)
+
+
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
-    probe_model = SAC.load(args.model, env=None, device=args.device)
-    obs_mode = resolve_obs_mode(args.obs_mode, probe_model.observation_space)
-    if obs_mode == "dict" and args.frame_stack != 1:
-        print("[compare] Dict observation model detected; ignoring frame_stack and using radar_image/kinematics observations.")
     if args.mode == "both":
         modes = ["baseline", "shield_first"]
     elif args.mode == "ablation":
         modes = ["baseline", "shield_only", "shield_mppi_teacher", "shield_mppi_execute"]
+    elif args.mode == "hierarchical_ablation":
+        modes = ["baseline", "shield_only", "hierarchical_mppi"]
     else:
         modes = [args.mode]
 
     all_rows: Dict[str, List[Dict[str, Any]]] = {}
     summary = {}
     for mode in modes:
-        rows = run_mode(args, mode, obs_mode)
+        model_path = model_path_for_mode(args, mode)
+        obs_mode = obs_mode_for_model(args, model_path)
+        if obs_mode == "dict" and args.frame_stack != 1:
+            print(f"[compare] Dict observation model detected for {mode}; ignoring frame_stack and using radar_image/kinematics observations.")
+        rows = run_mode(args, mode, model_path, obs_mode)
         all_rows[mode] = rows
         write_csv(os.path.join(args.output_dir, f"{mode}_metrics.csv"), rows)
         summary[mode] = summarize(rows)
