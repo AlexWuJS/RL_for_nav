@@ -12,7 +12,12 @@ from stable_baselines3 import SAC
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
 
-from hierarchical_mppi_wrapper import HierarchicalMppiWrapper, hierarchical_mppi_config
+from hierarchical_mppi_wrapper import (
+    HierarchicalMppiV2Wrapper,
+    HierarchicalMppiWrapper,
+    hierarchical_mppi_config,
+    hierarchical_mppi_v2_config,
+)
 from mppi_dbas import MPPIDBaSConfig
 from mppi_dbas_wrapper import MppiDbaSActionWrapper
 from ros_env import MyCarEnv
@@ -168,6 +173,8 @@ def make_env(mode: str, seed: int, log_dir: str, obs_mode: str):
         env = MyCarEnv()
         if mode in ("hierarchical_mppi", "hierarchical_mppi_shield"):
             env = HierarchicalMppiWrapper(env, config=hierarchical_mppi_config(seed=seed))
+        elif mode in ("hierarchical_mppi_v2", "hierarchical_mppi_v2_shield"):
+            env = HierarchicalMppiV2Wrapper(env, config=hierarchical_mppi_v2_config(seed=seed))
         elif mode != "baseline":
             env = MppiDbaSActionWrapper(env, config_for_mode(mode, seed))
         if obs_mode == "dict":
@@ -306,7 +313,10 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
                 "source_sac": float(info.get("action_source", "sac") == "sac"),
                 "source_mppi": float(info.get("action_source", "sac") == "mppi"),
                 "source_fallback": float(info.get("action_source", "sac") == "fallback"),
+                "source_intent_prior": float(info.get("action_source", "sac") == "intent_prior"),
                 "source_hierarchical_mppi": float(info.get("action_source", "sac") == "hierarchical_mppi"),
+                "mppi_triggered": float(bool(info.get("mppi_triggered", info.get("mppi_active", False)))),
+                "candidate_accepted": float(bool(info.get("candidate_accepted", info.get("mppi_accept", False)))),
                 "sac_intent_target_speed": float(info.get("sac_intent_target_speed", 0.0)),
                 "sac_intent_turn_bias": float(info.get("sac_intent_turn_bias", 0.0)),
                 "sac_intent_path_weight": float(info.get("sac_intent_path_weight", 0.0)),
@@ -334,6 +344,10 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
             "selected_reason": info.get("selected_reason", "none"),
             "reject_reason": info.get("reject_reason", "none"),
             "mppi_rejected_reason": info.get("mppi_rejected_reason", info.get("reject_reason", "none")),
+            "mppi_triggered": int(bool(info.get("mppi_triggered", info.get("mppi_active", False)))),
+            "mppi_trigger_reason": info.get("mppi_trigger_reason", "none"),
+            "candidate_accepted": int(bool(info.get("candidate_accepted", info.get("mppi_accept", False)))),
+            "candidate_reject_reason": info.get("candidate_reject_reason", info.get("reject_reason", "none")),
             "mppi_prior_type": info.get("mppi_prior_type", "none"),
             "mppi_warm_start_used": int(bool(info.get("mppi_warm_start_used", False))),
             "teacher_mppi_would_accept": int(bool(info.get("teacher_mppi_would_accept", False))),
@@ -386,6 +400,14 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
             "intent_turn_bias": float(info.get("intent_turn_bias", 0.0)),
             "intent_path_weight": float(info.get("intent_path_weight", 0.0)),
             "intent_safety_weight": float(info.get("intent_safety_weight", 0.0)),
+            "intent_prior_surge": float(info.get("intent_prior_surge", 0.0)),
+            "intent_prior_yaw": float(info.get("intent_prior_yaw", 0.0)),
+            "smoothed_intent_target_speed": float(info.get("smoothed_intent_target_speed", 0.0)),
+            "smoothed_intent_turn_bias": float(info.get("smoothed_intent_turn_bias", 0.0)),
+            "smoothed_intent_path_weight": float(info.get("smoothed_intent_path_weight", 0.0)),
+            "smoothed_intent_safety_weight": float(info.get("smoothed_intent_safety_weight", 0.0)),
+            "prior_risk_score": float(info.get("prior_risk_score", info.get("base_risk", 0.0))),
+            "candidate_risk_score": float(info.get("candidate_risk_score", info.get("candidate_risk", 0.0))),
             "mppi_best_cost": float(info.get("mppi_best_cost", info.get("mppi_cost", 0.0))),
             "terminal_reason": info.get("terminal_reason", "running"),
         })
@@ -450,7 +472,10 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
                 "mean_source_sac": mean_debug(mppi_debug, "source_sac"),
                 "mean_source_mppi": mean_debug(mppi_debug, "source_mppi"),
                 "mean_source_fallback": mean_debug(mppi_debug, "source_fallback"),
+                "mean_source_intent_prior": mean_debug(mppi_debug, "source_intent_prior"),
                 "mean_source_hierarchical_mppi": mean_debug(mppi_debug, "source_hierarchical_mppi"),
+                "mean_mppi_triggered": mean_debug(mppi_debug, "mppi_triggered"),
+                "mean_candidate_accepted": mean_debug(mppi_debug, "candidate_accepted"),
                 "mean_sac_intent_target_speed": mean_debug(mppi_debug, "sac_intent_target_speed"),
                 "mean_sac_intent_turn_bias": mean_debug(mppi_debug, "sac_intent_turn_bias"),
                 "mean_sac_intent_path_weight": mean_debug(mppi_debug, "sac_intent_path_weight"),
@@ -571,6 +596,7 @@ def parse_args():
     parser.add_argument("--model", default=None, help="Path to a trained SAC model zip.")
     parser.add_argument("--baseline-model", default=None, help="Path to the old pure SAC baseline model.")
     parser.add_argument("--hierarchical-model", default=None, help="Path to the hierarchical SAC-MPPI model.")
+    parser.add_argument("--hierarchical-v2-model", default=None, help="Path to the trigger-based hierarchical SAC-MPPI v2 model.")
     parser.add_argument("--episodes", "--episode", type=int, default=30)
     parser.add_argument(
         "--mode",
@@ -589,7 +615,10 @@ def parse_args():
             "trust_mppi_dbas",
             "hierarchical_mppi",
             "hierarchical_mppi_shield",
+            "hierarchical_mppi_v2",
+            "hierarchical_mppi_v2_shield",
             "hierarchical_ablation",
+            "hierarchical_ablation_v2",
             "both",
             "ablation",
         ],
@@ -613,7 +642,9 @@ def parse_args():
 
 
 def model_path_for_mode(args, mode: str) -> str:
-    if mode in ("hierarchical_mppi", "hierarchical_mppi_shield"):
+    if mode in ("hierarchical_mppi_v2", "hierarchical_mppi_v2_shield"):
+        model_path = args.hierarchical_v2_model or args.hierarchical_model or args.model
+    elif mode in ("hierarchical_mppi", "hierarchical_mppi_shield"):
         model_path = args.hierarchical_model or args.model
     else:
         model_path = args.baseline_model or args.model
@@ -636,6 +667,8 @@ def main():
         modes = ["baseline", "shield_only", "shield_mppi_teacher", "shield_mppi_execute"]
     elif args.mode == "hierarchical_ablation":
         modes = ["baseline", "shield_only", "hierarchical_mppi"]
+    elif args.mode == "hierarchical_ablation_v2":
+        modes = ["baseline", "shield_only", "hierarchical_mppi", "hierarchical_mppi_v2"]
     else:
         modes = [args.mode]
 

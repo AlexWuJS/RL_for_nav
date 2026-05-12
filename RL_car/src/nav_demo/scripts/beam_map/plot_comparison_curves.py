@@ -25,6 +25,8 @@ MODE_COLORS = {
     "trust_mppi_dbas": "#ff7f0e",
     "hierarchical_mppi": "#6f4e7c",
     "hierarchical_mppi_shield": "#54a24b",
+    "hierarchical_mppi_v2": "#2a9d8f",
+    "hierarchical_mppi_v2_shield": "#457b9d",
 }
 
 FALLBACK_COLORS = [
@@ -266,7 +268,7 @@ def plot_action_source(result_dir: str, output_dir: str, max_steps: int) -> None
     for ax, mode in zip(axes.flatten(), modes):
         files = files_by_mode[mode]
         series = {}
-        sources = ("sac", "mppi", "fallback", "hierarchical_mppi")
+        sources = ("sac", "mppi", "fallback", "intent_prior", "hierarchical_mppi")
         for source in sources:
             sums = np.zeros(max_steps, dtype=float)
             counts = np.zeros(max_steps, dtype=float)
@@ -284,9 +286,10 @@ def plot_action_source(result_dir: str, output_dir: str, max_steps: int) -> None
             series["sac"],
             series["mppi"],
             series["fallback"],
+            series["intent_prior"],
             series["hierarchical_mppi"],
-            labels=["sac", "mppi", "fallback", "hierarchical"],
-            colors=["#9ecae1", "#fb6a4a", "#74c476", "#9e77b8"],
+            labels=["sac", "mppi", "fallback", "intent_prior", "hierarchical"],
+            colors=["#9ecae1", "#fb6a4a", "#74c476", "#8dd3c7", "#9e77b8"],
         )
         ax.set_ylim(0, 1.0)
         ax.set_title(f"Action Source Fraction: {mode}")

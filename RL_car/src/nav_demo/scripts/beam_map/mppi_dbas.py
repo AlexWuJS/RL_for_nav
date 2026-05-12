@@ -23,6 +23,24 @@ def intent_to_params(intent: Any) -> Dict[str, float]:
     }
 
 
+def intent_to_params_v2(intent: Any) -> Dict[str, float]:
+    """Conservative intent mapping for trigger-based hierarchical MPPI."""
+    values = np.asarray(intent, dtype=float).reshape(-1)
+    padded = np.zeros(4, dtype=float)
+    padded[: min(4, values.size)] = values[:4]
+    clipped = np.clip(padded, -1.0, 1.0)
+    return {
+        "target_speed": float(0.75 * (clipped[0] + 1.0)),
+        "turn_bias": float(0.55 * clipped[1]),
+        "path_weight": float(0.8 + 0.7 * (clipped[2] + 1.0)),
+        "safety_weight": float(1.2 + 1.0 * (clipped[3] + 1.0)),
+        "raw_target_speed": float(clipped[0]),
+        "raw_turn_bias": float(clipped[1]),
+        "raw_path_weight": float(clipped[2]),
+        "raw_safety_weight": float(clipped[3]),
+    }
+
+
 try:
     from frenet_utils import frenet_reward
 except ImportError:
@@ -108,6 +126,12 @@ class MPPIDBaSConfig:
     enable_mppi: bool = True
     enable_fallback: bool = True
     seed: Optional[int] = None
+    hierarchical_front_trigger_distance: float = 1.2
+    hierarchical_global_trigger_distance: float = 0.9
+    hierarchical_lateral_trigger: float = 0.8
+    hierarchical_heading_trigger: float = 0.6
+    hierarchical_min_risk_gain: float = 0.05
+    hierarchical_accept_score_margin: float = 0.01
 
 
 class MPPIDBaSOptimizer:
@@ -454,6 +478,288 @@ class MPPIDBaSOptimizer:
             noise_scale=noise_scale,
         )
         return executed_action.astype(np.float32), debug
+
+    def optimize_from_intent_v2(self, intent: Any, planner_state: Dict[str, Any]) -> Tuple[np.ndarray, Dict[str, float]]:
+        """Use SAC intent as the default action and run MPPI only when local risk warrants it."""
+        cfg = self.config
+        params = intent_to_params_v2(intent)
+        prior_action = self._clip_action([params["target_speed"], params["turn_bias"]])
+        radar = self._scan_risk_summary(planner_state)
+        obstacles = self._scan_to_obstacle_points(planner_state)
+        prior_sequence = np.tile(prior_action.reshape(1, 2), (cfg.horizon, 1))
+        prior_metrics = self._reward_aligned_rollout(prior_sequence, prior_action, planner_state, obstacles)
+        should_trigger, trigger_reason = self._intent_v2_should_trigger(prior_metrics, radar)
+
+        if not should_trigger or not cfg.enable_mppi:
+            executed_action = prior_action
+            self.last_action = executed_action.astype(np.float32)
+            debug = self._make_intent_v2_debug(
+                intent=np.asarray(intent, dtype=float).reshape(-1),
+                params=params,
+                executed_action=executed_action,
+                prior_action=prior_action,
+                candidate_action=prior_action,
+                prior_metrics=prior_metrics,
+                candidate_metrics=prior_metrics,
+                costs=np.array([self._intent_conditioned_cost_v2(prior_metrics, prior_sequence, prior_action, params)]),
+                radar=radar,
+                prior_type="intent_prior",
+                warm_start_used=False,
+                noise_scale=0.0,
+                mppi_triggered=False,
+                trigger_reason=trigger_reason,
+                candidate_accepted=False,
+                reject_reason="base_safe" if cfg.enable_mppi else "mppi_disabled",
+                action_source="intent_prior",
+            )
+            return executed_action.astype(np.float32), debug
+
+        noise_scale = self._adaptive_noise_scale(radar["global_min"])
+        action_sequences, prior_names, warm_start_used = self._sample_sac_centered_sequences(prior_action, noise_scale)
+        metrics = [
+            self._reward_aligned_rollout(sequence, prior_action, planner_state, obstacles)
+            for sequence in action_sequences
+        ]
+        costs = np.asarray(
+            [
+                self._intent_conditioned_cost_v2(metric, sequence, prior_action, params)
+                for metric, sequence in zip(metrics, action_sequences)
+            ],
+            dtype=float,
+        )
+        best_idx = int(np.argmin(costs))
+        best_sequence = action_sequences[best_idx]
+        candidate_action = self._clip_action(best_sequence[0])
+        candidate_metrics = metrics[best_idx]
+        self.best_sequence = best_sequence.copy()
+
+        accepted, reject_reason = self._accept_intent_v2_candidate(
+            prior_metrics=prior_metrics,
+            candidate_metrics=candidate_metrics,
+            candidate_action=candidate_action,
+            prior_action=prior_action,
+            prior_score=self._intent_conditioned_cost_v2(prior_metrics, prior_sequence, prior_action, params),
+            candidate_score=float(costs[best_idx]),
+        )
+        if accepted:
+            executed_action = candidate_action
+            action_source = "hierarchical_mppi"
+        elif cfg.enable_fallback and self._fallback_should_run(prior_metrics, radar):
+            fallback_action = self._fallback_action(prior_action, planner_state, radar)
+            fallback_sequence = np.tile(fallback_action.reshape(1, 2), (cfg.horizon, 1))
+            fallback_metrics = self._reward_aligned_rollout(fallback_sequence, prior_action, planner_state, obstacles)
+            fallback_accepted, _ = self._accept_fallback(prior_metrics, fallback_metrics)
+            if fallback_accepted:
+                executed_action = fallback_action
+                action_source = "fallback"
+            else:
+                executed_action = prior_action
+                action_source = "intent_prior"
+        else:
+            executed_action = prior_action
+            action_source = "intent_prior"
+
+        if cfg.final_safety_check and self._emergency_brake_needed(prior_metrics, candidate_metrics, radar):
+            executed_action = self._emergency_brake_action(prior_action)
+            action_source = "fallback"
+            reject_reason = "emergency_brake"
+            accepted = False
+
+        self.last_action = executed_action.astype(np.float32)
+        self.last_noise_scale = float(noise_scale)
+        debug = self._make_intent_v2_debug(
+            intent=np.asarray(intent, dtype=float).reshape(-1),
+            params=params,
+            executed_action=executed_action,
+            prior_action=prior_action,
+            candidate_action=candidate_action,
+            prior_metrics=prior_metrics,
+            candidate_metrics=candidate_metrics,
+            costs=costs,
+            radar=radar,
+            prior_type=prior_names[best_idx],
+            warm_start_used=warm_start_used,
+            noise_scale=noise_scale,
+            mppi_triggered=True,
+            trigger_reason=trigger_reason,
+            candidate_accepted=accepted and action_source == "hierarchical_mppi",
+            reject_reason=reject_reason,
+            action_source=action_source,
+        )
+        return executed_action.astype(np.float32), debug
+
+    def _intent_v2_should_trigger(self, prior_metrics: Dict[str, float], radar: Dict[str, float]) -> Tuple[bool, str]:
+        cfg = self.config
+        if radar["front_min"] < cfg.hierarchical_front_trigger_distance:
+            return True, "trigger_front_obstacle"
+        if radar["global_min"] < cfg.hierarchical_global_trigger_distance:
+            return True, "trigger_near_obstacle"
+        if prior_metrics.get("ttc_cost", 0.0) > 0.0:
+            return True, "trigger_ttc"
+        if prior_metrics.get("collision_risk", 0.0) > 0.0:
+            return True, "trigger_collision_risk"
+        if prior_metrics.get("out_of_bounds_risk", 0.0) > 0.0:
+            return True, "trigger_out_of_bounds"
+        if prior_metrics.get("max_lateral_error", 0.0) > cfg.hierarchical_lateral_trigger:
+            return True, "trigger_lateral_error"
+        if prior_metrics.get("max_heading_error", 0.0) > cfg.hierarchical_heading_trigger:
+            return True, "trigger_heading_error"
+        return False, "base_safe"
+
+    def _accept_intent_v2_candidate(
+        self,
+        prior_metrics: Dict[str, float],
+        candidate_metrics: Dict[str, float],
+        candidate_action: np.ndarray,
+        prior_action: np.ndarray,
+        prior_score: float,
+        candidate_score: float,
+    ) -> Tuple[bool, str]:
+        cfg = self.config
+        if not self._trust_region_ok(candidate_action, prior_action):
+            return False, "reject_trust_region"
+        if candidate_metrics["collision_risk"] > prior_metrics["collision_risk"] + 1e-6:
+            return False, "reject_collision_risk"
+        if candidate_metrics["out_of_bounds_risk"] > prior_metrics["out_of_bounds_risk"] + 1e-6:
+            return False, "reject_out_of_bounds"
+        if candidate_metrics["progress"] < prior_metrics["progress"] - cfg.max_progress_loss:
+            return False, "reject_progress_loss"
+        if candidate_metrics["max_lateral_error"] > prior_metrics["max_lateral_error"] + cfg.max_lateral_worsening:
+            return False, "reject_lateral_worsening"
+        risk_gain = prior_metrics["risk_score"] - candidate_metrics["risk_score"]
+        score_gain = prior_score - candidate_score
+        if risk_gain < cfg.hierarchical_min_risk_gain and score_gain < cfg.hierarchical_accept_score_margin:
+            return False, "reject_no_score_gain"
+        return True, "none"
+
+    def _intent_conditioned_cost_v2(
+        self,
+        metrics: Dict[str, float],
+        action_sequence: np.ndarray,
+        prior_action: np.ndarray,
+        params: Dict[str, float],
+    ) -> float:
+        cfg = self.config
+        sequence = np.asarray(action_sequence, dtype=float)
+        prior = np.asarray(prior_action, dtype=float).reshape(1, 2)
+        min_distance = float(metrics.get("min_distance", cfg.safe_distance))
+        obstacle_barrier = max(0.0, cfg.safe_distance - min_distance) ** 2
+        path_cost = (
+            -6.0 * float(metrics.get("progress", 0.0))
+            + 7.0 * float(metrics.get("max_lateral_error", 0.0)) ** 2
+            + 2.0 * float(metrics.get("max_heading_error", 0.0)) ** 2
+        )
+        safety_cost = (
+            35.0 * obstacle_barrier
+            + 6.0 * float(metrics.get("ttc_cost", 0.0))
+            + 40.0 * float(metrics.get("out_of_bounds_cost", 0.0))
+            + 800.0 * float(metrics.get("collision_risk", 0.0))
+            + 500.0 * float(metrics.get("out_of_bounds_risk", 0.0))
+        )
+        prior_tracking = float(np.mean(np.sum((sequence - prior) ** 2, axis=1)))
+        smoothness = 0.0
+        if len(sequence) > 1:
+            smoothness = float(np.mean(np.sum(np.diff(sequence, axis=0) ** 2, axis=1)))
+        action_effort = float(np.mean(np.sum(sequence * sequence, axis=1)))
+        return float(
+            params["path_weight"] * path_cost
+            + params["safety_weight"] * safety_cost
+            + 8.0 * prior_tracking
+            + 1.5 * smoothness
+            + 0.03 * action_effort
+        )
+
+    def _make_intent_v2_debug(
+        self,
+        intent: np.ndarray,
+        params: Dict[str, float],
+        executed_action: np.ndarray,
+        prior_action: np.ndarray,
+        candidate_action: np.ndarray,
+        prior_metrics: Dict[str, float],
+        candidate_metrics: Dict[str, float],
+        costs: np.ndarray,
+        radar: Dict[str, float],
+        prior_type: str,
+        warm_start_used: bool,
+        noise_scale: float,
+        mppi_triggered: bool,
+        trigger_reason: str,
+        candidate_accepted: bool,
+        reject_reason: str,
+        action_source: str,
+    ) -> Dict[str, float]:
+        padded = np.zeros(4, dtype=float)
+        padded[: min(4, intent.size)] = intent[:4]
+        return {
+            "action_source": action_source,
+            "terminal_source": action_source,
+            "mppi_dbas_enabled": True,
+            "mppi_active": bool(mppi_triggered),
+            "mppi_accept": bool(candidate_accepted),
+            "mppi_reject": bool(mppi_triggered and not candidate_accepted),
+            "mppi_decision_reason": trigger_reason if mppi_triggered else "select_intent_prior",
+            "selected_reason": f"select_{action_source}",
+            "reject_reason": reject_reason,
+            "mppi_triggered": bool(mppi_triggered),
+            "mppi_trigger_reason": trigger_reason,
+            "candidate_accepted": bool(candidate_accepted),
+            "candidate_reject_reason": reject_reason,
+            "mppi_prior_type": prior_type,
+            "mppi_warm_start_used": bool(warm_start_used),
+            "exploration_noise_scale": float(noise_scale),
+            "sac_intent_target_speed": float(padded[0]),
+            "sac_intent_turn_bias": float(padded[1]),
+            "sac_intent_path_weight": float(padded[2]),
+            "sac_intent_safety_weight": float(padded[3]),
+            "intent_target_speed": float(params["target_speed"]),
+            "intent_turn_bias": float(params["turn_bias"]),
+            "intent_path_weight": float(params["path_weight"]),
+            "intent_safety_weight": float(params["safety_weight"]),
+            "intent_prior_surge": float(prior_action[0]),
+            "intent_prior_yaw": float(prior_action[1]),
+            "raw_action_surge": float(prior_action[0]),
+            "raw_action_yaw": float(prior_action[1]),
+            "candidate_action_surge": float(candidate_action[0]),
+            "candidate_action_yaw": float(candidate_action[1]),
+            "optimized_action_surge": float(executed_action[0]),
+            "optimized_action_yaw": float(executed_action[1]),
+            "mppi_executed_surge": float(executed_action[0]),
+            "mppi_executed_yaw": float(executed_action[1]),
+            "action_delta_surge": float(executed_action[0] - prior_action[0]),
+            "action_delta_yaw": float(executed_action[1] - prior_action[1]),
+            "action_delta_norm": float(np.linalg.norm(executed_action - prior_action)),
+            "mppi_cost": float(candidate_metrics["total_cost"]),
+            "mppi_best_cost": float(np.min(costs)) if len(costs) else float(candidate_metrics["total_cost"]),
+            "mppi_mean_cost": float(np.mean(costs)) if len(costs) else float(candidate_metrics["total_cost"]),
+            "dbas_cost": float(candidate_metrics["dbas_cost"]),
+            "ttc_cost": float(candidate_metrics["ttc_cost"]),
+            "out_of_bounds_cost": float(candidate_metrics["out_of_bounds_cost"]),
+            "min_predicted_obstacle_distance": float(candidate_metrics["min_distance"]),
+            "current_obstacle_distance": float(radar["global_min"]),
+            "mppi_pred_collision": bool(candidate_metrics["collision_risk"] > 0.0),
+            "mppi_pred_out_of_bounds": bool(candidate_metrics["out_of_bounds_risk"] > 0.0),
+            "mppi_min_obstacle_distance": float(candidate_metrics["min_distance"]),
+            "candidate_risk": float(candidate_metrics["risk_score"]),
+            "candidate_progress": float(candidate_metrics["progress"]),
+            "candidate_max_lateral_error": float(candidate_metrics["max_lateral_error"]),
+            "candidate_ttc_cost": float(candidate_metrics["ttc_cost"]),
+            "candidate_min_distance": float(candidate_metrics["min_distance"]),
+            "base_risk": float(prior_metrics["risk_score"]),
+            "prior_risk_score": float(prior_metrics["risk_score"]),
+            "candidate_risk_score": float(candidate_metrics["risk_score"]),
+            "base_progress": float(prior_metrics["progress"]),
+            "base_max_lateral_error": float(prior_metrics["max_lateral_error"]),
+            "base_ttc_cost": float(prior_metrics["ttc_cost"]),
+            "base_min_distance": float(prior_metrics["min_distance"]),
+            "sac_pred_collision": bool(prior_metrics["collision_risk"] > 0.0),
+            "sac_pred_out_of_bounds": bool(prior_metrics["out_of_bounds_risk"] > 0.0),
+            "sac_min_obstacle_distance": float(prior_metrics["min_distance"]),
+            "front_obstacle_distance": float(radar["front_min"]),
+            "left_clearance": float(radar["left_min"]),
+            "right_clearance": float(radar["right_min"]),
+            "global_obstacle_distance": float(radar["global_min"]),
+        }
 
     def _intent_conditioned_cost(
         self,

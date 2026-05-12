@@ -51,7 +51,7 @@ except ModuleNotFoundError:
     sys.modules["gymnasium.spaces"] = spaces
 
 
-from hierarchical_mppi_wrapper import HierarchicalMppiWrapper, intent_to_params  # noqa: E402
+from hierarchical_mppi_wrapper import HierarchicalMppiV2Wrapper, HierarchicalMppiWrapper, intent_to_params, intent_to_params_v2  # noqa: E402
 from mppi_dbas import MPPIDBaSConfig, MPPIDBaSOptimizer  # noqa: E402
 
 
@@ -122,6 +122,23 @@ class FakeOptimizer:
         }
 
 
+class FakeV2Optimizer:
+    def reset(self):
+        self.reset_called = True
+
+    def optimize_from_intent_v2(self, intent, planner_state):
+        return np.array([0.6, 0.1], dtype=np.float32), {
+            "action_source": "intent_prior",
+            "mppi_active": False,
+            "mppi_triggered": False,
+            "mppi_trigger_reason": "base_safe",
+            "intent_prior_surge": 0.6,
+            "intent_prior_yaw": 0.1,
+            "mppi_executed_surge": 0.6,
+            "mppi_executed_yaw": 0.1,
+        }
+
+
 class HierarchicalSacMppiTests(unittest.TestCase):
     def test_wrapper_exposes_four_dimensional_intent_action_space_and_executes_mppi_action(self):
         env = FakeEnv()
@@ -147,6 +164,32 @@ class HierarchicalSacMppiTests(unittest.TestCase):
         self.assertAlmostEqual(params["path_weight"], 0.5)
         self.assertAlmostEqual(params["safety_weight"], 4.0)
 
+    def test_v2_intent_mapping_uses_conservative_ranges(self):
+        params = intent_to_params_v2(np.array([-1.0, 1.0, -1.0, 1.0], dtype=np.float32))
+
+        self.assertAlmostEqual(params["target_speed"], 0.0)
+        self.assertAlmostEqual(params["turn_bias"], 0.55)
+        self.assertAlmostEqual(params["path_weight"], 0.8)
+        self.assertAlmostEqual(params["safety_weight"], 3.2)
+
+    def test_v2_wrapper_smooths_and_holds_intent_prior_action(self):
+        env = FakeEnv()
+        wrapper = HierarchicalMppiV2Wrapper(
+            env,
+            optimizer=FakeV2Optimizer(),
+            intent_ema_alpha=0.5,
+            intent_hold_steps=2,
+        )
+
+        _, _, _, _, first_info = wrapper.step(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+        _, _, _, _, second_info = wrapper.step(np.array([-1.0, 1.0, 1.0, 1.0], dtype=np.float32))
+
+        self.assertEqual(first_info["action_source"], "intent_prior")
+        self.assertFalse(first_info["mppi_triggered"])
+        self.assertAlmostEqual(first_info["held_intent_target_speed"], 0.5)
+        self.assertAlmostEqual(second_info["held_intent_target_speed"], 0.5)
+        np.testing.assert_allclose(env.last_action, np.array([0.6, 0.1], dtype=np.float32))
+
     def test_intent_conditioned_mppi_outputs_bounded_action_and_debug(self):
         optimizer = MPPIDBaSOptimizer(
             MPPIDBaSConfig(seed=0, num_samples=8, horizon=4)
@@ -162,6 +205,27 @@ class HierarchicalSacMppiTests(unittest.TestCase):
         self.assertEqual(debug["action_source"], "hierarchical_mppi")
         self.assertIn("sac_intent_target_speed", debug)
         self.assertIn("mppi_best_cost", debug)
+
+    def test_v2_optimizer_skips_mppi_when_prior_is_safe(self):
+        optimizer = MPPIDBaSOptimizer(MPPIDBaSConfig(seed=0, num_samples=8, horizon=4))
+
+        action, debug = optimizer.optimize_from_intent_v2(np.array([0.0, 0.0, 0.0, 0.0]), planner_state())
+
+        self.assertEqual(debug["action_source"], "intent_prior")
+        self.assertFalse(debug["mppi_triggered"])
+        self.assertFalse(debug["mppi_active"])
+        np.testing.assert_allclose(action, np.array([0.75, 0.0], dtype=np.float32), atol=1e-6)
+
+    def test_v2_optimizer_triggers_mppi_when_prior_is_risky(self):
+        optimizer = MPPIDBaSOptimizer(MPPIDBaSConfig(seed=0, num_samples=8, horizon=4))
+
+        _, debug = optimizer.optimize_from_intent_v2(
+            np.array([0.0, 0.0, 0.0, 0.0]),
+            planner_state(scan_ranges=[0.5, 0.5, 0.5, 0.5, 0.5]),
+        )
+
+        self.assertTrue(debug["mppi_triggered"])
+        self.assertIn(debug["action_source"], ("intent_prior", "hierarchical_mppi", "fallback"))
 
     def test_safety_and_path_intents_change_conditioned_cost(self):
         optimizer = MPPIDBaSOptimizer(MPPIDBaSConfig(seed=0))

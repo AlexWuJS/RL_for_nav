@@ -6,7 +6,12 @@ import rospy
 from stable_baselines3 import SAC
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
 
-from hierarchical_mppi_wrapper import HierarchicalMppiWrapper, hierarchical_mppi_config
+from hierarchical_mppi_wrapper import (
+    HierarchicalMppiV2Wrapper,
+    HierarchicalMppiWrapper,
+    hierarchical_mppi_config,
+    hierarchical_mppi_v2_config,
+)
 from mppi_dbas import MPPIDBaSConfig
 from mppi_dbas_wrapper import MppiDbaSActionWrapper
 from ros_env import MyCarEnv
@@ -16,7 +21,7 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 
 def config_for_mode(mode: str, seed: int) -> MPPIDBaSConfig | None:
-    if mode in ("baseline", "hierarchical_mppi"):
+    if mode in ("baseline", "hierarchical_mppi", "hierarchical_mppi_v2"):
         return None
     if mode == "shield_only":
         return MPPIDBaSConfig(seed=seed, enable_mppi=False, enable_fallback=True)
@@ -58,6 +63,8 @@ def make_env(mode: str, seed: int) -> gym.Env:
     env = MyCarEnv()
     if mode == "hierarchical_mppi":
         return HierarchicalMppiWrapper(env, config=hierarchical_mppi_config(seed=seed))
+    if mode == "hierarchical_mppi_v2":
+        return HierarchicalMppiV2Wrapper(env, config=hierarchical_mppi_v2_config(seed=seed))
     config = config_for_mode(mode, seed)
     if config is None:
         return env
@@ -71,6 +78,9 @@ def unwrap_env(env: gym.Env) -> gym.Env:
 def choose_model_path(model_arg: str | None) -> str | None:
     candidates = [
         model_arg,
+        "./training_hierarchical_mppi_v2_results/best_model.zip",
+        "./training_hierarchical_mppi_v2_results/best_model",
+        "./training_hierarchical_mppi_v2_results/final_model_hierarchical_v2.zip",
         "./training_hierarchical_mppi_results/best_model.zip",
         "./training_hierarchical_mppi_results/best_model",
         "./training_hierarchical_mppi_results/final_model_hierarchical.zip",
@@ -88,7 +98,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run SAC policy in Gazebo, optionally with shield/MPPI-DBaS action filtering.")
     parser.add_argument(
         "--mode",
-        choices=["baseline", "shield_only", "shield_first", "shield_mppi_teacher", "shield_mppi_execute", "hierarchical_mppi"],
+        choices=["baseline", "shield_only", "shield_first", "shield_mppi_teacher", "shield_mppi_execute", "hierarchical_mppi", "hierarchical_mppi_v2"],
         default="baseline",
         help="baseline keeps raw SAC actions; shield_only enables the low-intervention safety fallback.",
     )
