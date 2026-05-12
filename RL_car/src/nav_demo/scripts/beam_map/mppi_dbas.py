@@ -132,6 +132,7 @@ class MPPIDBaSConfig:
     hierarchical_heading_trigger: float = 0.6
     hierarchical_min_risk_gain: float = 0.05
     hierarchical_accept_score_margin: float = 0.01
+    hierarchical_lateral_recovery_gain: float = 0.08
 
 
 class MPPIDBaSOptimizer:
@@ -626,6 +627,12 @@ class MPPIDBaSOptimizer:
             return False, "reject_progress_loss"
         if candidate_metrics["max_lateral_error"] > prior_metrics["max_lateral_error"] + cfg.max_lateral_worsening:
             return False, "reject_lateral_worsening"
+        if (
+            prior_metrics["max_lateral_error"] > cfg.hierarchical_lateral_trigger
+            and candidate_metrics["max_lateral_error"]
+            > prior_metrics["max_lateral_error"] - cfg.hierarchical_lateral_recovery_gain
+        ):
+            return False, "reject_no_lateral_recovery"
         risk_gain = prior_metrics["risk_score"] - candidate_metrics["risk_score"]
         score_gain = prior_score - candidate_score
         if risk_gain < cfg.hierarchical_min_risk_gain and score_gain < cfg.hierarchical_accept_score_margin:
@@ -644,10 +651,13 @@ class MPPIDBaSOptimizer:
         prior = np.asarray(prior_action, dtype=float).reshape(1, 2)
         min_distance = float(metrics.get("min_distance", cfg.safe_distance))
         obstacle_barrier = max(0.0, cfg.safe_distance - min_distance) ** 2
+        lateral_error = float(metrics.get("max_lateral_error", 0.0))
+        heading_error = float(metrics.get("max_heading_error", 0.0))
         path_cost = (
-            -6.0 * float(metrics.get("progress", 0.0))
-            + 7.0 * float(metrics.get("max_lateral_error", 0.0)) ** 2
-            + 2.0 * float(metrics.get("max_heading_error", 0.0)) ** 2
+            -5.0 * float(metrics.get("progress", 0.0))
+            + 11.0 * lateral_error ** 2
+            + 2.8 * heading_error ** 2
+            + 4.0 * max(0.0, lateral_error - cfg.lateral_deadband) ** 2
         )
         safety_cost = (
             35.0 * obstacle_barrier
@@ -1712,13 +1722,26 @@ class MPPIDBaSOptimizer:
     def _fallback_action(self, base_action: np.ndarray, planner_state: Dict[str, Any], radar: Dict[str, float]) -> np.ndarray:
         cfg = self.config
         action = base_action.astype(float).copy()
-        action[0] = min(action[0], cfg.hard_brake_surge if radar["global_min"] < cfg.safe_distance else cfg.fallback_surge)
+        lateral_error = 0.0
+        frenet_transform = planner_state.get("frenet_transform")
+        if frenet_transform is not None:
+            position = np.asarray(planner_state["position"], dtype=float)
+            _, frenet_d = frenet_transform.cartesian_to_frenet(position)
+            lateral_error = abs(float(frenet_d))
+
+        recover_speed = cfg.hard_brake_surge if (radar["global_min"] < cfg.safe_distance or lateral_error > 1.2) else cfg.fallback_surge
+        action[0] = min(action[0], recover_speed)
 
         clearance_delta = radar["left_min"] - radar["right_min"]
-        if abs(clearance_delta) >= cfg.fallback_min_clearance_delta:
+        path_center_yaw = self._yaw_toward_path_center(planner_state, default_yaw=0.0)
+        strong_center_recovery = lateral_error > cfg.hierarchical_lateral_trigger
+
+        if strong_center_recovery and abs(path_center_yaw) > 1e-6:
+            yaw = path_center_yaw
+        elif abs(clearance_delta) >= cfg.fallback_min_clearance_delta:
             yaw = cfg.fallback_yaw if clearance_delta > 0.0 else -cfg.fallback_yaw
         else:
-            yaw = self._yaw_toward_path_center(planner_state, default_yaw=0.0)
+            yaw = path_center_yaw
             if abs(yaw) < 1e-6:
                 yaw = cfg.fallback_yaw if radar["left_min"] >= radar["right_min"] else -cfg.fallback_yaw
 
@@ -1726,7 +1749,7 @@ class MPPIDBaSOptimizer:
         candidate = self._clip_action(action)
         if self._one_step_lateral_worsens(candidate, base_action, planner_state):
             candidate[0] = min(candidate[0], cfg.hard_brake_surge)
-            candidate[1] = 0.5 * self._yaw_toward_path_center(planner_state, default_yaw=0.0)
+            candidate[1] = self._yaw_toward_path_center(planner_state, default_yaw=0.0)
             candidate = self._clip_action(candidate)
         return candidate
 
@@ -1738,7 +1761,8 @@ class MPPIDBaSOptimizer:
         _, frenet_d = frenet_transform.cartesian_to_frenet(position)
         if abs(float(frenet_d)) < 0.05:
             return default_yaw
-        return -math.copysign(self.config.fallback_yaw, float(frenet_d))
+        magnitude = min(1.0, self.config.fallback_yaw + 0.12 * abs(float(frenet_d)))
+        return -math.copysign(magnitude, float(frenet_d))
 
     def _one_step_lateral_worsens(
         self,

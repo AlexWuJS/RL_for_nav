@@ -42,10 +42,10 @@ def hierarchical_mppi_v2_config(seed: Optional[int] = None) -> MPPIDBaSConfig:
         reward_aligned_residual_low=(-0.22, -0.28),
         reward_aligned_residual_high=(0.18, 0.28),
         mppi_max_action_delta=(0.22, 0.28),
-        hierarchical_front_trigger_distance=1.2,
-        hierarchical_global_trigger_distance=0.9,
-        hierarchical_lateral_trigger=0.8,
-        hierarchical_heading_trigger=0.6,
+        hierarchical_front_trigger_distance=1.35,
+        hierarchical_global_trigger_distance=1.0,
+        hierarchical_lateral_trigger=0.55,
+        hierarchical_heading_trigger=0.45,
     )
 
 

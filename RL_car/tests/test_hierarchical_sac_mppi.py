@@ -227,6 +227,17 @@ class HierarchicalSacMppiTests(unittest.TestCase):
         self.assertTrue(debug["mppi_triggered"])
         self.assertIn(debug["action_source"], ("intent_prior", "hierarchical_mppi", "fallback"))
 
+    def test_v2_optimizer_triggers_on_lateral_deviation(self):
+        optimizer = MPPIDBaSOptimizer(MPPIDBaSConfig(seed=0, num_samples=8, horizon=4))
+
+        _, debug = optimizer.optimize_from_intent_v2(
+            np.array([0.0, 0.0, 0.0, 0.0]),
+            planner_state(y=1.0),
+        )
+
+        self.assertTrue(debug["mppi_triggered"])
+        self.assertEqual(debug["mppi_trigger_reason"], "trigger_lateral_error")
+
     def test_safety_and_path_intents_change_conditioned_cost(self):
         optimizer = MPPIDBaSOptimizer(MPPIDBaSConfig(seed=0))
         metrics = {
@@ -257,6 +268,17 @@ class HierarchicalSacMppiTests(unittest.TestCase):
             optimizer._intent_conditioned_cost(metrics, sequence, prior, high_path),
             optimizer._intent_conditioned_cost(metrics, sequence, prior, low_path),
         )
+
+    def test_fallback_action_yaws_toward_path_center_when_laterally_offset(self):
+        optimizer = MPPIDBaSOptimizer(MPPIDBaSConfig(seed=0))
+
+        action = optimizer._fallback_action(
+            np.array([0.7, 0.0], dtype=float),
+            planner_state(y=1.0),
+            {"global_min": 10.0, "front_min": 10.0, "left_min": 10.0, "right_min": 10.0},
+        )
+
+        self.assertLess(action[1], 0.0)
 
 
 if __name__ == "__main__":
