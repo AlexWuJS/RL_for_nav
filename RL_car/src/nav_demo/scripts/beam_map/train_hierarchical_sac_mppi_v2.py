@@ -56,6 +56,7 @@ def make_env(rank: int, log_dir: str, seed: int, intent_ema_alpha: float, intent
 def parse_args():
     parser = argparse.ArgumentParser(description="Train SAC high-level intent policy with trigger-based MPPI control.")
     parser.add_argument("--total-timesteps", type=int, default=300000)
+    parser.add_argument("--load-model", default=None, help="Resume training from an existing SAC model zip/path.")
     parser.add_argument("--save-dir", default="./training_hierarchical_mppi_v2_results/")
     parser.add_argument("--log-dir", default="./logs_hierarchical_mppi_v2/")
     parser.add_argument("--tensorboard-log", default="./sac_hierarchical_mppi_v2_log/")
@@ -74,6 +75,14 @@ def parse_args():
     parser.add_argument("--target-ent-coef", type=float, default=0.02)
     parser.add_argument("--target-lr", type=float, default=3e-5)
     return parser.parse_args()
+
+
+def resolve_model_path(path: str) -> str:
+    if os.path.exists(path):
+        return path
+    if not path.endswith(".zip") and os.path.exists(f"{path}.zip"):
+        return f"{path}.zip"
+    raise FileNotFoundError(f"Could not find model file: {path}")
 
 
 def main():
@@ -118,31 +127,56 @@ def main():
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    model = SAC(
-        "MlpPolicy",
-        train_env,
-        verbose=1,
-        tensorboard_log=args.tensorboard_log,
-        policy_kwargs=policy_kwargs,
-        learning_rate=3e-4,
-        buffer_size=args.buffer_size,
-        batch_size=args.batch_size,
-        ent_coef="auto",
-        gamma=0.99,
-        tau=0.005,
-        learning_starts=args.learning_starts,
-        train_freq=(10, "step"),
-        gradient_steps=10,
-        seed=args.seed,
-        device=device,
-    )
+    if args.load_model:
+        model_path = resolve_model_path(args.load_model)
+        print(f"Resuming hierarchical SAC-MPPI v2 from: {model_path}")
+        model = SAC.load(model_path, env=train_env, device=device)
+        model.tensorboard_log = args.tensorboard_log
+        model.verbose = 1
+        completed_timesteps = int(getattr(model, "num_timesteps", 0))
+        remaining_timesteps = args.total_timesteps - completed_timesteps
+        if remaining_timesteps <= 0:
+            print(
+                f"Requested total_timesteps={args.total_timesteps}, "
+                f"but loaded model already has num_timesteps={completed_timesteps}."
+            )
+            train_env.close()
+            eval_env.close()
+            return
+    else:
+        model = SAC(
+            "MlpPolicy",
+            train_env,
+            verbose=1,
+            tensorboard_log=args.tensorboard_log,
+            policy_kwargs=policy_kwargs,
+            learning_rate=3e-4,
+            buffer_size=args.buffer_size,
+            batch_size=args.batch_size,
+            ent_coef="auto",
+            gamma=0.99,
+            tau=0.005,
+            learning_starts=args.learning_starts,
+            train_freq=(10, "step"),
+            gradient_steps=10,
+            seed=args.seed,
+            device=device,
+        )
+        completed_timesteps = 0
+        remaining_timesteps = args.total_timesteps
 
     print(f"Training hierarchical SAC-MPPI v2 with action space: {train_env.action_space}")
     print(f"Saving results to: {args.save_dir}")
+    print(
+        f"Completed timesteps: {completed_timesteps} | "
+        f"Target total timesteps: {args.total_timesteps} | "
+        f"Timesteps to run now: {remaining_timesteps}"
+    )
     try:
         model.learn(
-            total_timesteps=args.total_timesteps,
+            total_timesteps=remaining_timesteps,
             callback=[eval_callback, checkpoint_callback, entropy_callback],
+            reset_num_timesteps=False,
         )
     except KeyboardInterrupt:
         print("Training interrupted; saving current model.")
