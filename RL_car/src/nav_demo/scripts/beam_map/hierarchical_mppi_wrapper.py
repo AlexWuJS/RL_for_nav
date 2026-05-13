@@ -106,12 +106,18 @@ class HierarchicalMppiV2Wrapper(gym.Wrapper):
         seed: Optional[int] = None,
         intent_ema_alpha: float = 0.6,
         intent_hold_steps: int = 2,
+        enable_delta_penalty: bool = False,
+        delta_penalty_alpha: float = 0.08,
+        delta_deadband: float = 0.10,
     ):
         super().__init__(env)
         self.optimizer = optimizer or MPPIDBaSOptimizer(config or hierarchical_mppi_v2_config(seed=seed))
         self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float32)
         self.intent_ema_alpha = float(np.clip(intent_ema_alpha, 0.0, 1.0))
         self.intent_hold_steps = max(1, int(intent_hold_steps))
+        self.enable_delta_penalty = bool(enable_delta_penalty)
+        self.delta_penalty_alpha = float(max(0.0, delta_penalty_alpha))
+        self.delta_deadband = float(max(0.0, delta_deadband))
         self.smoothed_intent = np.zeros(4, dtype=np.float32)
         self.held_intent = np.zeros(4, dtype=np.float32)
         self.hold_counter = 0
@@ -164,15 +170,53 @@ class HierarchicalMppiV2Wrapper(gym.Wrapper):
         debug.setdefault("mppi_executed_surge", float(executed_action[0]))
         debug.setdefault("mppi_executed_yaw", float(executed_action[1]))
         info.update(debug)
+        prior_action = np.array([info["intent_prior_surge"], info["intent_prior_yaw"]], dtype=np.float32)
+        mppi_delta_norm = float(np.linalg.norm(executed_action.astype(np.float32) - prior_action))
+        delta_penalty = self._mppi_delta_penalty(mppi_delta_norm, info)
+        training_reward = float(reward) - delta_penalty
+        info["env_reward"] = float(reward)
+        info["training_reward"] = float(training_reward)
+        info["mppi_delta_norm"] = float(mppi_delta_norm)
+        info["mppi_delta_penalty"] = float(delta_penalty)
+        info["delta_penalty_enabled"] = bool(self.enable_delta_penalty)
         info["raw_intent"] = raw_intent.copy()
         info["smoothed_intent"] = self.smoothed_intent.copy()
         info["held_intent"] = self.held_intent.copy()
-        info["raw_action"] = np.array([info["intent_prior_surge"], info["intent_prior_yaw"]], dtype=np.float32)
+        info["raw_action"] = prior_action
         info["optimized_action"] = executed_action.astype(np.float32)
         info["hierarchical_mppi_enabled"] = True
         info["hierarchical_mppi_v2_enabled"] = True
         info["mppi_dbas_enabled"] = True
-        return obs, reward, terminated, truncated, info
+        return obs, training_reward, terminated, truncated, info
 
     def get_planner_state(self):
         return self.env.get_planner_state()
+
+    def _mppi_delta_penalty(self, mppi_delta_norm: float, info: dict) -> float:
+        if not self.enable_delta_penalty:
+            return 0.0
+        if not self._delta_penalty_allowed(info):
+            return 0.0
+        excess = max(0.0, float(mppi_delta_norm) - self.delta_deadband)
+        return float(self.delta_penalty_alpha * excess * excess)
+
+    def _delta_penalty_allowed(self, info: dict) -> bool:
+        source = str(info.get("action_source", "intent_prior"))
+        trigger = str(info.get("mppi_trigger_reason", "none"))
+        reject = str(info.get("reject_reason", "none"))
+        if source == "fallback" or reject == "emergency_brake":
+            return False
+        emergency_triggers = {
+            "trigger_collision_risk",
+            "trigger_out_of_bounds",
+            "trigger_ttc",
+            "trigger_front_obstacle",
+            "trigger_near_obstacle",
+        }
+        if trigger in emergency_triggers:
+            return False
+        current_distance = float(info.get("current_obstacle_distance", np.inf))
+        safe_distance = float(getattr(self.optimizer.config, "safe_distance", 0.55))
+        if current_distance < safe_distance:
+            return False
+        return True

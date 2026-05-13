@@ -634,6 +634,14 @@ class MPPIDBaSOptimizer:
         ):
             return False, "reject_no_lateral_recovery"
         risk_gain = prior_metrics["risk_score"] - candidate_metrics["risk_score"]
+        lateral_gain = prior_metrics["max_lateral_error"] - candidate_metrics["max_lateral_error"]
+        ttc_gain = float(prior_metrics.get("ttc_cost", 0.0)) - float(candidate_metrics.get("ttc_cost", 0.0))
+        if (
+            risk_gain < cfg.hierarchical_min_risk_gain
+            and lateral_gain < 0.5 * cfg.hierarchical_lateral_recovery_gain
+            and ttc_gain <= 1e-6
+        ):
+            return False, "reject_no_safety_or_path_gain"
         score_gain = prior_score - candidate_score
         if risk_gain < cfg.hierarchical_min_risk_gain and score_gain < cfg.hierarchical_accept_score_margin:
             return False, "reject_no_score_gain"
@@ -653,18 +661,14 @@ class MPPIDBaSOptimizer:
         obstacle_barrier = max(0.0, cfg.safe_distance - min_distance) ** 2
         lateral_error = float(metrics.get("max_lateral_error", 0.0))
         heading_error = float(metrics.get("max_heading_error", 0.0))
-        path_cost = (
-            -5.0 * float(metrics.get("progress", 0.0))
-            + 11.0 * lateral_error ** 2
-            + 2.8 * heading_error ** 2
-            + 4.0 * max(0.0, lateral_error - cfg.lateral_deadband) ** 2
-        )
+        progress = float(metrics.get("progress", 0.0))
+        local_path_cost = self._mppi_lateral_cost(lateral_error) + 2.0 * heading_error ** 2
         safety_cost = (
-            35.0 * obstacle_barrier
-            + 6.0 * float(metrics.get("ttc_cost", 0.0))
-            + 40.0 * float(metrics.get("out_of_bounds_cost", 0.0))
-            + 800.0 * float(metrics.get("collision_risk", 0.0))
-            + 500.0 * float(metrics.get("out_of_bounds_risk", 0.0))
+            55.0 * obstacle_barrier
+            + 8.0 * float(metrics.get("ttc_cost", 0.0))
+            + 90.0 * float(metrics.get("out_of_bounds_cost", 0.0))
+            + 1000.0 * float(metrics.get("collision_risk", 0.0))
+            + 700.0 * float(metrics.get("out_of_bounds_risk", 0.0))
         )
         prior_tracking = float(np.mean(np.sum((sequence - prior) ** 2, axis=1)))
         smoothness = 0.0
@@ -672,12 +676,21 @@ class MPPIDBaSOptimizer:
             smoothness = float(np.mean(np.sum(np.diff(sequence, axis=0) ** 2, axis=1)))
         action_effort = float(np.mean(np.sum(sequence * sequence, axis=1)))
         return float(
-            params["path_weight"] * path_cost
+            params["path_weight"] * local_path_cost
             + params["safety_weight"] * safety_cost
-            + 8.0 * prior_tracking
-            + 1.5 * smoothness
-            + 0.03 * action_effort
+            + 14.0 * prior_tracking
+            + 3.0 * smoothness
+            + 0.04 * action_effort
+            - 1.25 * progress
         )
+
+    def _mppi_lateral_cost(self, lateral_error: float) -> float:
+        lateral_error = abs(float(lateral_error))
+        if lateral_error <= 0.4:
+            return 0.0
+        if lateral_error <= 1.2:
+            return float(5.0 * (lateral_error - 0.4) ** 2)
+        return float(3.2 + 22.0 * (lateral_error - 1.2) ** 2)
 
     def _make_intent_v2_debug(
         self,

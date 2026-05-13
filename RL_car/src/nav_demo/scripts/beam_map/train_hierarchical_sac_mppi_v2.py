@@ -38,7 +38,16 @@ class EntropyControlCallback(BaseCallback):
         return True
 
 
-def make_env(rank: int, log_dir: str, seed: int, intent_ema_alpha: float, intent_hold_steps: int):
+def make_env(
+    rank: int,
+    log_dir: str,
+    seed: int,
+    intent_ema_alpha: float,
+    intent_hold_steps: int,
+    enable_delta_penalty: bool,
+    delta_penalty_alpha: float,
+    delta_deadband: float,
+):
     def _init():
         env = MyCarEnv()
         env = HierarchicalMppiV2Wrapper(
@@ -46,6 +55,9 @@ def make_env(rank: int, log_dir: str, seed: int, intent_ema_alpha: float, intent
             config=hierarchical_mppi_v2_config(seed=seed + rank),
             intent_ema_alpha=intent_ema_alpha,
             intent_hold_steps=intent_hold_steps,
+            enable_delta_penalty=enable_delta_penalty,
+            delta_penalty_alpha=delta_penalty_alpha,
+            delta_deadband=delta_deadband,
         )
         env = Monitor(env, filename=os.path.join(log_dir, f"hierarchical_v2_monitor_{rank}"))
         return env
@@ -71,6 +83,9 @@ def parse_args():
     parser.add_argument("--device", default="auto")
     parser.add_argument("--intent-ema-alpha", type=float, default=0.6)
     parser.add_argument("--intent-hold-steps", type=int, default=2)
+    parser.add_argument("--enable-delta-penalty", action="store_true")
+    parser.add_argument("--delta-penalty-alpha", type=float, default=0.08)
+    parser.add_argument("--delta-deadband", type=float, default=0.10)
     parser.add_argument("--entropy-switch-step", type=int, default=120000)
     parser.add_argument("--target-ent-coef", type=float, default=0.02)
     parser.add_argument("--target-lr", type=float, default=3e-5)
@@ -90,8 +105,30 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
 
-    train_env = DummyVecEnv([make_env(0, args.log_dir, args.seed, args.intent_ema_alpha, args.intent_hold_steps)])
-    eval_env = DummyVecEnv([make_env(1, args.log_dir, args.seed + 10000, args.intent_ema_alpha, args.intent_hold_steps)])
+    train_env = DummyVecEnv([
+        make_env(
+            0,
+            args.log_dir,
+            args.seed,
+            args.intent_ema_alpha,
+            args.intent_hold_steps,
+            args.enable_delta_penalty,
+            args.delta_penalty_alpha,
+            args.delta_deadband,
+        )
+    ])
+    eval_env = DummyVecEnv([
+        make_env(
+            1,
+            args.log_dir,
+            args.seed + 10000,
+            args.intent_ema_alpha,
+            args.intent_hold_steps,
+            args.enable_delta_penalty,
+            args.delta_penalty_alpha,
+            args.delta_deadband,
+        )
+    ])
     if args.frame_stack > 1:
         train_env = VecFrameStack(train_env, n_stack=args.frame_stack)
         eval_env = VecFrameStack(eval_env, n_stack=args.frame_stack)

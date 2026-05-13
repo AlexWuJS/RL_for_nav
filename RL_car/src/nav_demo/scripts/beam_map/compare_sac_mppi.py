@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+from collections import Counter
 from typing import Any, Dict, List
 
 import numpy as np
@@ -173,8 +174,12 @@ def make_env(mode: str, seed: int, log_dir: str, obs_mode: str):
         env = MyCarEnv()
         if mode in ("hierarchical_mppi", "hierarchical_mppi_shield"):
             env = HierarchicalMppiWrapper(env, config=hierarchical_mppi_config(seed=seed))
-        elif mode in ("hierarchical_mppi_v2", "hierarchical_mppi_v2_shield"):
-            env = HierarchicalMppiV2Wrapper(env, config=hierarchical_mppi_v2_config(seed=seed))
+        elif mode in ("hierarchical_mppi_v2", "hierarchical_mppi_v2_shield", "hierarchical_mppi_v2_consistency"):
+            env = HierarchicalMppiV2Wrapper(
+                env,
+                config=hierarchical_mppi_v2_config(seed=seed),
+                enable_delta_penalty=(mode == "hierarchical_mppi_v2_consistency"),
+            )
         elif mode != "baseline":
             env = MppiDbaSActionWrapper(env, config_for_mode(mode, seed))
         if obs_mode == "dict":
@@ -247,7 +252,9 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
         obs, rewards, dones, infos = vec_env.step(action)
         info = dict(infos[0])
         last_info = info
-        episode_reward += float(rewards[0])
+        env_reward = float(info.get("env_reward", rewards[0]))
+        training_reward = float(info.get("training_reward", rewards[0]))
+        episode_reward += env_reward
 
         metrics = get_metric_state(vec_env)
         if "min_laser_dist" in info:
@@ -283,6 +290,10 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
                 "ttc_cost": float(info.get("ttc_cost", 0.0)),
                 "out_of_bounds_cost": float(info.get("out_of_bounds_cost", 0.0)),
                 "action_delta_norm": float(info.get("action_delta_norm", 0.0)),
+                "mppi_delta_norm": float(info.get("mppi_delta_norm", info.get("action_delta_norm", 0.0))),
+                "mppi_delta_penalty": float(info.get("mppi_delta_penalty", 0.0)),
+                "env_reward": env_reward,
+                "training_reward": training_reward,
                 "current_obstacle_distance": float(info.get("current_obstacle_distance", 0.0)),
                 "min_predicted_obstacle_distance": float(info.get("min_predicted_obstacle_distance", 0.0)),
                 "exploration_noise_scale": float(info.get("exploration_noise_scale", 0.0)),
@@ -308,7 +319,7 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
                 "predicted_reward_sac": float(info.get("predicted_reward_sac", 0.0)),
                 "predicted_reward_mppi": float(info.get("predicted_reward_mppi", 0.0)),
                 "predicted_reward_delta": float(info.get("predicted_reward_delta", 0.0)),
-                "reward_prediction_error": float(info.get("predicted_reward_delta", 0.0) - float(rewards[0])),
+                "reward_prediction_error": float(info.get("predicted_reward_delta", 0.0) - env_reward),
                 "mppi_selected": float(bool(info.get("mppi_selected", False))),
                 "source_sac": float(info.get("action_source", "sac") == "sac"),
                 "source_mppi": float(info.get("action_source", "sac") == "mppi"),
@@ -321,11 +332,19 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
                 "sac_intent_turn_bias": float(info.get("sac_intent_turn_bias", 0.0)),
                 "sac_intent_path_weight": float(info.get("sac_intent_path_weight", 0.0)),
                 "sac_intent_safety_weight": float(info.get("sac_intent_safety_weight", 0.0)),
+                "prior_risk_score": float(info.get("prior_risk_score", info.get("base_risk", 0.0))),
+                "candidate_risk_score": float(info.get("candidate_risk_score", info.get("candidate_risk", 0.0))),
+                "prior_progress": float(info.get("base_progress", 0.0)),
+                "candidate_progress": float(info.get("candidate_progress", 0.0)),
+                "prior_lateral_error": float(info.get("base_max_lateral_error", 0.0)),
+                "candidate_lateral_error": float(info.get("candidate_max_lateral_error", 0.0)),
             })
 
         trace_rows.append({
             "step": step_idx,
-            "reward": float(rewards[0]),
+            "reward": env_reward,
+            "env_reward": env_reward,
+            "training_reward": training_reward,
             "x": float(pos[0]),
             "y": float(pos[1]),
             "distance_to_goal": float(metrics["distance_to_goal"]),
@@ -336,6 +355,8 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
             "optimized_surge": float(executed_action[0]),
             "optimized_yaw": float(executed_action[1]),
             "action_delta_norm": float(info.get("action_delta_norm", 0.0)),
+            "mppi_delta_norm": float(info.get("mppi_delta_norm", info.get("action_delta_norm", 0.0))),
+            "mppi_delta_penalty": float(info.get("mppi_delta_penalty", 0.0)),
             "current_obstacle_distance": float(info.get("current_obstacle_distance", metrics["min_scan_distance"])),
             "mppi_active": mppi_active,
             "mppi_accept": int(bool(info.get("mppi_accept", False))),
@@ -358,8 +379,8 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
             "predicted_reward_sac": float(info.get("predicted_reward_sac", 0.0)),
             "predicted_reward_mppi": float(info.get("predicted_reward_mppi", 0.0)),
             "predicted_reward_delta": float(info.get("predicted_reward_delta", 0.0)),
-            "actual_step_reward": float(rewards[0]),
-            "reward_prediction_error": float(info.get("predicted_reward_delta", 0.0) - float(rewards[0])),
+            "actual_step_reward": env_reward,
+            "reward_prediction_error": float(info.get("predicted_reward_delta", 0.0) - env_reward),
             "sac_rollout_terminal": info.get("sac_rollout_terminal", "none"),
             "mppi_rollout_terminal": info.get("mppi_rollout_terminal", "none"),
             "candidate_sac_score": float(info.get("candidate_sac_score", 0.0)),
@@ -384,9 +405,12 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
             "candidate_ttc_cost": float(info.get("candidate_ttc_cost", 0.0)),
             "fallback_ttc_cost": float(info.get("fallback_ttc_cost", 0.0)),
             "base_max_lateral_error": float(info.get("base_max_lateral_error", 0.0)),
+            "prior_lateral_error": float(info.get("base_max_lateral_error", 0.0)),
             "candidate_max_lateral_error": float(info.get("candidate_max_lateral_error", 0.0)),
+            "candidate_lateral_error": float(info.get("candidate_max_lateral_error", 0.0)),
             "fallback_max_lateral_error": float(info.get("fallback_max_lateral_error", 0.0)),
             "base_progress": float(info.get("base_progress", 0.0)),
+            "prior_progress": float(info.get("base_progress", 0.0)),
             "candidate_progress": float(info.get("candidate_progress", 0.0)),
             "fallback_progress": float(info.get("fallback_progress", 0.0)),
             "front_obstacle_distance": float(info.get("front_obstacle_distance", metrics["min_scan_distance"])),
@@ -481,6 +505,17 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
                 "mean_sac_intent_path_weight": mean_debug(mppi_debug, "sac_intent_path_weight"),
                 "mean_sac_intent_safety_weight": mean_debug(mppi_debug, "sac_intent_safety_weight"),
                 "mean_action_delta_norm": mean_debug(mppi_debug, "action_delta_norm"),
+                "mean_mppi_delta_norm": mean_debug(mppi_debug, "mppi_delta_norm"),
+                "mean_mppi_delta_penalty": mean_debug(mppi_debug, "mppi_delta_penalty"),
+                "mean_env_reward": mean_trace(trace_rows, "env_reward"),
+                "mean_training_reward": mean_trace(trace_rows, "training_reward"),
+                "mean_prior_risk_score": mean_debug(mppi_debug, "prior_risk_score"),
+                "mean_candidate_risk_score": mean_debug(mppi_debug, "candidate_risk_score"),
+                "mean_prior_progress": mean_debug(mppi_debug, "prior_progress"),
+                "mean_candidate_progress": mean_debug(mppi_debug, "candidate_progress"),
+                "mean_prior_lateral_error": mean_debug(mppi_debug, "prior_lateral_error"),
+                "mean_candidate_lateral_error": mean_debug(mppi_debug, "candidate_lateral_error"),
+                "major_delta_trigger_reason": major_delta_trigger_reason(trace_rows),
                 "mean_current_obstacle_distance": mean_debug(mppi_debug, "current_obstacle_distance"),
                 "mean_front_obstacle_distance": mean_trace(trace_rows, "front_obstacle_distance"),
                 "mean_left_clearance": mean_trace(trace_rows, "left_clearance"),
@@ -509,6 +544,15 @@ def terminal_source_from_trace(rows: List[Dict[str, Any]]) -> str:
     if not rows:
         return "unknown"
     return str(rows[-1].get("action_source", "unknown"))
+
+
+def major_delta_trigger_reason(rows: List[Dict[str, Any]]) -> str:
+    if not rows:
+        return "none"
+    largest = max(rows, key=lambda row: float(row.get("mppi_delta_norm", row.get("action_delta_norm", 0.0))))
+    if float(largest.get("mppi_delta_norm", largest.get("action_delta_norm", 0.0))) <= 0.0:
+        return "none"
+    return str(largest.get("mppi_trigger_reason", "none"))
 
 
 def run_mode(args, mode: str, model_path: str, obs_mode: str) -> List[Dict[str, Any]]:
@@ -548,7 +592,7 @@ def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
-def summarize(rows: List[Dict[str, Any]]) -> Dict[str, float]:
+def summarize(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not rows:
         return {}
     numeric_keys = [key for key, value in rows[0].items() if isinstance(value, (int, float))]
@@ -557,7 +601,28 @@ def summarize(rows: List[Dict[str, Any]]) -> Dict[str, float]:
         if key in ("episode", "seed"):
             continue
         summary[f"mean_{key}"] = float(np.mean([float(row[key]) for row in rows]))
+    success_rows = [row for row in rows if float(row.get("success", 0.0)) > 0.5]
+    failure_rows = [row for row in rows if float(row.get("success", 0.0)) <= 0.5]
+    collision_rows = [row for row in rows if float(row.get("collision", 0.0)) > 0.5]
+    oob_rows = [row for row in rows if float(row.get("out_of_bounds", 0.0)) > 0.5]
+    summary["mean_success_episode_mppi_delta_norm"] = mean_episode_key(success_rows, "mean_mppi_delta_norm")
+    summary["mean_failure_episode_mppi_delta_norm"] = mean_episode_key(failure_rows, "mean_mppi_delta_norm")
+    summary["mean_success_episode_mppi_delta_penalty"] = mean_episode_key(success_rows, "mean_mppi_delta_penalty")
+    summary["mean_failure_episode_mppi_delta_penalty"] = mean_episode_key(failure_rows, "mean_mppi_delta_penalty")
+    summary["mean_collision_episode_mppi_delta_penalty"] = mean_episode_key(collision_rows, "mean_mppi_delta_penalty")
+    summary["mean_oob_episode_mppi_delta_penalty"] = mean_episode_key(oob_rows, "mean_mppi_delta_penalty")
+    trigger_counts = Counter(
+        str(row.get("major_delta_trigger_reason", "none"))
+        for row in rows
+        if float(row.get("mean_mppi_delta_norm", row.get("mean_action_delta_norm", 0.0))) > 0.0
+    )
+    summary["major_delta_trigger_counts"] = dict(trigger_counts)
     return summary
+
+
+def mean_episode_key(rows: List[Dict[str, Any]], key: str) -> float:
+    values = [float(row[key]) for row in rows if key in row]
+    return float(np.mean(values)) if values else 0.0
 
 
 def paired_summary(all_rows: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
@@ -617,8 +682,10 @@ def parse_args():
             "hierarchical_mppi_shield",
             "hierarchical_mppi_v2",
             "hierarchical_mppi_v2_shield",
+            "hierarchical_mppi_v2_consistency",
             "hierarchical_ablation",
             "hierarchical_ablation_v2",
+            "hierarchical_ablation_v2_consistency",
             "both",
             "ablation",
         ],
@@ -642,7 +709,7 @@ def parse_args():
 
 
 def model_path_for_mode(args, mode: str) -> str:
-    if mode in ("hierarchical_mppi_v2", "hierarchical_mppi_v2_shield"):
+    if mode in ("hierarchical_mppi_v2", "hierarchical_mppi_v2_shield", "hierarchical_mppi_v2_consistency"):
         model_path = args.hierarchical_v2_model or args.hierarchical_model or args.model
     elif mode in ("hierarchical_mppi", "hierarchical_mppi_shield"):
         model_path = args.hierarchical_model or args.model
@@ -669,6 +736,8 @@ def main():
         modes = ["baseline", "shield_only", "hierarchical_mppi"]
     elif args.mode == "hierarchical_ablation_v2":
         modes = ["baseline", "shield_only", "hierarchical_mppi", "hierarchical_mppi_v2"]
+    elif args.mode == "hierarchical_ablation_v2_consistency":
+        modes = ["baseline", "shield_only", "hierarchical_mppi_v2_consistency"]
     else:
         modes = [args.mode]
 

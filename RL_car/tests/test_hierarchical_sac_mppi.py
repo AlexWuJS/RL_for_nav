@@ -139,6 +139,27 @@ class FakeV2Optimizer:
         }
 
 
+class FakeV2DeltaOptimizer(FakeV2Optimizer):
+    def __init__(self, source="hierarchical_mppi", trigger="trigger_lateral_error"):
+        self.config = MPPIDBaSConfig()
+        self.source = source
+        self.trigger = trigger
+
+    def optimize_from_intent_v2(self, intent, planner_state):
+        return np.array([1.0, 0.5], dtype=np.float32), {
+            "action_source": self.source,
+            "mppi_active": True,
+            "mppi_triggered": True,
+            "mppi_trigger_reason": self.trigger,
+            "reject_reason": "none",
+            "intent_prior_surge": 0.6,
+            "intent_prior_yaw": 0.1,
+            "mppi_executed_surge": 1.0,
+            "mppi_executed_yaw": 0.5,
+            "current_obstacle_distance": 10.0,
+        }
+
+
 class HierarchicalSacMppiTests(unittest.TestCase):
     def test_wrapper_exposes_four_dimensional_intent_action_space_and_executes_mppi_action(self):
         env = FakeEnv()
@@ -190,6 +211,47 @@ class HierarchicalSacMppiTests(unittest.TestCase):
         self.assertAlmostEqual(second_info["held_intent_target_speed"], 0.5)
         np.testing.assert_allclose(env.last_action, np.array([0.6, 0.1], dtype=np.float32))
 
+    def test_v2_delta_penalty_disabled_returns_env_reward(self):
+        wrapper = HierarchicalMppiV2Wrapper(FakeEnv(), optimizer=FakeV2DeltaOptimizer())
+
+        _, reward, _, _, info = wrapper.step(np.zeros(4, dtype=np.float32))
+
+        self.assertAlmostEqual(reward, 1.0)
+        self.assertAlmostEqual(info["env_reward"], 1.0)
+        self.assertAlmostEqual(info["training_reward"], 1.0)
+        self.assertAlmostEqual(info["mppi_delta_penalty"], 0.0)
+
+    def test_v2_delta_penalty_applies_to_non_emergency_large_delta(self):
+        wrapper = HierarchicalMppiV2Wrapper(
+            FakeEnv(),
+            optimizer=FakeV2DeltaOptimizer(),
+            enable_delta_penalty=True,
+            delta_penalty_alpha=1.0,
+            delta_deadband=0.1,
+        )
+
+        _, reward, _, _, info = wrapper.step(np.zeros(4, dtype=np.float32))
+
+        expected_delta = float(np.linalg.norm(np.array([1.0, 0.5]) - np.array([0.6, 0.1])))
+        expected_penalty = (expected_delta - 0.1) ** 2
+        self.assertAlmostEqual(info["mppi_delta_norm"], expected_delta, places=6)
+        self.assertAlmostEqual(info["mppi_delta_penalty"], expected_penalty, places=6)
+        self.assertAlmostEqual(reward, 1.0 - expected_penalty, places=6)
+
+    def test_v2_delta_penalty_ignores_emergency_fallback(self):
+        wrapper = HierarchicalMppiV2Wrapper(
+            FakeEnv(),
+            optimizer=FakeV2DeltaOptimizer(source="fallback", trigger="trigger_collision_risk"),
+            enable_delta_penalty=True,
+            delta_penalty_alpha=1.0,
+            delta_deadband=0.1,
+        )
+
+        _, reward, _, _, info = wrapper.step(np.zeros(4, dtype=np.float32))
+
+        self.assertAlmostEqual(reward, 1.0)
+        self.assertAlmostEqual(info["mppi_delta_penalty"], 0.0)
+
     def test_intent_conditioned_mppi_outputs_bounded_action_and_debug(self):
         optimizer = MPPIDBaSOptimizer(
             MPPIDBaSConfig(seed=0, num_samples=8, horizon=4)
@@ -237,6 +299,57 @@ class HierarchicalSacMppiTests(unittest.TestCase):
 
         self.assertTrue(debug["mppi_triggered"])
         self.assertEqual(debug["mppi_trigger_reason"], "trigger_lateral_error")
+
+    def test_v2_accept_rejects_high_progress_candidate_without_safety_or_path_gain(self):
+        optimizer = MPPIDBaSOptimizer(MPPIDBaSConfig(seed=0))
+        prior_metrics = {
+            "risk_score": 0.0,
+            "collision_risk": 0.0,
+            "out_of_bounds_risk": 0.0,
+            "progress": 0.1,
+            "max_lateral_error": 0.2,
+            "ttc_cost": 0.0,
+        }
+        candidate_metrics = {
+            **prior_metrics,
+            "progress": 2.0,
+            "max_lateral_error": 0.2,
+        }
+
+        accepted, reason = optimizer._accept_intent_v2_candidate(
+            prior_metrics,
+            candidate_metrics,
+            candidate_action=np.array([0.5, 0.1], dtype=float),
+            prior_action=np.array([0.5, 0.0], dtype=float),
+            prior_score=10.0,
+            candidate_score=1.0,
+        )
+
+        self.assertFalse(accepted)
+        self.assertEqual(reason, "reject_no_safety_or_path_gain")
+
+    def test_v2_accept_rejects_large_prior_deviation_without_safety_gain(self):
+        optimizer = MPPIDBaSOptimizer(MPPIDBaSConfig(seed=0, mppi_max_action_delta=(0.1, 0.1)))
+        metrics = {
+            "risk_score": 0.0,
+            "collision_risk": 0.0,
+            "out_of_bounds_risk": 0.0,
+            "progress": 0.1,
+            "max_lateral_error": 0.2,
+            "ttc_cost": 0.0,
+        }
+
+        accepted, reason = optimizer._accept_intent_v2_candidate(
+            metrics,
+            metrics,
+            candidate_action=np.array([1.0, 0.6], dtype=float),
+            prior_action=np.array([0.5, 0.0], dtype=float),
+            prior_score=10.0,
+            candidate_score=1.0,
+        )
+
+        self.assertFalse(accepted)
+        self.assertEqual(reason, "reject_trust_region")
 
     def test_safety_and_path_intents_change_conditioned_cost(self):
         optimizer = MPPIDBaSOptimizer(MPPIDBaSConfig(seed=0))
