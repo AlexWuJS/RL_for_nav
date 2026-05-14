@@ -51,7 +51,14 @@ except ModuleNotFoundError:
     sys.modules["gymnasium.spaces"] = spaces
 
 
-from hierarchical_mppi_wrapper import HierarchicalMppiV2Wrapper, HierarchicalMppiWrapper, intent_to_params, intent_to_params_v2  # noqa: E402
+from hierarchical_mppi_wrapper import (  # noqa: E402
+    HierarchicalMppiV2Wrapper,
+    HierarchicalMppiV3Wrapper,
+    HierarchicalMppiWrapper,
+    intent_to_frenet_params_v3,
+    intent_to_params,
+    intent_to_params_v2,
+)
 from mppi_dbas import MPPIDBaSConfig, MPPIDBaSOptimizer  # noqa: E402
 
 
@@ -160,6 +167,32 @@ class FakeV2DeltaOptimizer(FakeV2Optimizer):
         }
 
 
+class FakeV3Optimizer:
+    def __init__(self):
+        self.config = MPPIDBaSConfig()
+
+    def reset(self):
+        self.reset_called = True
+
+    def optimize_from_frenet_intent_v3(self, intent, planner_state):
+        return np.array([0.8, -0.15], dtype=np.float32), {
+            "action_source": "hierarchical_mppi_v3",
+            "mppi_active": True,
+            "mppi_fallback_active": False,
+            "target_progress_speed": 0.75,
+            "target_lateral_offset": -0.5,
+            "caution_level": 0.5,
+            "recovery_level": 0.5,
+            "intent_feasible": True,
+            "intent_feasibility_cost": 0.0,
+            "mppi_best_cost": 1.25,
+            "mppi_predicted_progress": 0.4,
+            "mppi_predicted_lateral_error": 0.1,
+            "mppi_predicted_min_obstacle_distance": 2.0,
+            "mppi_predicted_oob_risk": 0.0,
+        }
+
+
 class HierarchicalSacMppiTests(unittest.TestCase):
     def test_wrapper_exposes_four_dimensional_intent_action_space_and_executes_mppi_action(self):
         env = FakeEnv()
@@ -192,6 +225,66 @@ class HierarchicalSacMppiTests(unittest.TestCase):
         self.assertAlmostEqual(params["turn_bias"], 0.55)
         self.assertAlmostEqual(params["path_weight"], 0.8)
         self.assertAlmostEqual(params["safety_weight"], 3.2)
+
+    def test_v3_frenet_intent_mapping_uses_long_horizon_semantics(self):
+        params = intent_to_frenet_params_v3(
+            np.array([-1.0, 1.0, -1.0, 1.0], dtype=np.float32),
+            planner_state(),
+            MPPIDBaSConfig(),
+        )
+
+        self.assertAlmostEqual(params["target_progress_speed"], 0.25)
+        self.assertAlmostEqual(params["target_lateral_offset"], 1.0)
+        self.assertAlmostEqual(params["caution_level"], 0.0)
+        self.assertAlmostEqual(params["recovery_level"], 1.0)
+        self.assertAlmostEqual(params["path_relaxation"], 0.0)
+        self.assertGreater(params["oob_weight"], params["base_oob_weight"])
+        self.assertGreater(params["lateral_target_weight"], params["base_lateral_weight"])
+
+    def test_v3_lateral_offset_maps_right_center_left(self):
+        config = MPPIDBaSConfig()
+        right = intent_to_frenet_params_v3(np.array([0.0, -1.0, 0.0, 0.0]), planner_state(), config)
+        center = intent_to_frenet_params_v3(np.array([0.0, 0.0, 0.0, 0.0]), planner_state(), config)
+        left = intent_to_frenet_params_v3(np.array([0.0, 1.0, 0.0, 0.0]), planner_state(), config)
+
+        self.assertLess(right["target_lateral_offset"], 0.0)
+        self.assertAlmostEqual(center["target_lateral_offset"], 0.0)
+        self.assertGreater(left["target_lateral_offset"], 0.0)
+
+    def test_v3_dynamic_offset_limit_shrinks_near_boundary(self):
+        config = MPPIDBaSConfig()
+        centered = intent_to_frenet_params_v3(np.array([0.0, 1.0, 0.0, 0.0]), planner_state(y=0.0), config)
+        near_boundary = intent_to_frenet_params_v3(np.array([0.0, 1.0, 0.0, 0.0]), planner_state(y=2.85), config)
+
+        self.assertLess(near_boundary["dynamic_offset_limit"], centered["dynamic_offset_limit"])
+        self.assertLess(abs(near_boundary["target_lateral_offset"]), abs(centered["target_lateral_offset"]))
+
+    def test_v3_caution_and_recovery_raise_safety_and_centering_weights(self):
+        config = MPPIDBaSConfig()
+        low = intent_to_frenet_params_v3(np.array([0.0, 0.0, -1.0, -1.0]), planner_state(), config)
+        high = intent_to_frenet_params_v3(np.array([0.0, 0.0, 1.0, 1.0]), planner_state(), config)
+
+        self.assertGreater(high["safe_distance"], low["safe_distance"])
+        self.assertGreater(high["ttc_weight"], low["ttc_weight"])
+        self.assertGreater(high["obstacle_weight"], low["obstacle_weight"])
+        self.assertGreater(high["oob_weight"], low["oob_weight"])
+        self.assertGreater(high["lateral_target_weight"], low["lateral_target_weight"])
+
+    def test_v3_wrapper_exposes_four_dimensional_intent_and_debug_fields(self):
+        env = FakeEnv()
+        wrapper = HierarchicalMppiV3Wrapper(env, optimizer=FakeV3Optimizer())
+
+        self.assertEqual(wrapper.action_space.shape, (4,))
+        _, reward, _, _, info = wrapper.step(np.array([0.0, -1.0, 0.0, 0.0], dtype=np.float32))
+
+        self.assertAlmostEqual(reward, 1.0)
+        np.testing.assert_allclose(env.last_action, np.array([0.8, -0.15], dtype=np.float32))
+        self.assertTrue(info["hierarchical_mppi_v3_enabled"])
+        self.assertEqual(info["action_source"], "hierarchical_mppi_v3")
+        self.assertIn("target_progress_speed", info)
+        self.assertIn("target_lateral_offset", info)
+        self.assertIn("intent_feasible", info)
+        self.assertIn("mppi_predicted_oob_risk", info)
 
     def test_v2_wrapper_smooths_and_holds_intent_prior_action(self):
         env = FakeEnv()
@@ -299,6 +392,37 @@ class HierarchicalSacMppiTests(unittest.TestCase):
 
         self.assertTrue(debug["mppi_triggered"])
         self.assertEqual(debug["mppi_trigger_reason"], "trigger_lateral_error")
+
+    def test_v3_optimizer_outputs_bounded_action_and_frenet_debug(self):
+        optimizer = MPPIDBaSOptimizer(MPPIDBaSConfig(seed=0, num_samples=8, horizon=4))
+
+        action, debug = optimizer.optimize_from_frenet_intent_v3(
+            np.array([0.0, 1.0, 1.0, 1.0], dtype=np.float32),
+            planner_state(),
+        )
+
+        self.assertEqual(action.shape, (2,))
+        self.assertGreaterEqual(action[0], -1.0)
+        self.assertLessEqual(action[0], 2.0)
+        self.assertGreaterEqual(action[1], -1.0)
+        self.assertLessEqual(action[1], 1.0)
+        self.assertTrue(debug["mppi_active"])
+        self.assertIn(debug["action_source"], ("hierarchical_mppi_v3", "fallback"))
+        self.assertIn("target_lateral_offset", debug)
+        self.assertIn("mppi_predicted_progress", debug)
+
+    def test_v3_fallback_activates_when_best_mppi_is_still_high_risk(self):
+        optimizer = MPPIDBaSOptimizer(
+            MPPIDBaSConfig(seed=0, num_samples=8, horizon=4, collision_distance=9.0, safe_distance=9.5)
+        )
+
+        _, debug = optimizer.optimize_from_frenet_intent_v3(
+            np.array([1.0, 0.0, 1.0, 1.0], dtype=np.float32),
+            planner_state(scan_ranges=[0.2, 0.2, 0.2, 0.2, 0.2]),
+        )
+
+        self.assertEqual(debug["action_source"], "fallback")
+        self.assertTrue(debug["mppi_fallback_active"])
 
     def test_v2_accept_rejects_high_progress_candidate_without_safety_or_path_gain(self):
         optimizer = MPPIDBaSOptimizer(MPPIDBaSConfig(seed=0))

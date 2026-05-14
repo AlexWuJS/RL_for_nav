@@ -41,6 +41,63 @@ def intent_to_params_v2(intent: Any) -> Dict[str, float]:
     }
 
 
+def intent_to_frenet_params_v3(
+    intent: Any,
+    planner_state: Optional[Dict[str, Any]] = None,
+    config: Optional["MPPIDBaSConfig"] = None,
+) -> Dict[str, float]:
+    """Map SAC's high-level Frenet intent to local MPPI trajectory targets."""
+    cfg = config or MPPIDBaSConfig()
+    values = np.asarray(intent, dtype=float).reshape(-1)
+    padded = np.zeros(4, dtype=float)
+    padded[: min(4, values.size)] = values[:4]
+    clipped = np.clip(padded, -1.0, 1.0)
+    caution_level = float(0.5 * (clipped[2] + 1.0))
+    recovery_level = float(0.5 * (clipped[3] + 1.0))
+    dynamic_offset_limit = _dynamic_lateral_offset_limit_v3(planner_state, cfg)
+    base_oob_weight = float(cfg.out_of_bounds_weight)
+    base_lateral_weight = float(cfg.lateral_weight)
+    base_ttc_weight = float(cfg.ttc_weight)
+    base_obstacle_weight = float(cfg.obstacle_weight)
+    return {
+        "target_progress_speed": float(0.25 + 0.5 * (clipped[0] + 1.0)),
+        "target_lateral_offset": float(clipped[1] * dynamic_offset_limit),
+        "dynamic_offset_limit": float(dynamic_offset_limit),
+        "caution_level": caution_level,
+        "recovery_level": recovery_level,
+        "safe_distance": float(cfg.safe_distance + caution_level * 0.55),
+        "ttc_weight": float(base_ttc_weight * (1.0 + 2.5 * caution_level)),
+        "obstacle_weight": float(base_obstacle_weight * (1.0 + 2.0 * caution_level)),
+        "oob_weight": float(base_oob_weight * (1.0 + 1.5 * recovery_level)),
+        "lateral_target_weight": float(base_lateral_weight * (0.5 + 1.5 * recovery_level)),
+        "path_relaxation": float(1.0 - recovery_level),
+        "base_oob_weight": base_oob_weight,
+        "base_lateral_weight": base_lateral_weight,
+        "raw_progress_intent": float(clipped[0]),
+        "raw_lateral_offset_intent": float(clipped[1]),
+        "raw_caution_intent": float(clipped[2]),
+        "raw_recovery_intent": float(clipped[3]),
+    }
+
+
+def _dynamic_lateral_offset_limit_v3(
+    planner_state: Optional[Dict[str, Any]],
+    config: "MPPIDBaSConfig",
+) -> float:
+    max_offset = 1.0
+    if not planner_state:
+        return max_offset
+    frenet_transform = planner_state.get("frenet_transform")
+    if frenet_transform is None:
+        return max_offset
+    try:
+        _, frenet_d = frenet_transform.cartesian_to_frenet(np.asarray(planner_state["position"], dtype=float))
+    except Exception:
+        return max_offset
+    boundary_margin = max(float(config.env_out_of_bounds_limit) - abs(float(frenet_d)) - 0.25, 0.05)
+    return float(np.clip(boundary_margin, 0.05, max_offset))
+
+
 try:
     from frenet_utils import frenet_reward
 except ImportError:
@@ -588,6 +645,337 @@ class MPPIDBaSOptimizer:
             action_source=action_source,
         )
         return executed_action.astype(np.float32), debug
+
+    def optimize_from_frenet_intent_v3(self, intent: Any, planner_state: Dict[str, Any]) -> Tuple[np.ndarray, Dict[str, float]]:
+        """Use SAC intent as a local Frenet target and let MPPI execute the short-horizon plan."""
+        cfg = self.config
+        params = intent_to_frenet_params_v3(intent, planner_state, cfg)
+        radar = self._scan_risk_summary(planner_state)
+        obstacles = self._scan_to_obstacle_points(planner_state)
+        prior_action = self._v3_prior_action(params, planner_state)
+        noise_scale = self._adaptive_noise_scale(radar["global_min"])
+        action_sequences, prior_names, warm_start_used = self._sample_sac_centered_sequences(prior_action, noise_scale)
+        metrics = [
+            self._frenet_rollout_metrics_v3(sequence, prior_action, planner_state, obstacles, params)
+            for sequence in action_sequences
+        ]
+        costs = np.asarray(
+            [
+                self._frenet_intent_cost_v3(metric, sequence, params)
+                for metric, sequence in zip(metrics, action_sequences)
+            ],
+            dtype=float,
+        )
+        best_idx = int(np.argmin(costs))
+        best_sequence = action_sequences[best_idx]
+        candidate_action = self._clip_action(best_sequence[0])
+        candidate_metrics = metrics[best_idx]
+        self.best_sequence = best_sequence.copy()
+
+        fallback_active = False
+        fallback_accept = False
+        reject_reason = "none"
+        executed_action = candidate_action
+        action_source = "hierarchical_mppi_v3"
+        fallback_action = candidate_action
+        fallback_metrics = candidate_metrics
+
+        candidate_high_risk = bool(
+            candidate_metrics["collision_risk"] > 0.0
+            or candidate_metrics["out_of_bounds_risk"] > 0.0
+            or candidate_metrics["ttc_cost"] > 0.0
+            or candidate_metrics["min_distance"] < cfg.safe_distance
+        )
+        if cfg.enable_fallback and candidate_high_risk:
+            fallback_active = True
+            fallback_action = self._fallback_action(prior_action, planner_state, radar)
+            fallback_sequence = np.tile(fallback_action.reshape(1, 2), (cfg.horizon, 1))
+            fallback_metrics = self._frenet_rollout_metrics_v3(fallback_sequence, prior_action, planner_state, obstacles, params)
+            fallback_accept = bool(fallback_metrics["risk_score"] <= candidate_metrics["risk_score"] + 1e-6)
+            if fallback_accept:
+                executed_action = fallback_action
+                action_source = "fallback"
+                reject_reason = "fallback_high_risk_mppi"
+
+        if cfg.final_safety_check and self._emergency_brake_needed(candidate_metrics, candidate_metrics, radar):
+            executed_action = self._emergency_brake_action(prior_action)
+            action_source = "fallback"
+            fallback_active = True
+            fallback_accept = True
+            reject_reason = "emergency_brake"
+
+        self.last_action = executed_action.astype(np.float32)
+        self.last_noise_scale = float(noise_scale)
+        debug = self._make_frenet_v3_debug(
+            intent=np.asarray(intent, dtype=float).reshape(-1),
+            params=params,
+            executed_action=executed_action,
+            prior_action=prior_action,
+            candidate_action=candidate_action,
+            candidate_metrics=candidate_metrics,
+            fallback_metrics=fallback_metrics,
+            costs=costs,
+            radar=radar,
+            prior_type=prior_names[best_idx],
+            warm_start_used=warm_start_used,
+            noise_scale=noise_scale,
+            action_source=action_source,
+            fallback_active=fallback_active,
+            fallback_accept=fallback_accept,
+            reject_reason=reject_reason,
+        )
+        return executed_action.astype(np.float32), debug
+
+    def _v3_prior_action(self, params: Dict[str, float], planner_state: Dict[str, Any]) -> np.ndarray:
+        target_speed = float(params["target_progress_speed"])
+        target_offset = float(params["target_lateral_offset"])
+        current_d = 0.0
+        frenet_transform = planner_state.get("frenet_transform")
+        if frenet_transform is not None:
+            try:
+                _, current_d = frenet_transform.cartesian_to_frenet(np.asarray(planner_state["position"], dtype=float))
+            except Exception:
+                current_d = 0.0
+        lateral_error = target_offset - float(current_d)
+        yaw_bias = float(np.clip(0.65 * lateral_error, -0.65, 0.65))
+        if params["caution_level"] > 0.75:
+            target_speed = min(target_speed, 0.85)
+        return self._clip_action([target_speed, yaw_bias])
+
+    def _frenet_rollout_metrics_v3(
+        self,
+        action_sequence: np.ndarray,
+        base_action: np.ndarray,
+        planner_state: Dict[str, Any],
+        obstacles: Optional[np.ndarray],
+        params: Dict[str, float],
+    ) -> Dict[str, float]:
+        cfg = self.config
+        dt = float(planner_state.get("dt", 0.1))
+        mass = float(planner_state.get("mass", 2.0))
+        damping = float(planner_state.get("damping", 0.5))
+        position = np.asarray(planner_state["position"], dtype=float).copy()
+        yaw = float(planner_state.get("yaw", 0.0))
+        velocity = np.asarray(planner_state.get("velocity", [0.0, 0.0, 0.0]), dtype=float).copy()
+        target = np.asarray(planner_state.get("target_position", position), dtype=float)
+        frenet_transform = planner_state.get("frenet_transform")
+        max_laser_range = float(planner_state.get("max_laser_range", 10.0))
+        prev_action = np.asarray(planner_state.get("last_action", self.last_action), dtype=float).reshape(-1)[:2]
+
+        if frenet_transform is not None:
+            start_s, start_d = frenet_transform.cartesian_to_frenet(position)
+            prev_s = float(start_s)
+        else:
+            start_d = 0.0
+            prev_s = 0.0
+
+        min_distance = max_laser_range
+        total_ttc_cost = 0.0
+        total_oob_cost = 0.0
+        max_lateral_error = 0.0
+        max_heading_error = 0.0
+        lateral_target_error_sum = 0.0
+        final_d = float(start_d)
+        terminal = "running"
+
+        for action in action_sequence:
+            effective_action = cfg.action_lag_alpha * prev_action + (1.0 - cfg.action_lag_alpha) * action
+            control_input = np.array([float(effective_action[0]), 0.0, float(effective_action[1])], dtype=float)
+            acceleration = (control_input / mass) - (damping * velocity)
+            velocity = velocity + acceleration * dt
+            yaw = self._wrap_angle(yaw + velocity[2] * dt)
+            heading_vec = np.array([math.cos(yaw), math.sin(yaw)], dtype=float)
+            position = position + heading_vec * velocity[0] * dt
+
+            if frenet_transform is not None:
+                frenet_s, frenet_d = frenet_transform.cartesian_to_frenet(position)
+                heading_error = float(frenet_transform.get_heading_error(yaw, frenet_s))
+                final_d = float(frenet_d)
+            else:
+                frenet_s = prev_s + max(0.0, float(velocity[0] * dt))
+                frenet_d = 0.0
+                heading_error = 0.0
+                final_d = 0.0
+
+            lateral_error = abs(float(frenet_d))
+            max_lateral_error = max(max_lateral_error, lateral_error)
+            max_heading_error = max(max_heading_error, abs(float(heading_error)))
+            lateral_target_error_sum += (float(frenet_d) - float(params["target_lateral_offset"])) ** 2
+
+            obstacle_dist = self._min_obstacle_distance(position, obstacles, planner_state)
+            min_distance = min(min_distance, obstacle_dist)
+            total_ttc_cost += self._ttc_cost(position, heading_vec * velocity[0], obstacles)
+            if lateral_error > cfg.env_out_of_bounds_limit:
+                total_oob_cost += (lateral_error - cfg.env_out_of_bounds_limit) ** 2 + 1.0
+                terminal = "out_of_bounds"
+                break
+            if obstacle_dist < cfg.collision_distance:
+                terminal = "collision"
+                break
+            prev_s = float(frenet_s)
+            prev_action = effective_action
+
+        progress = float(prev_s - float(start_s)) if frenet_transform is not None else float(
+            np.linalg.norm(target - np.asarray(planner_state["position"], dtype=float)) - np.linalg.norm(target - position)
+        )
+        collision_risk = 1.0 if terminal == "collision" or min_distance < cfg.collision_distance else 0.0
+        out_of_bounds_risk = 1.0 if terminal == "out_of_bounds" or max_lateral_error > cfg.env_out_of_bounds_limit else 0.0
+        safety_violation = max(0.0, float(params["safe_distance"]) - min_distance)
+        risk_score = 10.0 * collision_risk + 4.0 * out_of_bounds_risk + total_ttc_cost + 2.0 * safety_violation
+        return {
+            "min_distance": float(min_distance),
+            "ttc_cost": float(total_ttc_cost),
+            "out_of_bounds_cost": float(total_oob_cost),
+            "max_lateral_error": float(max_lateral_error),
+            "max_heading_error": float(max_heading_error),
+            "progress": float(progress),
+            "target_lateral_error": float(lateral_target_error_sum / max(len(action_sequence), 1)),
+            "final_lateral_offset": float(final_d),
+            "risk_score": float(risk_score),
+            "collision_risk": float(collision_risk),
+            "out_of_bounds_risk": float(out_of_bounds_risk),
+            "rollout_terminal": terminal,
+        }
+
+    def _frenet_intent_cost_v3(
+        self,
+        metrics: Dict[str, float],
+        action_sequence: np.ndarray,
+        params: Dict[str, float],
+    ) -> float:
+        cfg = self.config
+        sequence = np.asarray(action_sequence, dtype=float)
+        target_progress = float(params["target_progress_speed"]) * cfg.horizon * 0.1
+        progress_shortfall = max(0.0, target_progress - float(metrics["progress"]))
+        progress_overshoot = max(0.0, float(metrics["progress"]) - 1.25 * target_progress)
+        progress_tracking_cost = 12.0 * progress_shortfall ** 2 + 1.5 * progress_overshoot ** 2
+        lateral_target_cost = float(params["lateral_target_weight"]) * float(metrics["target_lateral_error"])
+        obstacle_barrier = max(0.0, float(params["safe_distance"]) - float(metrics["min_distance"])) ** 2
+        safety_cost = (
+            float(params["obstacle_weight"]) * obstacle_barrier
+            + float(params["ttc_weight"]) * float(metrics["ttc_cost"])
+            + 1000.0 * float(metrics["collision_risk"])
+        )
+        oob_cost = float(params["oob_weight"]) * (
+            float(metrics["out_of_bounds_cost"]) + 4.0 * float(metrics["out_of_bounds_risk"])
+        )
+        smoothness_cost = 0.0
+        if len(sequence) > 1:
+            smoothness_cost = 3.0 * float(np.mean(np.sum(np.diff(sequence, axis=0) ** 2, axis=1)))
+        action_effort_cost = 0.04 * float(np.mean(np.sum(sequence * sequence, axis=1)))
+        intent_feasibility_cost = self._intent_feasibility_cost_v3(params, metrics)
+        return float(
+            progress_tracking_cost
+            + lateral_target_cost
+            + safety_cost
+            + oob_cost
+            + smoothness_cost
+            + action_effort_cost
+            + intent_feasibility_cost
+        )
+
+    def _intent_feasibility_cost_v3(self, params: Dict[str, float], metrics: Dict[str, float]) -> float:
+        target_offset = abs(float(params["target_lateral_offset"]))
+        dynamic_limit = max(float(params["dynamic_offset_limit"]), 1e-6)
+        boundary_cost = max(0.0, target_offset - dynamic_limit) ** 2 * 50.0
+        obstacle_cost = 20.0 * max(0.0, float(params["safe_distance"]) - float(metrics["min_distance"])) ** 2
+        return float(boundary_cost + obstacle_cost)
+
+    def _make_frenet_v3_debug(
+        self,
+        intent: np.ndarray,
+        params: Dict[str, float],
+        executed_action: np.ndarray,
+        prior_action: np.ndarray,
+        candidate_action: np.ndarray,
+        candidate_metrics: Dict[str, float],
+        fallback_metrics: Dict[str, float],
+        costs: np.ndarray,
+        radar: Dict[str, float],
+        prior_type: str,
+        warm_start_used: bool,
+        noise_scale: float,
+        action_source: str,
+        fallback_active: bool,
+        fallback_accept: bool,
+        reject_reason: str,
+    ) -> Dict[str, float]:
+        padded = np.zeros(4, dtype=float)
+        padded[: min(4, intent.size)] = intent[:4]
+        feasibility_cost = self._intent_feasibility_cost_v3(params, candidate_metrics)
+        intent_feasible = bool(feasibility_cost < 1e-6 and abs(params["target_lateral_offset"]) <= params["dynamic_offset_limit"] + 1e-6)
+        action_delta = np.asarray(executed_action, dtype=float) - np.asarray(prior_action, dtype=float)
+        return {
+            "action_source": action_source,
+            "terminal_source": action_source,
+            "mppi_dbas_enabled": True,
+            "hierarchical_mppi_v3_enabled": True,
+            "mppi_active": True,
+            "mppi_accept": action_source == "hierarchical_mppi_v3",
+            "mppi_reject": action_source != "hierarchical_mppi_v3",
+            "mppi_fallback_active": bool(fallback_active),
+            "fallback_active": bool(fallback_active),
+            "fallback_accept": bool(fallback_accept),
+            "mppi_decision_reason": "select_frenet_mppi_v3",
+            "selected_reason": f"select_{action_source}",
+            "reject_reason": reject_reason,
+            "mppi_triggered": True,
+            "mppi_trigger_reason": "always_frenet_v3",
+            "candidate_accepted": action_source == "hierarchical_mppi_v3",
+            "candidate_reject_reason": reject_reason,
+            "mppi_prior_type": prior_type,
+            "mppi_warm_start_used": bool(warm_start_used),
+            "exploration_noise_scale": float(noise_scale),
+            "sac_intent_progress": float(padded[0]),
+            "sac_intent_lateral_offset": float(padded[1]),
+            "sac_intent_caution": float(padded[2]),
+            "sac_intent_recovery": float(padded[3]),
+            "target_progress_speed": float(params["target_progress_speed"]),
+            "target_lateral_offset": float(params["target_lateral_offset"]),
+            "dynamic_offset_limit": float(params["dynamic_offset_limit"]),
+            "caution_level": float(params["caution_level"]),
+            "recovery_level": float(params["recovery_level"]),
+            "path_relaxation": float(params["path_relaxation"]),
+            "intent_feasible": bool(intent_feasible),
+            "intent_feasibility_cost": float(feasibility_cost),
+            "intent_prior_surge": float(prior_action[0]),
+            "intent_prior_yaw": float(prior_action[1]),
+            "raw_action_surge": float(prior_action[0]),
+            "raw_action_yaw": float(prior_action[1]),
+            "candidate_action_surge": float(candidate_action[0]),
+            "candidate_action_yaw": float(candidate_action[1]),
+            "optimized_action_surge": float(executed_action[0]),
+            "optimized_action_yaw": float(executed_action[1]),
+            "mppi_executed_surge": float(executed_action[0]),
+            "mppi_executed_yaw": float(executed_action[1]),
+            "action_delta_surge": float(action_delta[0]),
+            "action_delta_yaw": float(action_delta[1]),
+            "action_delta_norm": float(np.linalg.norm(action_delta)),
+            "mppi_best_cost": float(np.min(costs)) if costs.size else 0.0,
+            "mppi_predicted_progress": float(candidate_metrics["progress"]),
+            "mppi_predicted_lateral_error": float(candidate_metrics["target_lateral_error"]),
+            "mppi_predicted_min_obstacle_distance": float(candidate_metrics["min_distance"]),
+            "mppi_predicted_oob_risk": float(candidate_metrics["out_of_bounds_risk"]),
+            "current_obstacle_distance": float(radar["global_min"]),
+            "front_obstacle_distance": float(radar["front_min"]),
+            "left_clearance": float(radar["left_min"]),
+            "right_clearance": float(radar["right_min"]),
+            "min_predicted_obstacle_distance": float(candidate_metrics["min_distance"]),
+            "dbas_cost": 0.0,
+            "ttc_cost": float(candidate_metrics["ttc_cost"]),
+            "out_of_bounds_cost": float(candidate_metrics["out_of_bounds_cost"]),
+            "candidate_risk_score": float(candidate_metrics["risk_score"]),
+            "candidate_progress": float(candidate_metrics["progress"]),
+            "candidate_max_lateral_error": float(candidate_metrics["max_lateral_error"]),
+            "candidate_ttc_cost": float(candidate_metrics["ttc_cost"]),
+            "candidate_min_distance": float(candidate_metrics["min_distance"]),
+            "candidate_pred_collision": bool(candidate_metrics["collision_risk"] > 0.0),
+            "candidate_pred_out_of_bounds": bool(candidate_metrics["out_of_bounds_risk"] > 0.0),
+            "fallback_risk": float(fallback_metrics["risk_score"]),
+            "fallback_progress": float(fallback_metrics["progress"]),
+            "fallback_max_lateral_error": float(fallback_metrics["max_lateral_error"]),
+            "fallback_ttc_cost": float(fallback_metrics["ttc_cost"]),
+        }
 
     def _intent_v2_should_trigger(self, prior_metrics: Dict[str, float], radar: Dict[str, float]) -> Tuple[bool, str]:
         cfg = self.config

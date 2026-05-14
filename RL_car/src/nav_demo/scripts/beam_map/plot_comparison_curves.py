@@ -28,6 +28,7 @@ MODE_COLORS = {
     "hierarchical_mppi_v2": "#2a9d8f",
     "hierarchical_mppi_v2_shield": "#457b9d",
     "hierarchical_mppi_v2_consistency": "#9c6644",
+    "hierarchical_mppi_v3": "#d1495b",
 }
 
 FALLBACK_COLORS = [
