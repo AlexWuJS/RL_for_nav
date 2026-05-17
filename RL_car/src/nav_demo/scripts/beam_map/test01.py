@@ -9,10 +9,12 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
 from hierarchical_mppi_wrapper import (
     HierarchicalMppiV2Wrapper,
     HierarchicalMppiV3Wrapper,
+    HierarchicalMppiV4Wrapper,
     HierarchicalMppiWrapper,
     hierarchical_mppi_config,
     hierarchical_mppi_v2_config,
     hierarchical_mppi_v3_config,
+    hierarchical_mppi_v4_config,
 )
 from mppi_dbas import MPPIDBaSConfig
 from mppi_dbas_wrapper import MppiDbaSActionWrapper
@@ -23,7 +25,7 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 
 def config_for_mode(mode: str, seed: int) -> MPPIDBaSConfig | None:
-    if mode in ("baseline", "hierarchical_mppi", "hierarchical_mppi_v2", "hierarchical_mppi_v3"):
+    if mode in ("baseline", "hierarchical_mppi", "hierarchical_mppi_v2", "hierarchical_mppi_v3", "hierarchical_mppi_v4_compat", "hierarchical_mppi_v4_enhanced"):
         return None
     if mode == "shield_only":
         return MPPIDBaSConfig(seed=seed, enable_mppi=False, enable_fallback=True)
@@ -69,6 +71,10 @@ def make_env(mode: str, seed: int) -> gym.Env:
         return HierarchicalMppiV2Wrapper(env, config=hierarchical_mppi_v2_config(seed=seed))
     if mode == "hierarchical_mppi_v3":
         return HierarchicalMppiV3Wrapper(env, config=hierarchical_mppi_v3_config(seed=seed))
+    if mode == "hierarchical_mppi_v4_compat":
+        return HierarchicalMppiV4Wrapper(env, config=hierarchical_mppi_v4_config(seed=seed, reward_profile="compat"), reward_profile="compat")
+    if mode == "hierarchical_mppi_v4_enhanced":
+        return HierarchicalMppiV4Wrapper(env, config=hierarchical_mppi_v4_config(seed=seed, reward_profile="enhanced"), reward_profile="enhanced")
     config = config_for_mode(mode, seed)
     if config is None:
         return env
@@ -85,6 +91,12 @@ def choose_model_path(model_arg: str | None) -> str | None:
         "./training_hierarchical_mppi_v3_results/best_model.zip",
         "./training_hierarchical_mppi_v3_results/best_model",
         "./training_hierarchical_mppi_v3_results/final_model_hierarchical_v3.zip",
+        "./training_hierarchical_mppi_v4_compat_results/best_model.zip",
+        "./training_hierarchical_mppi_v4_compat_results/best_model",
+        "./training_hierarchical_mppi_v4_compat_results/final_model_hierarchical_v4_compat.zip",
+        "./training_hierarchical_mppi_v4_enhanced_results/best_model.zip",
+        "./training_hierarchical_mppi_v4_enhanced_results/best_model",
+        "./training_hierarchical_mppi_v4_enhanced_results/final_model_hierarchical_v4_enhanced.zip",
         "./training_hierarchical_mppi_v2_results/best_model.zip",
         "./training_hierarchical_mppi_v2_results/best_model",
         "./training_hierarchical_mppi_v2_results/final_model_hierarchical_v2.zip",
@@ -114,6 +126,8 @@ def parse_args():
             "hierarchical_mppi",
             "hierarchical_mppi_v2",
             "hierarchical_mppi_v3",
+            "hierarchical_mppi_v4_compat",
+            "hierarchical_mppi_v4_enhanced",
         ],
         default="baseline",
         help="baseline keeps raw SAC actions; shield_only enables the low-intervention safety fallback.",

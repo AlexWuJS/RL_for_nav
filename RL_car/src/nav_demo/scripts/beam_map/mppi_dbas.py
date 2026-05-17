@@ -5,6 +5,16 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 
+V4_MODE_NAMES = (
+    "cruise",
+    "cautious_cruise",
+    "avoid_left",
+    "avoid_right",
+    "recover_center",
+    "brake",
+)
+
+
 def intent_to_params(intent: Any) -> Dict[str, float]:
     """Map SAC's normalized high-level intent to MPPI priors and cost weights."""
     values = np.asarray(intent, dtype=float).reshape(-1)
@@ -39,6 +49,113 @@ def intent_to_params_v2(intent: Any) -> Dict[str, float]:
         "raw_path_weight": float(clipped[2]),
         "raw_safety_weight": float(clipped[3]),
     }
+
+
+def decode_mode_intent_v4(intent: Any) -> Dict[str, Any]:
+    """Decode an 8D continuous policy output into a mode choice plus 2 continuous parameters."""
+    values = np.asarray(intent, dtype=float).reshape(-1)
+    padded = np.zeros(8, dtype=float)
+    padded[: min(8, values.size)] = values[:8]
+    clipped = np.clip(padded, -1.0, 1.0)
+    mode_scores = clipped[: len(V4_MODE_NAMES)]
+    mode_index = int(np.argmax(mode_scores))
+    sorted_scores = np.sort(mode_scores)
+    if mode_scores.size >= 2:
+        mode_margin = float(sorted_scores[-1] - sorted_scores[-2])
+    else:
+        mode_margin = 0.0
+    speed_scale = float(0.5 * (clipped[6] + 1.0))
+    avoid_strength = float(0.5 * (clipped[7] + 1.0))
+    return {
+        "mode_scores": mode_scores.astype(float),
+        "mode_index": mode_index,
+        "mode_name": V4_MODE_NAMES[mode_index],
+        "mode_margin": mode_margin,
+        "speed_scale": speed_scale,
+        "avoid_strength": avoid_strength,
+        "raw_speed_scale": float(clipped[6]),
+        "raw_avoid_strength": float(clipped[7]),
+        "raw_vector": clipped.astype(float),
+    }
+
+
+def intent_to_mode_params_v4(
+    intent: Any,
+    planner_state: Optional[Dict[str, Any]] = None,
+    config: Optional["MPPIDBaSConfig"] = None,
+) -> Dict[str, Any]:
+    """Map the semi-discrete v4 policy output to interpretable control priors and cost weights."""
+    cfg = config or MPPIDBaSConfig()
+    decoded = decode_mode_intent_v4(intent)
+    mode_name = str(decoded["mode_name"])
+    speed_scale = float(decoded["speed_scale"])
+    avoid_strength = float(decoded["avoid_strength"])
+    current_d = 0.0
+    frenet_transform = None if not planner_state else planner_state.get("frenet_transform")
+    if planner_state and frenet_transform is not None:
+        try:
+            _, current_d = frenet_transform.cartesian_to_frenet(np.asarray(planner_state["position"], dtype=float))
+        except Exception:
+            current_d = 0.0
+    center_correction = float(np.clip(-0.35 * current_d, -0.35, 0.35))
+    target_speed = 0.55 + 0.45 * speed_scale
+    turn_bias = center_correction
+    path_weight = 1.05
+    safety_weight = 1.6
+    desired_lateral_offset = float(np.clip(-0.4 * current_d, -0.75, 0.75))
+
+    if mode_name == "cautious_cruise":
+        target_speed = min(target_speed, 0.55 + 0.20 * speed_scale)
+        safety_weight = 2.4
+        path_weight = 1.1
+    elif mode_name == "avoid_left":
+        target_speed = 0.35 + 0.35 * speed_scale
+        turn_bias = float(np.clip(0.18 + 0.55 * avoid_strength + 0.25 * center_correction, -0.8, 0.8))
+        path_weight = 1.25
+        safety_weight = 2.6
+        desired_lateral_offset = float(np.clip(0.35 + 0.55 * avoid_strength, -0.85, 0.85))
+    elif mode_name == "avoid_right":
+        target_speed = 0.35 + 0.35 * speed_scale
+        turn_bias = float(np.clip(-0.18 - 0.55 * avoid_strength + 0.25 * center_correction, -0.8, 0.8))
+        path_weight = 1.25
+        safety_weight = 2.6
+        desired_lateral_offset = float(np.clip(-0.35 - 0.55 * avoid_strength, -0.85, 0.85))
+    elif mode_name == "recover_center":
+        target_speed = 0.25 + 0.35 * speed_scale
+        recovery_gain = 0.45 + 0.40 * avoid_strength
+        turn_bias = float(np.clip(-recovery_gain * current_d, -0.85, 0.85))
+        path_weight = 1.7
+        safety_weight = 2.3
+        desired_lateral_offset = 0.0
+    elif mode_name == "brake":
+        target_speed = 0.02 + 0.15 * speed_scale
+        turn_bias = float(np.clip(-0.25 * current_d, -0.45, 0.45))
+        path_weight = 1.3
+        safety_weight = 3.1
+        desired_lateral_offset = 0.0
+
+    safe_distance = float(cfg.safe_distance)
+    if mode_name == "cautious_cruise":
+        safe_distance += 0.20
+    elif mode_name in ("avoid_left", "avoid_right"):
+        safe_distance += 0.25 + 0.15 * avoid_strength
+    elif mode_name == "recover_center":
+        safe_distance += 0.10
+    elif mode_name == "brake":
+        safe_distance += 0.35
+
+    decoded.update(
+        {
+            "target_speed": float(np.clip(target_speed, 0.0, cfg.action_high[0])),
+            "turn_bias": float(np.clip(turn_bias, cfg.action_low[1], cfg.action_high[1])),
+            "path_weight": float(path_weight),
+            "safety_weight": float(safety_weight),
+            "safe_distance": float(safe_distance),
+            "desired_lateral_offset": float(desired_lateral_offset),
+            "current_lateral_offset": float(current_d),
+        }
+    )
+    return decoded
 
 
 def intent_to_frenet_params_v3(
@@ -190,6 +307,10 @@ class MPPIDBaSConfig:
     hierarchical_min_risk_gain: float = 0.05
     hierarchical_accept_score_margin: float = 0.01
     hierarchical_lateral_recovery_gain: float = 0.08
+    hierarchical_v4_cruise_max_yaw_delta: float = 0.18
+    hierarchical_v4_mode_switch_margin: float = 0.02
+    hierarchical_v4_fallback_risk_margin: float = 0.08
+    hierarchical_v4_direction_consistency_weight: float = 0.5
 
 
 class MPPIDBaSOptimizer:
@@ -643,6 +764,138 @@ class MPPIDBaSOptimizer:
             candidate_accepted=accepted and action_source == "hierarchical_mppi",
             reject_reason=reject_reason,
             action_source=action_source,
+        )
+        return executed_action.astype(np.float32), debug
+
+    def optimize_from_mode_intent_v4(self, intent: Any, planner_state: Dict[str, Any]) -> Tuple[np.ndarray, Dict[str, float]]:
+        """Use semi-discrete v4 intent semantics and keep MPPI as a trigger-based local corrector."""
+        cfg = self.config
+        params = intent_to_mode_params_v4(intent, planner_state, cfg)
+        mode_name = str(params["mode_name"])
+        prior_action = self._v4_prior_action(params, planner_state)
+        radar = self._scan_risk_summary(planner_state)
+        obstacles = self._scan_to_obstacle_points(planner_state)
+        prior_sequence = np.tile(prior_action.reshape(1, 2), (cfg.horizon, 1))
+        prior_metrics = self._reward_aligned_rollout(prior_sequence, prior_action, planner_state, obstacles)
+        should_trigger, trigger_reason = self._intent_v4_should_trigger(mode_name, params, prior_metrics, radar)
+
+        fallback_active = False
+        fallback_accept = False
+        fallback_action = prior_action
+        fallback_metrics = prior_metrics
+        if cfg.enable_fallback and should_trigger and self._fallback_should_run(prior_metrics, radar):
+            fallback_active = True
+            fallback_action = self._fallback_action(prior_action, planner_state, radar)
+            fallback_sequence = np.tile(fallback_action.reshape(1, 2), (cfg.horizon, 1))
+            fallback_metrics = self._reward_aligned_rollout(fallback_sequence, prior_action, planner_state, obstacles)
+            fallback_accept, _ = self._accept_fallback(prior_metrics, fallback_metrics)
+
+        if not should_trigger or not cfg.enable_mppi:
+            executed_action = fallback_action if fallback_accept else prior_action
+            action_source = "fallback" if fallback_accept else "intent_prior"
+            self.last_action = executed_action.astype(np.float32)
+            debug = self._make_intent_v4_debug(
+                intent=np.asarray(intent, dtype=float).reshape(-1),
+                params=params,
+                executed_action=executed_action,
+                prior_action=prior_action,
+                candidate_action=prior_action,
+                prior_metrics=prior_metrics,
+                candidate_metrics=prior_metrics,
+                fallback_metrics=fallback_metrics,
+                costs=np.array([self._intent_conditioned_cost_v4(prior_metrics, prior_sequence, prior_action, params)]),
+                radar=radar,
+                prior_type="mode_prior",
+                warm_start_used=False,
+                noise_scale=0.0,
+                mppi_triggered=False,
+                trigger_reason=trigger_reason,
+                candidate_accepted=False,
+                reject_reason="base_safe" if cfg.enable_mppi else "mppi_disabled",
+                action_source=action_source,
+                fallback_active=fallback_active,
+                fallback_accept=fallback_accept,
+            )
+            return executed_action.astype(np.float32), debug
+
+        noise_scale = self._adaptive_noise_scale(radar["global_min"])
+        action_sequences, prior_names, warm_start_used = self._sample_sac_centered_sequences(prior_action, noise_scale)
+        metrics = [
+            self._reward_aligned_rollout(sequence, prior_action, planner_state, obstacles)
+            for sequence in action_sequences
+        ]
+        costs = np.asarray(
+            [
+                self._intent_conditioned_cost_v4(metric, sequence, prior_action, params)
+                for metric, sequence in zip(metrics, action_sequences)
+            ],
+            dtype=float,
+        )
+        best_idx = int(np.argmin(costs))
+        candidate_action = self._clip_action(action_sequences[best_idx][0])
+        candidate_metrics = metrics[best_idx]
+        self.best_sequence = action_sequences[best_idx].copy()
+
+        accepted, reject_reason = self._accept_intent_v4_candidate(
+            mode_name=mode_name,
+            params=params,
+            prior_metrics=prior_metrics,
+            candidate_metrics=candidate_metrics,
+            candidate_action=candidate_action,
+            prior_action=prior_action,
+            prior_score=self._intent_conditioned_cost_v4(prior_metrics, prior_sequence, prior_action, params),
+            candidate_score=float(costs[best_idx]),
+        )
+
+        if fallback_accept:
+            prefer_mppi = accepted and self._intent_v4_prefer_mppi_over_fallback(candidate_metrics, fallback_metrics)
+            if prefer_mppi:
+                executed_action = candidate_action
+                action_source = "hierarchical_mppi_v4"
+            else:
+                executed_action = fallback_action
+                action_source = "fallback"
+                if accepted:
+                    reject_reason = "prefer_fallback"
+                    accepted = False
+        elif accepted:
+            executed_action = candidate_action
+            action_source = "hierarchical_mppi_v4"
+        else:
+            executed_action = prior_action
+            action_source = "intent_prior"
+
+        if cfg.final_safety_check and self._emergency_brake_needed(prior_metrics, candidate_metrics, radar):
+            executed_action = self._emergency_brake_action(prior_action)
+            action_source = "fallback"
+            fallback_active = True
+            fallback_accept = True
+            reject_reason = "emergency_brake"
+            accepted = False
+
+        self.last_action = executed_action.astype(np.float32)
+        self.last_noise_scale = float(noise_scale)
+        debug = self._make_intent_v4_debug(
+            intent=np.asarray(intent, dtype=float).reshape(-1),
+            params=params,
+            executed_action=executed_action,
+            prior_action=prior_action,
+            candidate_action=candidate_action,
+            prior_metrics=prior_metrics,
+            candidate_metrics=candidate_metrics,
+            fallback_metrics=fallback_metrics,
+            costs=costs,
+            radar=radar,
+            prior_type=prior_names[best_idx],
+            warm_start_used=warm_start_used,
+            noise_scale=noise_scale,
+            mppi_triggered=True,
+            trigger_reason=trigger_reason,
+            candidate_accepted=accepted and action_source == "hierarchical_mppi_v4",
+            reject_reason=reject_reason,
+            action_source=action_source,
+            fallback_active=fallback_active,
+            fallback_accept=fallback_accept,
         )
         return executed_action.astype(np.float32), debug
 
@@ -1171,6 +1424,205 @@ class MPPIDBaSOptimizer:
             "right_clearance": float(radar["right_min"]),
             "global_obstacle_distance": float(radar["global_min"]),
         }
+
+    def _v4_prior_action(self, params: Dict[str, Any], planner_state: Dict[str, Any]) -> np.ndarray:
+        current_d = float(params.get("current_lateral_offset", 0.0))
+        target_speed = float(params["target_speed"])
+        mode_name = str(params["mode_name"])
+        if mode_name == "recover_center":
+            yaw_bias = float(np.clip(-0.6 * current_d, -0.85, 0.85))
+        elif mode_name == "brake":
+            yaw_bias = float(np.clip(-0.25 * current_d, -0.45, 0.45))
+        else:
+            yaw_bias = float(params["turn_bias"])
+        return self._clip_action([target_speed, yaw_bias])
+
+    def _intent_v4_should_trigger(
+        self,
+        mode_name: str,
+        params: Dict[str, Any],
+        prior_metrics: Dict[str, float],
+        radar: Dict[str, float],
+    ) -> Tuple[bool, str]:
+        if mode_name in ("avoid_left", "avoid_right", "recover_center", "brake"):
+            return True, f"mode_{mode_name}"
+        if mode_name == "cautious_cruise" and (
+            radar["front_min"] < self.config.hierarchical_front_trigger_distance * 1.25
+            or prior_metrics.get("ttc_cost", 0.0) > 0.0
+        ):
+            return True, "mode_cautious_cruise"
+        return self._intent_v2_should_trigger(prior_metrics, radar)
+
+    def _intent_conditioned_cost_v4(
+        self,
+        metrics: Dict[str, float],
+        action_sequence: np.ndarray,
+        prior_action: np.ndarray,
+        params: Dict[str, Any],
+    ) -> float:
+        base_cost = self._intent_conditioned_cost_v2(
+            metrics=metrics,
+            action_sequence=action_sequence,
+            prior_action=prior_action,
+            params=params,
+        )
+        mode_name = str(params["mode_name"])
+        direction_cost = 0.0
+        current_offset = float(params.get("current_lateral_offset", 0.0))
+        if mode_name == "avoid_left":
+            direction_cost += 8.0 * max(0.0, -float(metrics.get("progress", 0.0)))
+            direction_cost += 4.0 * max(0.0, -float(prior_action[1]))
+        elif mode_name == "avoid_right":
+            direction_cost += 8.0 * max(0.0, -float(metrics.get("progress", 0.0)))
+            direction_cost += 4.0 * max(0.0, float(prior_action[1]))
+        elif mode_name == "recover_center":
+            direction_cost += 10.0 * float(metrics.get("max_lateral_error", 0.0)) ** 2
+            direction_cost += 6.0 * float(metrics.get("final_lateral_offset", current_offset)) ** 2
+        elif mode_name == "brake":
+            direction_cost += 8.0 * max(0.0, float(action_sequence[0, 0]) - 0.25) ** 2
+        elif mode_name == "cruise":
+            direction_cost += 5.0 * float(np.mean(action_sequence[:, 1] ** 2))
+        return float(base_cost + direction_cost)
+
+    def _accept_intent_v4_candidate(
+        self,
+        mode_name: str,
+        params: Dict[str, Any],
+        prior_metrics: Dict[str, float],
+        candidate_metrics: Dict[str, float],
+        candidate_action: np.ndarray,
+        prior_action: np.ndarray,
+        prior_score: float,
+        candidate_score: float,
+    ) -> Tuple[bool, str]:
+        accepted, reason = self._accept_intent_v2_candidate(
+            prior_metrics=prior_metrics,
+            candidate_metrics=candidate_metrics,
+            candidate_action=candidate_action,
+            prior_action=prior_action,
+            prior_score=prior_score,
+            candidate_score=candidate_score,
+        )
+        if not accepted:
+            return accepted, reason
+
+        if mode_name == "cruise":
+            if abs(float(candidate_action[1] - prior_action[1])) > self.config.hierarchical_v4_cruise_max_yaw_delta:
+                return False, "reject_cruise_yaw_override"
+        elif mode_name == "avoid_left":
+            if float(candidate_action[1]) < -0.05:
+                return False, "reject_wrong_direction"
+        elif mode_name == "avoid_right":
+            if float(candidate_action[1]) > 0.05:
+                return False, "reject_wrong_direction"
+        elif mode_name == "recover_center":
+            current_offset = abs(float(params.get("current_lateral_offset", 0.0)))
+            final_offset = abs(float(candidate_metrics.get("final_lateral_offset", current_offset)))
+            if final_offset > current_offset - self.config.hierarchical_lateral_recovery_gain:
+                return False, "reject_no_center_recovery"
+        elif mode_name == "brake":
+            if float(candidate_action[0]) > float(prior_action[0]) + 0.05:
+                return False, "reject_brake_speedup"
+        return True, "none"
+
+    def _intent_v4_prefer_mppi_over_fallback(
+        self,
+        candidate_metrics: Dict[str, float],
+        fallback_metrics: Dict[str, float],
+    ) -> bool:
+        if candidate_metrics["out_of_bounds_risk"] > fallback_metrics["out_of_bounds_risk"] + 1e-6:
+            return False
+        if candidate_metrics["collision_risk"] > fallback_metrics["collision_risk"] + 1e-6:
+            return False
+        risk_margin = float(fallback_metrics["risk_score"]) - float(candidate_metrics["risk_score"])
+        if risk_margin > self.config.hierarchical_v4_fallback_risk_margin:
+            return True
+        return float(candidate_metrics["progress"]) > float(fallback_metrics["progress"]) + 0.03
+
+    def _make_intent_v4_debug(
+        self,
+        intent: np.ndarray,
+        params: Dict[str, Any],
+        executed_action: np.ndarray,
+        prior_action: np.ndarray,
+        candidate_action: np.ndarray,
+        prior_metrics: Dict[str, float],
+        candidate_metrics: Dict[str, float],
+        fallback_metrics: Dict[str, float],
+        costs: np.ndarray,
+        radar: Dict[str, float],
+        prior_type: str,
+        warm_start_used: bool,
+        noise_scale: float,
+        mppi_triggered: bool,
+        trigger_reason: str,
+        candidate_accepted: bool,
+        reject_reason: str,
+        action_source: str,
+        fallback_active: bool,
+        fallback_accept: bool,
+    ) -> Dict[str, float]:
+        decoded = decode_mode_intent_v4(intent)
+        action_delta = np.asarray(executed_action, dtype=float) - np.asarray(prior_action, dtype=float)
+        debug = self._make_intent_v2_debug(
+            intent=np.asarray([params["target_speed"], params["turn_bias"], params["path_weight"], params["safety_weight"]], dtype=float),
+            params={
+                "target_speed": float(params["target_speed"]),
+                "turn_bias": float(params["turn_bias"]),
+                "path_weight": float(params["path_weight"]),
+                "safety_weight": float(params["safety_weight"]),
+            },
+            executed_action=executed_action,
+            prior_action=prior_action,
+            candidate_action=candidate_action,
+            prior_metrics=prior_metrics,
+            candidate_metrics=candidate_metrics,
+            costs=costs,
+            radar=radar,
+            prior_type=prior_type,
+            warm_start_used=warm_start_used,
+            noise_scale=noise_scale,
+            mppi_triggered=mppi_triggered,
+            trigger_reason=trigger_reason,
+            candidate_accepted=candidate_accepted,
+            reject_reason=reject_reason,
+            action_source=action_source,
+        )
+        debug.update(
+            {
+                "action_source": action_source,
+                "terminal_source": action_source,
+                "hierarchical_mppi_v4_enabled": True,
+                "high_level_mode": str(params["mode_name"]),
+                "high_level_mode_index": int(params["mode_index"]),
+                "high_level_mode_margin": float(params["mode_margin"]),
+                "raw_mode": str(decoded["mode_name"]),
+                "raw_mode_index": int(decoded["mode_index"]),
+                "high_level_speed_scale": float(params["speed_scale"]),
+                "high_level_avoid_strength": float(params["avoid_strength"]),
+                "high_level_raw_speed_scale": float(params["raw_speed_scale"]),
+                "high_level_raw_avoid_strength": float(params["raw_avoid_strength"]),
+                "mode_score_cruise": float(params["mode_scores"][0]),
+                "mode_score_cautious_cruise": float(params["mode_scores"][1]),
+                "mode_score_avoid_left": float(params["mode_scores"][2]),
+                "mode_score_avoid_right": float(params["mode_scores"][3]),
+                "mode_score_recover_center": float(params["mode_scores"][4]),
+                "mode_score_brake": float(params["mode_scores"][5]),
+                "mode_target_speed": float(params["target_speed"]),
+                "mode_turn_bias": float(params["turn_bias"]),
+                "mode_safe_distance": float(params["safe_distance"]),
+                "mode_desired_lateral_offset": float(params["desired_lateral_offset"]),
+                "mode_current_lateral_offset": float(params["current_lateral_offset"]),
+                "fallback_active": bool(fallback_active),
+                "fallback_accept": bool(fallback_accept),
+                "fallback_risk": float(fallback_metrics["risk_score"]),
+                "fallback_progress": float(fallback_metrics["progress"]),
+                "fallback_max_lateral_error": float(fallback_metrics["max_lateral_error"]),
+                "action_delta_norm": float(np.linalg.norm(action_delta)),
+                "mppi_decision_reason": trigger_reason if mppi_triggered else "select_mode_prior",
+            }
+        )
+        return debug
 
     def _intent_conditioned_cost(
         self,

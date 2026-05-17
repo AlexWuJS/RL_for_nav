@@ -16,10 +16,13 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
 from hierarchical_mppi_wrapper import (
     HierarchicalMppiV2Wrapper,
     HierarchicalMppiV3Wrapper,
+    HierarchicalMppiV4Wrapper,
     HierarchicalMppiWrapper,
+    V4_MODE_NAMES,
     hierarchical_mppi_config,
     hierarchical_mppi_v2_config,
     hierarchical_mppi_v3_config,
+    hierarchical_mppi_v4_config,
 )
 from mppi_dbas import MPPIDBaSConfig
 from mppi_dbas_wrapper import MppiDbaSActionWrapper
@@ -184,6 +187,18 @@ def make_env(mode: str, seed: int, log_dir: str, obs_mode: str):
             )
         elif mode == "hierarchical_mppi_v3":
             env = HierarchicalMppiV3Wrapper(env, config=hierarchical_mppi_v3_config(seed=seed))
+        elif mode == "hierarchical_mppi_v4_compat":
+            env = HierarchicalMppiV4Wrapper(
+                env,
+                config=hierarchical_mppi_v4_config(seed=seed, reward_profile="compat"),
+                reward_profile="compat",
+            )
+        elif mode == "hierarchical_mppi_v4_enhanced":
+            env = HierarchicalMppiV4Wrapper(
+                env,
+                config=hierarchical_mppi_v4_config(seed=seed, reward_profile="enhanced"),
+                reward_profile="enhanced",
+            )
         elif mode != "baseline":
             env = MppiDbaSActionWrapper(env, config_for_mode(mode, seed))
         if obs_mode == "dict":
@@ -331,6 +346,7 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
                 "source_intent_prior": float(info.get("action_source", "sac") == "intent_prior"),
                 "source_hierarchical_mppi": float(info.get("action_source", "sac") == "hierarchical_mppi"),
                 "source_hierarchical_mppi_v3": float(info.get("action_source", "sac") == "hierarchical_mppi_v3"),
+                "source_hierarchical_mppi_v4": float(info.get("action_source", "sac") == "hierarchical_mppi_v4"),
                 "mppi_triggered": float(bool(info.get("mppi_triggered", info.get("mppi_active", False)))),
                 "candidate_accepted": float(bool(info.get("candidate_accepted", info.get("mppi_accept", False)))),
                 "sac_intent_target_speed": float(info.get("sac_intent_target_speed", 0.0)),
@@ -357,6 +373,7 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
                 "candidate_progress": float(info.get("candidate_progress", 0.0)),
                 "prior_lateral_error": float(info.get("base_max_lateral_error", 0.0)),
                 "candidate_lateral_error": float(info.get("candidate_max_lateral_error", 0.0)),
+                "mode_switch_flag": float(bool(info.get("mode_switched", False))),
             })
 
         trace_rows.append({
@@ -467,6 +484,17 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
             "prior_risk_score": float(info.get("prior_risk_score", info.get("base_risk", 0.0))),
             "candidate_risk_score": float(info.get("candidate_risk_score", info.get("candidate_risk", 0.0))),
             "mppi_best_cost": float(info.get("mppi_best_cost", info.get("mppi_cost", 0.0))),
+            "high_level_mode": info.get("high_level_mode", "none"),
+            "high_level_mode_index": int(info.get("high_level_mode_index", -1)),
+            "raw_mode": info.get("raw_mode", "none"),
+            "mode_switched": int(bool(info.get("mode_switched", False))),
+            "high_level_speed_scale": float(info.get("high_level_speed_scale", 0.0)),
+            "high_level_avoid_strength": float(info.get("high_level_avoid_strength", 0.0)),
+            "reward_mode_switch_penalty": float(info.get("reward_mode_switch_penalty", 0.0)),
+            "reward_direction_flip_penalty": float(info.get("reward_direction_flip_penalty", 0.0)),
+            "reward_recover_center_bonus": float(info.get("reward_recover_center_bonus", 0.0)),
+            "reward_hazard_mode_bonus": float(info.get("reward_hazard_mode_bonus", 0.0)),
+            "reward_conservative_overuse_penalty": float(info.get("reward_conservative_overuse_penalty", 0.0)),
             "terminal_reason": info.get("terminal_reason", "running"),
         })
         step_idx += 1
@@ -488,6 +516,12 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
                 and bool(last_info.get("is_timeout", final_step_count >= getattr(env, "max_steps", 0)))
             )
             write_csv(os.path.join(trace_dir, f"{mode}_episode_{episode_idx:03d}.csv"), trace_rows)
+            mode_counts = Counter(str(row.get("high_level_mode", "none")) for row in trace_rows if row.get("high_level_mode", "none") != "none")
+            mode_switches = int(sum(int(row.get("mode_switched", 0)) for row in trace_rows))
+            mode_metrics = {
+                f"mean_mode_{name}": float(mode_counts.get(name, 0) / max(len(trace_rows), 1))
+                for name in V4_MODE_NAMES
+            }
             return {
                 "reward": episode_reward,
                 "success": int(terminated_by_success),
@@ -533,6 +567,7 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
                 "mean_source_intent_prior": mean_debug(mppi_debug, "source_intent_prior"),
                 "mean_source_hierarchical_mppi": mean_debug(mppi_debug, "source_hierarchical_mppi"),
                 "mean_source_hierarchical_mppi_v3": mean_debug(mppi_debug, "source_hierarchical_mppi_v3"),
+                "mean_source_hierarchical_mppi_v4": mean_debug(mppi_debug, "source_hierarchical_mppi_v4"),
                 "mean_mppi_triggered": mean_debug(mppi_debug, "mppi_triggered"),
                 "mean_candidate_accepted": mean_debug(mppi_debug, "candidate_accepted"),
                 "mean_sac_intent_target_speed": mean_debug(mppi_debug, "sac_intent_target_speed"),
@@ -570,11 +605,15 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
                 "mean_left_clearance": mean_trace(trace_rows, "left_clearance"),
                 "mean_right_clearance": mean_trace(trace_rows, "right_clearance"),
                 "terminal_source": terminal_source_from_trace(trace_rows),
+                "mean_mode_switches": float(mode_switches / max(final_step_count, 1)),
+                "total_mode_switches": float(mode_switches),
+                "final_high_level_mode": str(trace_rows[-1].get("high_level_mode", "none")) if trace_rows else "none",
                 "mean_dbas_cost": mean_debug(mppi_debug, "dbas_cost"),
                 "mean_ttc_cost": mean_debug(mppi_debug, "ttc_cost"),
                 "mean_out_of_bounds_cost": mean_debug(mppi_debug, "out_of_bounds_cost"),
                 "mean_min_predicted_obstacle_distance": mean_debug(mppi_debug, "min_predicted_obstacle_distance"),
                 "mean_exploration_noise_scale": mean_debug(mppi_debug, "exploration_noise_scale"),
+                **mode_metrics,
             }
 
 
@@ -712,6 +751,8 @@ def parse_args():
     parser.add_argument("--hierarchical-model", default=None, help="Path to the hierarchical SAC-MPPI model.")
     parser.add_argument("--hierarchical-v2-model", default=None, help="Path to the trigger-based hierarchical SAC-MPPI v2 model.")
     parser.add_argument("--hierarchical-v3-model", default=None, help="Path to the Frenet-target hierarchical SAC-MPPI v3 model.")
+    parser.add_argument("--hierarchical-v4-compat-model", default=None, help="Path to the semi-discrete hierarchical SAC-MPPI v4 compat model.")
+    parser.add_argument("--hierarchical-v4-enhanced-model", default=None, help="Path to the semi-discrete hierarchical SAC-MPPI v4 enhanced model.")
     parser.add_argument("--episodes", "--episode", type=int, default=30)
     parser.add_argument(
         "--mode",
@@ -734,10 +775,13 @@ def parse_args():
             "hierarchical_mppi_v2_shield",
             "hierarchical_mppi_v2_consistency",
             "hierarchical_mppi_v3",
+            "hierarchical_mppi_v4_compat",
+            "hierarchical_mppi_v4_enhanced",
             "hierarchical_ablation",
             "hierarchical_ablation_v2",
             "hierarchical_ablation_v2_consistency",
             "hierarchical_ablation_v3",
+            "hierarchical_ablation_v4",
             "both",
             "ablation",
         ],
@@ -763,6 +807,10 @@ def parse_args():
 def model_path_for_mode(args, mode: str) -> str:
     if mode == "hierarchical_mppi_v3":
         model_path = args.hierarchical_v3_model or args.hierarchical_model or args.model
+    elif mode == "hierarchical_mppi_v4_compat":
+        model_path = args.hierarchical_v4_compat_model or args.hierarchical_model or args.model
+    elif mode == "hierarchical_mppi_v4_enhanced":
+        model_path = args.hierarchical_v4_enhanced_model or args.hierarchical_model or args.model
     elif mode in ("hierarchical_mppi_v2", "hierarchical_mppi_v2_shield", "hierarchical_mppi_v2_consistency"):
         model_path = args.hierarchical_v2_model or args.hierarchical_model or args.model
     elif mode in ("hierarchical_mppi", "hierarchical_mppi_shield"):
@@ -794,6 +842,8 @@ def main():
         modes = ["baseline", "shield_only", "hierarchical_mppi_v2_consistency"]
     elif args.mode == "hierarchical_ablation_v3":
         modes = ["baseline", "shield_only", "hierarchical_mppi_v2", "hierarchical_mppi_v3"]
+    elif args.mode == "hierarchical_ablation_v4":
+        modes = ["baseline", "shield_only", "hierarchical_mppi_v4_compat", "hierarchical_mppi_v4_enhanced"]
     else:
         modes = [args.mode]
 

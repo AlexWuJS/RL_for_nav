@@ -54,8 +54,11 @@ except ModuleNotFoundError:
 from hierarchical_mppi_wrapper import (  # noqa: E402
     HierarchicalMppiV2Wrapper,
     HierarchicalMppiV3Wrapper,
+    HierarchicalMppiV4Wrapper,
     HierarchicalMppiWrapper,
+    decode_mode_intent_v4,
     intent_to_frenet_params_v3,
+    intent_to_mode_params_v4,
     intent_to_params,
     intent_to_params_v2,
 )
@@ -193,6 +196,33 @@ class FakeV3Optimizer:
         }
 
 
+class FakeV4Optimizer:
+    def __init__(self):
+        self.config = MPPIDBaSConfig()
+
+    def reset(self):
+        self.reset_called = True
+
+    def optimize_from_mode_intent_v4(self, intent, planner_state):
+        return np.array([0.45, 0.2], dtype=np.float32), {
+            "action_source": "hierarchical_mppi_v4",
+            "mppi_active": True,
+            "mppi_triggered": True,
+            "mppi_trigger_reason": "mode_avoid_left",
+            "mppi_accept": True,
+            "candidate_accepted": True,
+            "high_level_mode": "avoid_left",
+            "high_level_mode_index": 2,
+            "mode_target_speed": 0.45,
+            "mode_turn_bias": 0.2,
+            "intent_prior_surge": 0.4,
+            "intent_prior_yaw": 0.15,
+            "mppi_executed_surge": 0.45,
+            "mppi_executed_yaw": 0.2,
+            "current_obstacle_distance": 0.8,
+        }
+
+
 class HierarchicalSacMppiTests(unittest.TestCase):
     def test_wrapper_exposes_four_dimensional_intent_action_space_and_executes_mppi_action(self):
         env = FakeEnv()
@@ -285,6 +315,41 @@ class HierarchicalSacMppiTests(unittest.TestCase):
         self.assertIn("target_lateral_offset", info)
         self.assertIn("intent_feasible", info)
         self.assertIn("mppi_predicted_oob_risk", info)
+
+    def test_v4_decode_chooses_mode_and_scales_params(self):
+        decoded = decode_mode_intent_v4(np.array([-1.0, -0.5, 0.8, 0.4, 0.2, -0.2, 1.0, -1.0], dtype=np.float32))
+
+        self.assertEqual(decoded["mode_name"], "avoid_left")
+        self.assertEqual(decoded["mode_index"], 2)
+        self.assertAlmostEqual(decoded["speed_scale"], 1.0)
+        self.assertAlmostEqual(decoded["avoid_strength"], 0.0)
+
+    def test_v4_mapping_uses_mode_semantics(self):
+        params = intent_to_mode_params_v4(np.array([-1.0, -1.0, 1.0, -1.0, -1.0, -1.0, 0.0, 1.0], dtype=np.float32), planner_state(), MPPIDBaSConfig())
+
+        self.assertEqual(params["mode_name"], "avoid_left")
+        self.assertGreater(params["turn_bias"], 0.0)
+        self.assertGreater(params["safety_weight"], 2.0)
+        self.assertGreater(params["safe_distance"], MPPIDBaSConfig().safe_distance)
+
+    def test_v4_wrapper_exposes_mode_debug_and_enhanced_reward(self):
+        env = FakeEnv()
+        wrapper = HierarchicalMppiV4Wrapper(
+            env,
+            optimizer=FakeV4Optimizer(),
+            reward_profile="enhanced",
+            mode_hold_steps=1,
+        )
+
+        self.assertEqual(wrapper.action_space.shape, (8,))
+        _, reward, _, _, info = wrapper.step(np.array([-1.0, -1.0, 1.0, -1.0, -1.0, -1.0, 0.0, 1.0], dtype=np.float32))
+
+        np.testing.assert_allclose(env.last_action, np.array([0.45, 0.2], dtype=np.float32))
+        self.assertTrue(info["hierarchical_mppi_v4_enabled"])
+        self.assertEqual(info["high_level_mode"], "avoid_left")
+        self.assertEqual(info["action_source"], "hierarchical_mppi_v4")
+        self.assertIn("reward_hazard_mode_bonus", info)
+        self.assertGreaterEqual(reward, 1.0)
 
     def test_v2_wrapper_smooths_and_holds_intent_prior_action(self):
         env = FakeEnv()

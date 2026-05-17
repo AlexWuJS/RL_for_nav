@@ -29,6 +29,8 @@ MODE_COLORS = {
     "hierarchical_mppi_v2_shield": "#457b9d",
     "hierarchical_mppi_v2_consistency": "#9c6644",
     "hierarchical_mppi_v3": "#d1495b",
+    "hierarchical_mppi_v4_compat": "#3a86ff",
+    "hierarchical_mppi_v4_enhanced": "#ff006e",
 }
 
 FALLBACK_COLORS = [
@@ -270,7 +272,7 @@ def plot_action_source(result_dir: str, output_dir: str, max_steps: int) -> None
     for ax, mode in zip(axes.flatten(), modes):
         files = files_by_mode[mode]
         series = {}
-        sources = ("sac", "mppi", "fallback", "intent_prior", "hierarchical_mppi")
+        sources = ("sac", "mppi", "fallback", "intent_prior", "hierarchical_mppi", "hierarchical_mppi_v3", "hierarchical_mppi_v4")
         for source in sources:
             sums = np.zeros(max_steps, dtype=float)
             counts = np.zeros(max_steps, dtype=float)
@@ -290,8 +292,10 @@ def plot_action_source(result_dir: str, output_dir: str, max_steps: int) -> None
             series["fallback"],
             series["intent_prior"],
             series["hierarchical_mppi"],
-            labels=["sac", "mppi", "fallback", "intent_prior", "hierarchical"],
-            colors=["#9ecae1", "#fb6a4a", "#74c476", "#8dd3c7", "#9e77b8"],
+            series["hierarchical_mppi_v3"],
+            series["hierarchical_mppi_v4"],
+            labels=["sac", "mppi", "fallback", "intent_prior", "hierarchical", "hierarchical_v3", "hierarchical_v4"],
+            colors=["#9ecae1", "#fb6a4a", "#74c476", "#8dd3c7", "#9e77b8", "#d1495b", "#3a86ff"],
         )
         ax.set_ylim(0, 1.0)
         ax.set_title(f"Action Source Fraction: {mode}")
@@ -300,6 +304,51 @@ def plot_action_source(result_dir: str, output_dir: str, max_steps: int) -> None
         ax.legend(loc="upper right")
     fig.tight_layout()
     fig.savefig(os.path.join(output_dir, "action_source_stack.png"), dpi=160)
+    plt.close(fig)
+
+
+def plot_v4_mode_usage(summary: Dict, modes: Iterable[str], output_dir: str) -> None:
+    modes = [mode for mode in modes if mode in summary]
+    if not modes:
+        return
+    mode_names = [
+        "cruise",
+        "cautious_cruise",
+        "avoid_left",
+        "avoid_right",
+        "recover_center",
+        "brake",
+    ]
+    relevant_modes = [mode for mode in modes if any(f"mean_mode_{name}" in summary.get(mode, {}) for name in mode_names)]
+    if not relevant_modes:
+        return
+
+    fig, axes = plt.subplots(2, 1, figsize=(14, 10))
+    x = np.arange(len(relevant_modes))
+    bottom = np.zeros(len(relevant_modes))
+    palette = ["#4c78a8", "#72b7b2", "#54a24b", "#e45756", "#9d755d", "#f58518"]
+    for color, mode_name in zip(palette, mode_names):
+        values = [float(summary.get(mode, {}).get(f"mean_mode_{mode_name}", 0.0)) for mode in relevant_modes]
+        axes[0].bar(x, values, bottom=bottom, label=mode_name, color=color)
+        bottom += np.asarray(values)
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels(relevant_modes, rotation=25, ha="right")
+    axes[0].set_ylim(0.0, 1.05)
+    axes[0].set_title("V4 Mode Occupancy")
+    axes[0].grid(axis="y", alpha=0.3)
+    axes[0].legend(loc="upper right")
+
+    switch_values = [float(summary.get(mode, {}).get("mean_mode_switches", 0.0)) for mode in relevant_modes]
+    axes[1].bar(x, switch_values, color=[color_for(mode) for mode in relevant_modes])
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels(relevant_modes, rotation=25, ha="right")
+    axes[1].set_title("Mode Switch Frequency")
+    axes[1].grid(axis="y", alpha=0.3)
+    for idx, value in enumerate(switch_values):
+        axes[1].text(idx, value, f"{value:.2f}", ha="center", va="bottom", fontsize=8)
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, "v4_mode_usage.png"), dpi=160)
     plt.close(fig)
 
 
@@ -326,6 +375,7 @@ def main() -> None:
     plot_trace_curves(result_dir, output_dir, args.max_steps)
     plot_reward_alignment(result_dir, output_dir, args.max_steps)
     plot_action_source(result_dir, output_dir, args.max_steps)
+    plot_v4_mode_usage(summary, modes, output_dir)
     print(f"Saved comparison plots to: {output_dir}")
 
 
