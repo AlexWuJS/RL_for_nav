@@ -54,6 +54,7 @@ except ModuleNotFoundError:
 from hierarchical_mppi_wrapper import (  # noqa: E402
     HierarchicalMppiV2Wrapper,
     HierarchicalMppiV3Wrapper,
+    HierarchicalMppiV41Wrapper,
     HierarchicalMppiV4Wrapper,
     HierarchicalMppiWrapper,
     decode_mode_intent_v4,
@@ -61,6 +62,7 @@ from hierarchical_mppi_wrapper import (  # noqa: E402
     intent_to_mode_params_v4,
     intent_to_params,
     intent_to_params_v2,
+    intent_to_structured_params_v41,
 )
 from mppi_dbas import MPPIDBaSConfig, MPPIDBaSOptimizer  # noqa: E402
 
@@ -223,6 +225,41 @@ class FakeV4Optimizer:
         }
 
 
+class FakeV41Optimizer:
+    def __init__(self, source="intent_prior", risk_score=0.0, triggered=False):
+        self.config = MPPIDBaSConfig()
+        self.source = source
+        self.risk_score = risk_score
+        self.triggered = triggered
+
+    def reset(self):
+        self.reset_called = True
+
+    def optimize_from_structured_intent_v41(self, intent, planner_state):
+        return np.array([0.55, 0.05], dtype=np.float32), {
+            "action_source": self.source,
+            "mppi_active": self.triggered,
+            "mppi_triggered": self.triggered,
+            "mppi_trigger_reason": "trigger_mppi_gate" if self.triggered else "base_safe",
+            "mppi_accept": self.source == "hierarchical_mppi_v41",
+            "candidate_accepted": self.source == "hierarchical_mppi_v41",
+            "intent_prior_surge": 0.52,
+            "intent_prior_yaw": 0.04,
+            "mppi_executed_surge": 0.55,
+            "mppi_executed_yaw": 0.05,
+            "current_obstacle_distance": 1.2,
+            "structured_target_progress_speed": 0.65,
+            "structured_target_lateral_offset": 0.1,
+            "structured_safety_margin": 0.2,
+            "structured_mppi_gate": 0.8,
+            "structured_dynamic_offset_limit": 1.0,
+            "structured_target_feasible": True,
+            "structured_prior_risk_score": self.risk_score,
+            "structured_candidate_risk_score": max(0.0, self.risk_score - 0.2),
+            "reject_reason": "none",
+        }
+
+
 class HierarchicalSacMppiTests(unittest.TestCase):
     def test_wrapper_exposes_four_dimensional_intent_action_space_and_executes_mppi_action(self):
         env = FakeEnv()
@@ -351,6 +388,67 @@ class HierarchicalSacMppiTests(unittest.TestCase):
         self.assertIn("reward_hazard_mode_bonus", info)
         self.assertGreaterEqual(reward, 1.0)
 
+    def test_v41_mapping_uses_continuous_structured_targets(self):
+        params = intent_to_structured_params_v41(
+            np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32),
+            planner_state(y=2.85),
+            MPPIDBaSConfig(),
+        )
+
+        self.assertGreater(params["target_progress_speed"], 1.0)
+        self.assertLess(params["dynamic_offset_limit"], 1.0)
+        self.assertLessEqual(abs(params["target_lateral_offset"]), params["dynamic_offset_limit"])
+        self.assertGreater(params["safe_distance"], MPPIDBaSConfig().safe_distance)
+        self.assertAlmostEqual(params["mppi_gate"], 1.0)
+
+    def test_v41_wrapper_compat_reward_matches_env_reward(self):
+        wrapper = HierarchicalMppiV41Wrapper(
+            FakeEnv(),
+            optimizer=FakeV41Optimizer(source="intent_prior", risk_score=5.0, triggered=True),
+            reward_profile="compat",
+        )
+
+        _, reward, _, _, info = wrapper.step(np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32))
+
+        self.assertEqual(wrapper.action_space.shape, (4,))
+        self.assertAlmostEqual(reward, 1.0)
+        self.assertAlmostEqual(info["training_reward"], 1.0)
+        self.assertTrue(info["hierarchical_mppi_v41_enabled"])
+
+    def test_v41_wrapper_guided_reward_penalizes_risk_and_intervention(self):
+        wrapper = HierarchicalMppiV41Wrapper(
+            FakeEnv(),
+            optimizer=FakeV41Optimizer(source="hierarchical_mppi_v41", risk_score=5.0, triggered=True),
+            reward_profile="guided",
+            risk_penalty_weight=0.1,
+            intervention_penalty_weight=0.1,
+            infeasible_penalty_weight=0.0,
+            jitter_penalty_weight=0.0,
+        )
+
+        _, reward, _, _, info = wrapper.step(np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32))
+
+        self.assertLess(reward, 1.0)
+        self.assertGreater(info["structured_risk_exposure_penalty"], 0.0)
+        self.assertGreater(info["structured_intervention_penalty"], 0.0)
+
+    def test_v41_wrapper_guided_reward_penalizes_target_jitter(self):
+        wrapper = HierarchicalMppiV41Wrapper(
+            FakeEnv(),
+            optimizer=FakeV41Optimizer(source="intent_prior", risk_score=0.0, triggered=False),
+            reward_profile="guided",
+            risk_penalty_weight=0.0,
+            intervention_penalty_weight=0.0,
+            infeasible_penalty_weight=0.0,
+            jitter_penalty_weight=1.0,
+        )
+
+        wrapper.step(np.array([-1.0, -1.0, 0.0, -1.0], dtype=np.float32))
+        _, reward, _, _, info = wrapper.step(np.array([1.0, 1.0, 0.0, -1.0], dtype=np.float32))
+
+        self.assertLess(reward, 1.0)
+        self.assertGreater(info["structured_target_jitter_penalty"], 0.0)
+
     def test_v2_wrapper_smooths_and_holds_intent_prior_action(self):
         env = FakeEnv()
         wrapper = HierarchicalMppiV2Wrapper(
@@ -475,6 +573,97 @@ class HierarchicalSacMppiTests(unittest.TestCase):
         self.assertIn(debug["action_source"], ("hierarchical_mppi_v3", "fallback"))
         self.assertIn("target_lateral_offset", debug)
         self.assertIn("mppi_predicted_progress", debug)
+
+    def test_v41_optimizer_keeps_safe_prior_without_mppi(self):
+        optimizer = MPPIDBaSOptimizer(MPPIDBaSConfig(seed=0, num_samples=8, horizon=4))
+
+        action, debug = optimizer.optimize_from_structured_intent_v41(
+            np.array([0.0, 0.0, 0.0, -1.0], dtype=np.float32),
+            planner_state(),
+        )
+
+        self.assertEqual(action.shape, (2,))
+        self.assertEqual(debug["action_source"], "intent_prior")
+        self.assertFalse(debug["mppi_triggered"])
+        self.assertTrue(debug["hierarchical_mppi_v41_enabled"])
+        self.assertIn("structured_target_progress_speed", debug)
+        self.assertIn("structured_mppi_gate", debug)
+
+    def test_v41_gate_alone_does_not_trigger_without_local_risk(self):
+        optimizer = MPPIDBaSOptimizer(MPPIDBaSConfig(seed=0, num_samples=8, horizon=4))
+
+        _, debug = optimizer.optimize_from_structured_intent_v41(
+            np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32),
+            planner_state(),
+        )
+
+        self.assertEqual(debug["action_source"], "intent_prior")
+        self.assertFalse(debug["mppi_triggered"])
+        self.assertEqual(debug["mppi_trigger_reason"], "base_safe")
+
+    def test_v41_optimizer_triggers_on_obstacle_risk(self):
+        optimizer = MPPIDBaSOptimizer(MPPIDBaSConfig(seed=0, num_samples=8, horizon=4))
+
+        _, debug = optimizer.optimize_from_structured_intent_v41(
+            np.array([0.0, 0.0, 0.0, -1.0], dtype=np.float32),
+            planner_state(scan_ranges=[0.5, 0.5, 0.5, 0.5, 0.5]),
+        )
+
+        self.assertTrue(debug["mppi_triggered"])
+        self.assertIn(debug["action_source"], ("intent_prior", "hierarchical_mppi_v41", "fallback"))
+
+    def test_v41_accept_rejects_candidate_with_higher_oob_risk(self):
+        optimizer = MPPIDBaSOptimizer(MPPIDBaSConfig(seed=0))
+        params = intent_to_structured_params_v41(np.zeros(4, dtype=np.float32), planner_state(), optimizer.config)
+        prior_metrics = {
+            "risk_score": 0.0,
+            "collision_risk": 0.0,
+            "out_of_bounds_risk": 0.0,
+            "progress": 0.4,
+            "max_lateral_error": 0.1,
+            "ttc_cost": 0.0,
+            "final_lateral_offset": 0.0,
+        }
+        candidate_metrics = {
+            **prior_metrics,
+            "risk_score": 4.0,
+            "out_of_bounds_risk": 1.0,
+            "max_lateral_error": 4.0,
+        }
+
+        accepted, reason = optimizer._accept_structured_candidate_v41(
+            params=params,
+            prior_metrics=prior_metrics,
+            candidate_metrics=candidate_metrics,
+            candidate_action=np.array([0.5, 0.0], dtype=float),
+            prior_action=np.array([0.5, 0.0], dtype=float),
+            prior_score=10.0,
+            candidate_score=1.0,
+        )
+
+        self.assertFalse(accepted)
+        self.assertEqual(reason, "reject_out_of_bounds")
+
+    def test_v41_prefers_fallback_when_candidate_is_not_clearly_safer(self):
+        optimizer = MPPIDBaSOptimizer(MPPIDBaSConfig(seed=0))
+        candidate_metrics = {
+            "risk_score": 1.0,
+            "out_of_bounds_risk": 0.0,
+            "collision_risk": 0.0,
+        }
+        fallback_metrics = {
+            "risk_score": 0.95,
+            "out_of_bounds_risk": 0.0,
+            "collision_risk": 0.0,
+        }
+
+        prefer_mppi = optimizer._structured_prefer_mppi_over_fallback_v41(
+            candidate_metrics,
+            fallback_metrics,
+            accepted=True,
+        )
+
+        self.assertFalse(prefer_mppi)
 
     def test_v3_fallback_activates_when_best_mppi_is_still_high_risk(self):
         optimizer = MPPIDBaSOptimizer(

@@ -21,6 +21,8 @@ class PlotComparisonCurvesTest(unittest.TestCase):
             "shield_first",
             "shield_mppi_teacher",
             "shield_mppi_execute",
+            "hierarchical_mppi_v41_compat",
+            "hierarchical_mppi_v41_guided",
             "hierarchical_mppi_v4_compat",
             "hierarchical_mppi_v4_enhanced",
         ]

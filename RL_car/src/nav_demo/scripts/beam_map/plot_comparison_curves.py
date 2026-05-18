@@ -29,6 +29,8 @@ MODE_COLORS = {
     "hierarchical_mppi_v2_shield": "#457b9d",
     "hierarchical_mppi_v2_consistency": "#9c6644",
     "hierarchical_mppi_v3": "#d1495b",
+    "hierarchical_mppi_v41_compat": "#0077b6",
+    "hierarchical_mppi_v41_guided": "#00a896",
     "hierarchical_mppi_v4_compat": "#3a86ff",
     "hierarchical_mppi_v4_enhanced": "#ff006e",
 }
@@ -272,7 +274,7 @@ def plot_action_source(result_dir: str, output_dir: str, max_steps: int) -> None
     for ax, mode in zip(axes.flatten(), modes):
         files = files_by_mode[mode]
         series = {}
-        sources = ("sac", "mppi", "fallback", "intent_prior", "hierarchical_mppi", "hierarchical_mppi_v3", "hierarchical_mppi_v4")
+        sources = ("sac", "mppi", "fallback", "intent_prior", "hierarchical_mppi", "hierarchical_mppi_v3", "hierarchical_mppi_v4", "hierarchical_mppi_v41")
         for source in sources:
             sums = np.zeros(max_steps, dtype=float)
             counts = np.zeros(max_steps, dtype=float)
@@ -294,8 +296,9 @@ def plot_action_source(result_dir: str, output_dir: str, max_steps: int) -> None
             series["hierarchical_mppi"],
             series["hierarchical_mppi_v3"],
             series["hierarchical_mppi_v4"],
-            labels=["sac", "mppi", "fallback", "intent_prior", "hierarchical", "hierarchical_v3", "hierarchical_v4"],
-            colors=["#9ecae1", "#fb6a4a", "#74c476", "#8dd3c7", "#9e77b8", "#d1495b", "#3a86ff"],
+            series["hierarchical_mppi_v41"],
+            labels=["sac", "mppi", "fallback", "intent_prior", "hierarchical", "hierarchical_v3", "hierarchical_v4", "hierarchical_v41"],
+            colors=["#9ecae1", "#fb6a4a", "#74c476", "#8dd3c7", "#9e77b8", "#d1495b", "#3a86ff", "#00a896"],
         )
         ax.set_ylim(0, 1.0)
         ax.set_title(f"Action Source Fraction: {mode}")
@@ -352,6 +355,34 @@ def plot_v4_mode_usage(summary: Dict, modes: Iterable[str], output_dir: str) -> 
     plt.close(fig)
 
 
+def plot_v41_structured_targets(result_dir: str, output_dir: str, max_steps: int) -> None:
+    files_by_mode = trace_files(result_dir)
+    modes = [mode for mode in files_by_mode if "v41" in mode]
+    if not modes:
+        return
+    metrics = [
+        ("structured_target_lateral_offset", "Target Lateral Offset"),
+        ("structured_mppi_gate", "MPPI Gate"),
+        ("structured_target_feasible", "Target Feasibility Rate"),
+        ("structured_prior_risk_score", "Prior Risk Score"),
+    ]
+    fig, axes = plt.subplots(2, 2, figsize=(15, 8))
+    axes = axes.flatten()
+    for ax, (key, title) in zip(axes, metrics):
+        for mode in modes:
+            xs, ys = mean_trace_series(files_by_mode[mode], key, max_steps)
+            if len(xs) == 0:
+                continue
+            ax.plot(xs, ys, label=mode, color=color_for(mode), linewidth=1.6)
+        ax.set_title(title)
+        ax.set_xlabel("Step")
+        ax.grid(alpha=0.3)
+    axes[0].legend()
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, "v41_structured_targets.png"), dpi=160)
+    plt.close(fig)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Plot comparison curves from compare_sac_mppi.py outputs.")
     parser.add_argument("--result-dir", default="./comparison_results")
@@ -376,6 +407,7 @@ def main() -> None:
     plot_reward_alignment(result_dir, output_dir, args.max_steps)
     plot_action_source(result_dir, output_dir, args.max_steps)
     plot_v4_mode_usage(summary, modes, output_dir)
+    plot_v41_structured_targets(result_dir, output_dir, args.max_steps)
     print(f"Saved comparison plots to: {output_dir}")
 
 

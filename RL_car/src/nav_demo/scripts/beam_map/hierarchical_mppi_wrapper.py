@@ -12,6 +12,7 @@ from mppi_dbas import (
     intent_to_mode_params_v4,
     intent_to_params,
     intent_to_params_v2,
+    intent_to_structured_params_v41,
 )
 
 
@@ -108,6 +109,35 @@ def hierarchical_mppi_v4_config(seed: Optional[int] = None, reward_profile: str 
         hierarchical_lateral_recovery_gain=0.06 if conservative else 0.05,
         hierarchical_v4_cruise_max_yaw_delta=0.16 if conservative else 0.18,
         hierarchical_v4_fallback_risk_margin=0.10 if conservative else 0.08,
+    )
+
+
+def hierarchical_mppi_v41_config(seed: Optional[int] = None, reward_profile: str = "guided") -> MPPIDBaSConfig:
+    reward_profile = str(reward_profile).lower()
+    guided = reward_profile == "guided"
+    return MPPIDBaSConfig(
+        seed=seed,
+        num_samples=40,
+        horizon=8,
+        use_reward_aligned_cost=True,
+        always_run_mppi=False,
+        execute_mppi=True,
+        final_safety_check=True,
+        enable_mppi=True,
+        enable_fallback=True,
+        base_noise_std=(0.10, 0.12),
+        reward_aligned_residual_low=(-0.20, -0.24),
+        reward_aligned_residual_high=(0.16, 0.24),
+        mppi_max_action_delta=(0.22, 0.28),
+        hierarchical_front_trigger_distance=1.30,
+        hierarchical_global_trigger_distance=0.95,
+        hierarchical_lateral_trigger=0.55,
+        hierarchical_heading_trigger=0.45,
+        hierarchical_min_risk_gain=0.04 if guided else 0.03,
+        hierarchical_accept_score_margin=0.01,
+        hierarchical_lateral_recovery_gain=0.06,
+        hierarchical_v41_gate_threshold=0.65,
+        hierarchical_v41_gate_risk_distance=1.8,
     )
 
 
@@ -578,4 +608,110 @@ class HierarchicalMppiV4Wrapper(gym.Wrapper):
             "recover_bonus": recover_bonus,
             "hazard_bonus": hazard_bonus,
             "conservative_penalty": conservative_penalty,
+        }
+
+
+class HierarchicalMppiV41Wrapper(gym.Wrapper):
+    """Continuous structured-intent variant: SAC sets targets and MPPI only locally corrects risk."""
+
+    def __init__(
+        self,
+        env: gym.Env,
+        config: Optional[MPPIDBaSConfig] = None,
+        optimizer: Optional[MPPIDBaSOptimizer] = None,
+        seed: Optional[int] = None,
+        reward_profile: str = "guided",
+        risk_penalty_weight: float = 0.08,
+        infeasible_penalty_weight: float = 0.12,
+        intervention_penalty_weight: float = 0.04,
+        jitter_penalty_weight: float = 0.05,
+    ):
+        super().__init__(env)
+        self.reward_profile = str(reward_profile).lower()
+        self.optimizer = optimizer or MPPIDBaSOptimizer(config or hierarchical_mppi_v41_config(seed=seed, reward_profile=self.reward_profile))
+        self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float32)
+        self.risk_penalty_weight = float(max(0.0, risk_penalty_weight))
+        self.infeasible_penalty_weight = float(max(0.0, infeasible_penalty_weight))
+        self.intervention_penalty_weight = float(max(0.0, intervention_penalty_weight))
+        self.jitter_penalty_weight = float(max(0.0, jitter_penalty_weight))
+        self.prev_target_progress_speed = 0.0
+        self.prev_target_lateral_offset = 0.0
+        self.has_prev_target = False
+
+    def reset(self, **kwargs):
+        self.optimizer.reset()
+        self.prev_target_progress_speed = 0.0
+        self.prev_target_lateral_offset = 0.0
+        self.has_prev_target = False
+        return self.env.reset(**kwargs)
+
+    def step(self, intent):
+        raw_intent = np.asarray(intent, dtype=np.float32).reshape(-1)[:4]
+        if raw_intent.size < 4:
+            raw_intent = np.pad(raw_intent, (0, 4 - raw_intent.size))
+        raw_intent = np.clip(raw_intent, -1.0, 1.0).astype(np.float32)
+
+        planner_state = self.env.get_planner_state()
+        params = intent_to_structured_params_v41(raw_intent, planner_state, self.optimizer.config)
+        executed_action, debug = self.optimizer.optimize_from_structured_intent_v41(raw_intent, planner_state)
+        obs, reward, terminated, truncated, info = self.env.step(executed_action)
+        info = dict(info)
+        debug.setdefault("mppi_executed_surge", float(executed_action[0]))
+        debug.setdefault("mppi_executed_yaw", float(executed_action[1]))
+        info.update(debug)
+
+        training_reward, reward_terms = self._training_reward(float(reward), info, params)
+        info["env_reward"] = float(reward)
+        info["training_reward"] = float(training_reward)
+        info["reward_profile"] = self.reward_profile
+        info["structured_risk_exposure_penalty"] = float(reward_terms["risk_penalty"])
+        info["structured_infeasible_target_penalty"] = float(reward_terms["infeasible_penalty"])
+        info["structured_intervention_penalty"] = float(reward_terms["intervention_penalty"])
+        info["structured_target_jitter_penalty"] = float(reward_terms["jitter_penalty"])
+        info["raw_intent"] = raw_intent.copy()
+        info["raw_action"] = np.array([info.get("intent_prior_surge", 0.0), info.get("intent_prior_yaw", 0.0)], dtype=np.float32)
+        info["optimized_action"] = executed_action.astype(np.float32)
+        info["hierarchical_mppi_enabled"] = True
+        info["hierarchical_mppi_v41_enabled"] = True
+        info["mppi_dbas_enabled"] = True
+
+        self.prev_target_progress_speed = float(params["target_progress_speed"])
+        self.prev_target_lateral_offset = float(params["target_lateral_offset"])
+        self.has_prev_target = True
+        return obs, training_reward, terminated, truncated, info
+
+    def get_planner_state(self):
+        return self.env.get_planner_state()
+
+    def _training_reward(self, env_reward: float, info: dict, params: dict) -> tuple[float, dict]:
+        if self.reward_profile != "guided":
+            return float(env_reward), {
+                "risk_penalty": 0.0,
+                "infeasible_penalty": 0.0,
+                "intervention_penalty": 0.0,
+                "jitter_penalty": 0.0,
+            }
+
+        risk_score = float(info.get("structured_prior_risk_score", info.get("prior_risk_score", 0.0)))
+        risk_penalty = self.risk_penalty_weight * min(risk_score, 10.0)
+
+        target_ratio = abs(float(params["target_lateral_offset"])) / max(float(params["dynamic_offset_limit"]), 1e-6)
+        infeasible_penalty = self.infeasible_penalty_weight * max(0.0, target_ratio - 0.85) ** 2
+
+        emergency = str(info.get("reject_reason", "none")) == "emergency_brake"
+        intervention = bool(info.get("mppi_triggered", False)) or str(info.get("action_source", "intent_prior")) == "fallback"
+        intervention_penalty = 0.0 if emergency else self.intervention_penalty_weight * float(intervention)
+
+        jitter_penalty = 0.0
+        if self.has_prev_target:
+            progress_delta = abs(float(params["target_progress_speed"]) - self.prev_target_progress_speed)
+            lateral_delta = abs(float(params["target_lateral_offset"]) - self.prev_target_lateral_offset)
+            jitter_penalty = self.jitter_penalty_weight * (progress_delta ** 2 + lateral_delta ** 2)
+
+        training_reward = float(env_reward - risk_penalty - infeasible_penalty - intervention_penalty - jitter_penalty)
+        return training_reward, {
+            "risk_penalty": risk_penalty,
+            "infeasible_penalty": infeasible_penalty,
+            "intervention_penalty": intervention_penalty,
+            "jitter_penalty": jitter_penalty,
         }

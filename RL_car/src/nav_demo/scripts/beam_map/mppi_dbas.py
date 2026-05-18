@@ -158,6 +158,64 @@ def intent_to_mode_params_v4(
     return decoded
 
 
+def intent_to_structured_params_v41(
+    intent: Any,
+    planner_state: Optional[Dict[str, Any]] = None,
+    config: Optional["MPPIDBaSConfig"] = None,
+) -> Dict[str, float]:
+    """Map v4.1's continuous high-level intent to MPPI targets and constraints."""
+    cfg = config or MPPIDBaSConfig()
+    values = np.asarray(intent, dtype=float).reshape(-1)
+    padded = np.zeros(4, dtype=float)
+    padded[: min(4, values.size)] = values[:4]
+    clipped = np.clip(padded, -1.0, 1.0)
+
+    progress_level = float(0.5 * (clipped[0] + 1.0))
+    lateral_intent = float(clipped[1])
+    safety_level = float(0.5 * (clipped[2] + 1.0))
+    mppi_gate = float(0.5 * (clipped[3] + 1.0))
+
+    current_d = 0.0
+    dynamic_offset_limit = 1.0
+    if planner_state:
+        frenet_transform = planner_state.get("frenet_transform")
+        if frenet_transform is not None:
+            try:
+                _, current_d = frenet_transform.cartesian_to_frenet(np.asarray(planner_state["position"], dtype=float))
+            except Exception:
+                current_d = 0.0
+        boundary_margin = float(cfg.env_out_of_bounds_limit) - abs(float(current_d)) - float(cfg.hierarchical_v41_boundary_buffer)
+        dynamic_offset_limit = float(np.clip(boundary_margin, 0.05, cfg.hierarchical_v41_max_lateral_target))
+
+    target_lateral_offset = float(lateral_intent * dynamic_offset_limit)
+    safe_distance = float(cfg.safe_distance + safety_level * cfg.hierarchical_v41_safety_margin_range)
+    target_progress_speed = float(
+        cfg.hierarchical_v41_min_progress_speed
+        + progress_level * (cfg.hierarchical_v41_max_progress_speed - cfg.hierarchical_v41_min_progress_speed)
+    )
+
+    return {
+        "target_progress_speed": target_progress_speed,
+        "target_lateral_offset": target_lateral_offset,
+        "safe_distance": safe_distance,
+        "mppi_gate": mppi_gate,
+        "dynamic_offset_limit": dynamic_offset_limit,
+        "current_lateral_offset": float(current_d),
+        "progress_level": progress_level,
+        "lateral_intent": lateral_intent,
+        "safety_level": safety_level,
+        "raw_progress_intent": float(clipped[0]),
+        "raw_lateral_target_intent": float(clipped[1]),
+        "raw_safety_margin_intent": float(clipped[2]),
+        "raw_mppi_gate_intent": float(clipped[3]),
+        "path_weight": float(1.0 + 1.25 * safety_level),
+        "safety_weight": float(1.2 + 1.8 * safety_level),
+        "obstacle_weight": float(cfg.obstacle_weight * (1.0 + 1.5 * safety_level)),
+        "ttc_weight": float(cfg.ttc_weight * (1.0 + 2.0 * safety_level)),
+        "oob_weight": float(cfg.out_of_bounds_weight * (1.0 + 1.2 * safety_level)),
+    }
+
+
 def intent_to_frenet_params_v3(
     intent: Any,
     planner_state: Optional[Dict[str, Any]] = None,
@@ -311,6 +369,15 @@ class MPPIDBaSConfig:
     hierarchical_v4_mode_switch_margin: float = 0.02
     hierarchical_v4_fallback_risk_margin: float = 0.08
     hierarchical_v4_direction_consistency_weight: float = 0.5
+    hierarchical_v41_min_progress_speed: float = 0.25
+    hierarchical_v41_max_progress_speed: float = 1.25
+    hierarchical_v41_max_lateral_target: float = 1.0
+    hierarchical_v41_boundary_buffer: float = 0.35
+    hierarchical_v41_safety_margin_range: float = 0.55
+    hierarchical_v41_lateral_gain: float = 0.65
+    hierarchical_v41_gate_threshold: float = 0.65
+    hierarchical_v41_gate_risk_distance: float = 1.8
+    hierarchical_v41_target_limit_warning: float = 0.92
 
 
 class MPPIDBaSOptimizer:
@@ -899,6 +966,131 @@ class MPPIDBaSOptimizer:
         )
         return executed_action.astype(np.float32), debug
 
+    def optimize_from_structured_intent_v41(self, intent: Any, planner_state: Dict[str, Any]) -> Tuple[np.ndarray, Dict[str, float]]:
+        """Use v4.1 continuous structured targets and trigger MPPI only when risk warrants it."""
+        cfg = self.config
+        params = intent_to_structured_params_v41(intent, planner_state, cfg)
+        prior_action = self._structured_prior_action_v41(params, planner_state)
+        radar = self._scan_risk_summary(planner_state)
+        obstacles = self._scan_to_obstacle_points(planner_state)
+        prior_sequence = np.tile(prior_action.reshape(1, 2), (cfg.horizon, 1))
+        prior_metrics = self._reward_aligned_rollout(prior_sequence, prior_action, planner_state, obstacles)
+        should_trigger, trigger_reason = self._structured_should_trigger_v41(params, prior_metrics, radar)
+
+        fallback_active = False
+        fallback_accept = False
+        fallback_action = prior_action
+        fallback_metrics = prior_metrics
+        if cfg.enable_fallback and should_trigger and self._fallback_should_run(prior_metrics, radar):
+            fallback_active = True
+            fallback_action = self._fallback_action(prior_action, planner_state, radar)
+            fallback_sequence = np.tile(fallback_action.reshape(1, 2), (cfg.horizon, 1))
+            fallback_metrics = self._reward_aligned_rollout(fallback_sequence, prior_action, planner_state, obstacles)
+            fallback_accept, _ = self._accept_fallback(prior_metrics, fallback_metrics)
+
+        if not should_trigger or not cfg.enable_mppi:
+            executed_action = fallback_action if fallback_accept else prior_action
+            action_source = "fallback" if fallback_accept else "intent_prior"
+            self.last_action = executed_action.astype(np.float32)
+            debug = self._make_structured_v41_debug(
+                intent=np.asarray(intent, dtype=float).reshape(-1),
+                params=params,
+                executed_action=executed_action,
+                prior_action=prior_action,
+                candidate_action=prior_action,
+                prior_metrics=prior_metrics,
+                candidate_metrics=prior_metrics,
+                fallback_metrics=fallback_metrics,
+                costs=np.array([self._structured_intent_cost_v41(prior_metrics, prior_sequence, prior_action, params)]),
+                radar=radar,
+                prior_type="structured_prior",
+                warm_start_used=False,
+                noise_scale=0.0,
+                mppi_triggered=False,
+                trigger_reason=trigger_reason,
+                candidate_accepted=False,
+                reject_reason="base_safe" if cfg.enable_mppi else "mppi_disabled",
+                action_source=action_source,
+                fallback_active=fallback_active,
+                fallback_accept=fallback_accept,
+            )
+            return executed_action.astype(np.float32), debug
+
+        noise_scale = self._adaptive_noise_scale(radar["global_min"])
+        action_sequences, prior_names, warm_start_used = self._sample_sac_centered_sequences(prior_action, noise_scale)
+        metrics = [
+            self._reward_aligned_rollout(sequence, prior_action, planner_state, obstacles)
+            for sequence in action_sequences
+        ]
+        costs = np.asarray(
+            [
+                self._structured_intent_cost_v41(metric, sequence, prior_action, params)
+                for metric, sequence in zip(metrics, action_sequences)
+            ],
+            dtype=float,
+        )
+        best_idx = int(np.argmin(costs))
+        candidate_action = self._clip_action(action_sequences[best_idx][0])
+        candidate_metrics = metrics[best_idx]
+        self.best_sequence = action_sequences[best_idx].copy()
+
+        accepted, reject_reason = self._accept_structured_candidate_v41(
+            params=params,
+            prior_metrics=prior_metrics,
+            candidate_metrics=candidate_metrics,
+            candidate_action=candidate_action,
+            prior_action=prior_action,
+            prior_score=self._structured_intent_cost_v41(prior_metrics, prior_sequence, prior_action, params),
+            candidate_score=float(costs[best_idx]),
+        )
+
+        if fallback_accept and not self._structured_prefer_mppi_over_fallback_v41(candidate_metrics, fallback_metrics, accepted):
+            executed_action = fallback_action
+            action_source = "fallback"
+            if accepted:
+                reject_reason = "prefer_fallback"
+            accepted = False
+        elif accepted:
+            executed_action = candidate_action
+            action_source = "hierarchical_mppi_v41"
+        else:
+            executed_action = prior_action
+            action_source = "intent_prior"
+
+        if cfg.final_safety_check and self._emergency_brake_needed(prior_metrics, candidate_metrics, radar):
+            executed_action = self._emergency_brake_action(prior_action)
+            action_source = "fallback"
+            fallback_active = True
+            fallback_accept = True
+            reject_reason = "emergency_brake"
+            accepted = False
+
+        self.last_action = executed_action.astype(np.float32)
+        self.last_noise_scale = float(noise_scale)
+        debug = self._make_structured_v41_debug(
+            intent=np.asarray(intent, dtype=float).reshape(-1),
+            params=params,
+            executed_action=executed_action,
+            prior_action=prior_action,
+            candidate_action=candidate_action,
+            prior_metrics=prior_metrics,
+            candidate_metrics=candidate_metrics,
+            fallback_metrics=fallback_metrics,
+            costs=costs,
+            radar=radar,
+            prior_type=prior_names[best_idx],
+            warm_start_used=warm_start_used,
+            noise_scale=noise_scale,
+            mppi_triggered=True,
+            trigger_reason=trigger_reason,
+            candidate_accepted=accepted and action_source == "hierarchical_mppi_v41",
+            reject_reason=reject_reason,
+            action_source=action_source,
+            fallback_active=fallback_active,
+            fallback_accept=fallback_accept,
+        )
+        return executed_action.astype(np.float32), debug
+
     def optimize_from_frenet_intent_v3(self, intent: Any, planner_state: Dict[str, Any]) -> Tuple[np.ndarray, Dict[str, float]]:
         """Use SAC intent as a local Frenet target and let MPPI execute the short-horizon plan."""
         cfg = self.config
@@ -1425,6 +1617,184 @@ class MPPIDBaSOptimizer:
             "global_obstacle_distance": float(radar["global_min"]),
         }
 
+    def _structured_prior_action_v41(self, params: Dict[str, float], planner_state: Dict[str, Any]) -> np.ndarray:
+        lateral_error = float(params["target_lateral_offset"]) - float(params["current_lateral_offset"])
+        yaw_bias = float(np.clip(self.config.hierarchical_v41_lateral_gain * lateral_error, -0.85, 0.85))
+        return self._clip_action([float(params["target_progress_speed"]), yaw_bias])
+
+    def _structured_should_trigger_v41(
+        self,
+        params: Dict[str, float],
+        prior_metrics: Dict[str, float],
+        radar: Dict[str, float],
+    ) -> Tuple[bool, str]:
+        base_trigger, base_reason = self._intent_v2_should_trigger(prior_metrics, radar)
+        if base_trigger:
+            return True, base_reason
+        gate_active = (
+            float(params["mppi_gate"]) > self.config.hierarchical_v41_gate_threshold
+            and radar["global_min"] < self.config.hierarchical_v41_gate_risk_distance
+        )
+        if gate_active:
+            return True, "trigger_mppi_gate"
+        return False, "base_safe"
+
+    def _structured_intent_cost_v41(
+        self,
+        metrics: Dict[str, float],
+        action_sequence: np.ndarray,
+        prior_action: np.ndarray,
+        params: Dict[str, float],
+    ) -> float:
+        base_params = {
+            "target_speed": float(params["target_progress_speed"]),
+            "turn_bias": 0.0,
+            "path_weight": float(params["path_weight"]),
+            "safety_weight": float(params["safety_weight"]),
+        }
+        base_cost = self._intent_conditioned_cost_v2(metrics, action_sequence, prior_action, base_params)
+        target_error = float(metrics.get("final_lateral_offset", params["current_lateral_offset"])) - float(params["target_lateral_offset"])
+        target_tracking_cost = float(params["path_weight"]) * 8.0 * target_error ** 2
+        safe_distance = float(params["safe_distance"])
+        safety_barrier = max(0.0, safe_distance - float(metrics.get("min_distance", safe_distance))) ** 2
+        safety_cost = (
+            float(params["obstacle_weight"]) * safety_barrier
+            + float(params["ttc_weight"]) * float(metrics.get("ttc_cost", 0.0))
+            + float(params["oob_weight"]) * float(metrics.get("out_of_bounds_cost", 0.0))
+        )
+        return float(base_cost + target_tracking_cost + safety_cost)
+
+    def _accept_structured_candidate_v41(
+        self,
+        params: Dict[str, float],
+        prior_metrics: Dict[str, float],
+        candidate_metrics: Dict[str, float],
+        candidate_action: np.ndarray,
+        prior_action: np.ndarray,
+        prior_score: float,
+        candidate_score: float,
+    ) -> Tuple[bool, str]:
+        accepted, reason = self._accept_intent_v2_candidate(
+            prior_metrics=prior_metrics,
+            candidate_metrics=candidate_metrics,
+            candidate_action=candidate_action,
+            prior_action=prior_action,
+            prior_score=prior_score,
+            candidate_score=candidate_score,
+        )
+        if not accepted:
+            return False, reason
+        prior_target_error = abs(float(prior_metrics.get("final_lateral_offset", params["current_lateral_offset"])) - float(params["target_lateral_offset"]))
+        candidate_target_error = abs(float(candidate_metrics.get("final_lateral_offset", params["current_lateral_offset"])) - float(params["target_lateral_offset"]))
+        if (
+            candidate_metrics["risk_score"] >= prior_metrics["risk_score"] - self.config.hierarchical_min_risk_gain
+            and candidate_target_error > prior_target_error - 0.03
+        ):
+            return False, "reject_no_structured_gain"
+        return True, "none"
+
+    def _structured_prefer_mppi_over_fallback_v41(
+        self,
+        candidate_metrics: Dict[str, float],
+        fallback_metrics: Dict[str, float],
+        accepted: bool,
+    ) -> bool:
+        if not accepted:
+            return False
+        if candidate_metrics["out_of_bounds_risk"] > fallback_metrics["out_of_bounds_risk"] + 1e-6:
+            return False
+        if candidate_metrics["collision_risk"] > fallback_metrics["collision_risk"] + 1e-6:
+            return False
+        risk_gain = float(fallback_metrics["risk_score"]) - float(candidate_metrics["risk_score"])
+        return bool(risk_gain > self.config.hierarchical_v4_fallback_risk_margin)
+
+    def _make_structured_v41_debug(
+        self,
+        intent: np.ndarray,
+        params: Dict[str, float],
+        executed_action: np.ndarray,
+        prior_action: np.ndarray,
+        candidate_action: np.ndarray,
+        prior_metrics: Dict[str, float],
+        candidate_metrics: Dict[str, float],
+        fallback_metrics: Dict[str, float],
+        costs: np.ndarray,
+        radar: Dict[str, float],
+        prior_type: str,
+        warm_start_used: bool,
+        noise_scale: float,
+        mppi_triggered: bool,
+        trigger_reason: str,
+        candidate_accepted: bool,
+        reject_reason: str,
+        action_source: str,
+        fallback_active: bool,
+        fallback_accept: bool,
+    ) -> Dict[str, float]:
+        debug = self._make_intent_v2_debug(
+            intent=np.asarray(
+                [
+                    params["raw_progress_intent"],
+                    params["raw_lateral_target_intent"],
+                    params["raw_safety_margin_intent"],
+                    params["raw_mppi_gate_intent"],
+                ],
+                dtype=float,
+            ),
+            params={
+                "target_speed": float(params["target_progress_speed"]),
+                "turn_bias": float(prior_action[1]),
+                "path_weight": float(params["path_weight"]),
+                "safety_weight": float(params["safety_weight"]),
+            },
+            executed_action=executed_action,
+            prior_action=prior_action,
+            candidate_action=candidate_action,
+            prior_metrics=prior_metrics,
+            candidate_metrics=candidate_metrics,
+            costs=costs,
+            radar=radar,
+            prior_type=prior_type,
+            warm_start_used=warm_start_used,
+            noise_scale=noise_scale,
+            mppi_triggered=mppi_triggered,
+            trigger_reason=trigger_reason,
+            candidate_accepted=candidate_accepted,
+            reject_reason=reject_reason,
+            action_source=action_source,
+        )
+        target_limit_ratio = abs(float(params["target_lateral_offset"])) / max(float(params["dynamic_offset_limit"]), 1e-6)
+        target_feasible = bool(target_limit_ratio <= self.config.hierarchical_v41_target_limit_warning)
+        debug.update(
+            {
+                "terminal_source": action_source,
+                "hierarchical_mppi_v41_enabled": True,
+                "structured_target_progress_speed": float(params["target_progress_speed"]),
+                "structured_target_lateral_offset": float(params["target_lateral_offset"]),
+                "structured_safety_margin": float(params["safe_distance"] - self.config.safe_distance),
+                "structured_mppi_gate": float(params["mppi_gate"]),
+                "structured_dynamic_offset_limit": float(params["dynamic_offset_limit"]),
+                "structured_current_lateral_offset": float(params["current_lateral_offset"]),
+                "structured_target_feasible": bool(target_feasible),
+                "structured_target_limit_ratio": float(target_limit_ratio),
+                "structured_progress_level": float(params["progress_level"]),
+                "structured_safety_level": float(params["safety_level"]),
+                "structured_prior_risk_score": float(prior_metrics["risk_score"]),
+                "structured_candidate_risk_score": float(candidate_metrics["risk_score"]),
+                "structured_prior_target_error": float(
+                    abs(float(prior_metrics.get("final_lateral_offset", params["current_lateral_offset"])) - float(params["target_lateral_offset"]))
+                ),
+                "structured_candidate_target_error": float(
+                    abs(float(candidate_metrics.get("final_lateral_offset", params["current_lateral_offset"])) - float(params["target_lateral_offset"]))
+                ),
+                "fallback_active": bool(fallback_active),
+                "fallback_accept": bool(fallback_accept),
+                "fallback_risk": float(fallback_metrics["risk_score"]),
+                "fallback_progress": float(fallback_metrics["progress"]),
+            }
+        )
+        return debug
+
     def _v4_prior_action(self, params: Dict[str, Any], planner_state: Dict[str, Any]) -> np.ndarray:
         current_d = float(params.get("current_lateral_offset", 0.0))
         target_speed = float(params["target_speed"])
@@ -1792,6 +2162,7 @@ class MPPIDBaSOptimizer:
         min_distance = max_laser_range
         max_lateral_error = 0.0
         max_heading_error = 0.0
+        final_lateral_offset = 0.0
         terminal = "running"
         terminal_step = -1
 
@@ -1817,6 +2188,7 @@ class MPPIDBaSOptimizer:
 
             delta_s = float(frenet_s - prev_s)
             lateral_error = abs(float(frenet_d))
+            final_lateral_offset = float(frenet_d)
             max_lateral_error = max(max_lateral_error, lateral_error)
             max_heading_error = max(max_heading_error, abs(float(heading_error)))
 
@@ -1889,6 +2261,7 @@ class MPPIDBaSOptimizer:
             "out_of_bounds_cost": float(total_oob_cost),
             "max_lateral_error": float(max_lateral_error),
             "max_heading_error": float(max_heading_error),
+            "final_lateral_offset": float(final_lateral_offset),
             "progress": float(progress),
             "final_distance_to_goal": float(np.linalg.norm(target - position)),
             "risk_score": float(risk_score),
