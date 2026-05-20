@@ -10,7 +10,7 @@ from geometry_msgs.msg import Pose
 from visualization_msgs.msg import Marker, MarkerArray
 import math
 import tf.transformations
-from frenet_utils import FrenetTransform, frenet_reward
+from frenet_utils import FrenetTransform, SharedRewardConfig, compute_shared_reward, frenet_reward
 
 class MyCarEnv(gym.Env):
     def __init__(self):
@@ -216,25 +216,15 @@ class MyCarEnv(gym.Env):
             print("Goal reached!")
             
         else:
-            # 7.2 路径跟踪奖励 (Frenet，放大2.5倍鼓励探索)
-            frenet_reward_dict = frenet_reward(delta_s, frenet_d, heading_to_path)
-            frenet_amplification_factor = 2.5
-            reward += frenet_reward_dict['total'] * frenet_amplification_factor
-
-            # 7.3 安全避障惩罚（收缩边界，k=5.0，上限10.0）
-            safe_distance = 0.45
-            if min_laser_dist < safe_distance:
-                k = 5.0
-                penalty = math.exp(k * (safe_distance - min_laser_dist)) - 1
-                reward -= min(penalty, 10.0)  # 上限-10
-
-            # 7.4 动作平滑度约束（削弱系数，降低前期探索阻力）
-            surge_change_penalty = abs(action[0] - self.last_action[0]) * 0.2
-            yaw_change_penalty = abs(action[1] - self.last_action[1]) * 0.1
-            reward -= surge_change_penalty + yaw_change_penalty
-
-            # 7.5 存活时间惩罚
-            reward -= 0.1
+            # 7.2 统一共享奖励（与 MPPI rollout 使用相同权重）
+            reward += compute_shared_reward(
+                delta_s=delta_s,
+                frenet_d=frenet_d,
+                heading_error=heading_to_path,
+                min_laser_dist=min_laser_dist,
+                prev_action=self.last_action,
+                current_action=np.array([float(action[0]), float(action[1])]),
+            )
 
         # ---------------------------------------------------------
 

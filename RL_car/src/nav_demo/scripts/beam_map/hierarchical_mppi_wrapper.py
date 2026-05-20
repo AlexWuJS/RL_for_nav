@@ -88,8 +88,8 @@ def hierarchical_mppi_v4_config(seed: Optional[int] = None, reward_profile: str 
     conservative = reward_profile == "enhanced"
     return MPPIDBaSConfig(
         seed=seed,
-        num_samples=40,
-        horizon=8,
+        num_samples=64,
+        horizon=15,
         use_reward_aligned_cost=True,
         always_run_mppi=False,
         execute_mppi=True,
@@ -117,8 +117,8 @@ def hierarchical_mppi_v41_config(seed: Optional[int] = None, reward_profile: str
     guided = reward_profile == "guided"
     return MPPIDBaSConfig(
         seed=seed,
-        num_samples=40,
-        horizon=8,
+        num_samples=64,
+        horizon=15,
         use_reward_aligned_cost=True,
         always_run_mppi=False,
         execute_mppi=True,
@@ -612,7 +612,7 @@ class HierarchicalMppiV4Wrapper(gym.Wrapper):
 
 
 class HierarchicalMppiV41Wrapper(gym.Wrapper):
-    """Continuous structured-intent variant: SAC sets targets and MPPI only locally corrects risk."""
+    """Plan-B: SAC perceives MPPI delta; shared cost; decomposed reward."""
 
     def __init__(
         self,
@@ -621,29 +621,32 @@ class HierarchicalMppiV41Wrapper(gym.Wrapper):
         optimizer: Optional[MPPIDBaSOptimizer] = None,
         seed: Optional[int] = None,
         reward_profile: str = "guided",
-        risk_penalty_weight: float = 0.08,
-        infeasible_penalty_weight: float = 0.12,
-        intervention_penalty_weight: float = 0.04,
-        jitter_penalty_weight: float = 0.05,
+        correction_bonus_weight: float = 0.1,
+        consistency_penalty_weight: float = 0.05,
     ):
         super().__init__(env)
         self.reward_profile = str(reward_profile).lower()
         self.optimizer = optimizer or MPPIDBaSOptimizer(config or hierarchical_mppi_v41_config(seed=seed, reward_profile=self.reward_profile))
+        # SAC action space unchanged (4D intent)
         self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float32)
-        self.risk_penalty_weight = float(max(0.0, risk_penalty_weight))
-        self.infeasible_penalty_weight = float(max(0.0, infeasible_penalty_weight))
-        self.intervention_penalty_weight = float(max(0.0, intervention_penalty_weight))
-        self.jitter_penalty_weight = float(max(0.0, jitter_penalty_weight))
-        self.prev_target_progress_speed = 0.0
-        self.prev_target_lateral_offset = 0.0
-        self.has_prev_target = False
+        # Expand observation by 2: [mppi_delta_surge_norm, mppi_delta_yaw_norm]
+        orig_obs_space = env.observation_space
+        orig_dim = orig_obs_space.shape[0]
+        self._base_obs_dim = orig_dim
+        self.observation_space = gym.spaces.Box(
+            low=-1.0, high=1.0, shape=(orig_dim + 2,), dtype=np.float32,
+        )
+        self.correction_bonus_weight = float(max(0.0, correction_bonus_weight))
+        self.consistency_penalty_weight = float(max(0.0, consistency_penalty_weight))
+        self._prev_executed_action = np.zeros(2, dtype=np.float32)
 
     def reset(self, **kwargs):
         self.optimizer.reset()
-        self.prev_target_progress_speed = 0.0
-        self.prev_target_lateral_offset = 0.0
-        self.has_prev_target = False
-        return self.env.reset(**kwargs)
+        self._prev_executed_action = np.zeros(2, dtype=np.float32)
+        obs, info = self.env.reset(**kwargs)
+        # Pad initial obs with zero delta (no MPPI correction yet)
+        obs = np.concatenate([obs, np.zeros(2, dtype=np.float32)]).astype(np.float32)
+        return obs, info
 
     def step(self, intent):
         raw_intent = np.asarray(intent, dtype=np.float32).reshape(-1)[:4]
@@ -660,58 +663,60 @@ class HierarchicalMppiV41Wrapper(gym.Wrapper):
         debug.setdefault("mppi_executed_yaw", float(executed_action[1]))
         info.update(debug)
 
-        training_reward, reward_terms = self._training_reward(float(reward), info, params)
-        info["env_reward"] = float(reward)
+        # --- Plan B: MPPI delta as observation ---
+        prior_action = np.array([
+            info.get("intent_prior_surge", 0.0),
+            info.get("intent_prior_yaw", 0.0),
+        ], dtype=np.float32)
+        mppi_delta = executed_action.astype(np.float32) - prior_action
+
+        act_low = self.env.action_space.low[:2].astype(np.float32)
+        act_high = self.env.action_space.high[:2].astype(np.float32)
+        act_range = act_high - act_low
+        safe_range = np.maximum(act_range, 1e-6)
+        delta_norm = np.clip(mppi_delta / (safe_range * 0.5), -1.0, 1.0).astype(np.float32)
+
+        obs = np.concatenate([obs, delta_norm]).astype(np.float32)
+
+        # --- Plan B: decomposed reward ---
+        base_reward = float(reward)
+        action_source = str(info.get("action_source", "intent_prior"))
+
+        if self.reward_profile == "guided":
+            # Correction bonus: reward MPPI when it finds a genuinely better action
+            correction_bonus = 0.0
+            if action_source == "hierarchical_mppi_v41" and not terminated:
+                prior_pred = float(info.get("prior_predicted_reward", 0.0))
+                mppi_pred = float(info.get("candidate_predicted_reward", 0.0))
+                correction_bonus = self.correction_bonus_weight * max(0.0, mppi_pred - prior_pred)
+
+            # Consistency penalty: discourage SAC from relying on MPPI corrections
+            consistency_penalty = self.consistency_penalty_weight * float(np.sum(delta_norm ** 2))
+
+            training_reward = base_reward + correction_bonus - consistency_penalty
+        else:
+            correction_bonus = 0.0
+            consistency_penalty = 0.0
+            training_reward = base_reward
+
+        info["env_reward"] = base_reward
         info["training_reward"] = float(training_reward)
+        info["base_reward"] = base_reward
+        info["mppi_correction_bonus"] = float(correction_bonus)
+        info["mppi_consistency_penalty"] = float(consistency_penalty)
+        info["mppi_delta_surge"] = float(delta_norm[0])
+        info["mppi_delta_yaw"] = float(delta_norm[1])
+        info["mppi_delta_norm"] = float(np.linalg.norm(mppi_delta))
         info["reward_profile"] = self.reward_profile
-        info["structured_risk_exposure_penalty"] = float(reward_terms["risk_penalty"])
-        info["structured_infeasible_target_penalty"] = float(reward_terms["infeasible_penalty"])
-        info["structured_intervention_penalty"] = float(reward_terms["intervention_penalty"])
-        info["structured_target_jitter_penalty"] = float(reward_terms["jitter_penalty"])
         info["raw_intent"] = raw_intent.copy()
-        info["raw_action"] = np.array([info.get("intent_prior_surge", 0.0), info.get("intent_prior_yaw", 0.0)], dtype=np.float32)
+        info["raw_action"] = prior_action
         info["optimized_action"] = executed_action.astype(np.float32)
         info["hierarchical_mppi_enabled"] = True
         info["hierarchical_mppi_v41_enabled"] = True
         info["mppi_dbas_enabled"] = True
 
-        self.prev_target_progress_speed = float(params["target_progress_speed"])
-        self.prev_target_lateral_offset = float(params["target_lateral_offset"])
-        self.has_prev_target = True
+        self._prev_executed_action = executed_action.astype(np.float32)
         return obs, training_reward, terminated, truncated, info
 
     def get_planner_state(self):
         return self.env.get_planner_state()
-
-    def _training_reward(self, env_reward: float, info: dict, params: dict) -> tuple[float, dict]:
-        if self.reward_profile != "guided":
-            return float(env_reward), {
-                "risk_penalty": 0.0,
-                "infeasible_penalty": 0.0,
-                "intervention_penalty": 0.0,
-                "jitter_penalty": 0.0,
-            }
-
-        risk_score = float(info.get("structured_prior_risk_score", info.get("prior_risk_score", 0.0)))
-        risk_penalty = self.risk_penalty_weight * min(risk_score, 10.0)
-
-        target_ratio = abs(float(params["target_lateral_offset"])) / max(float(params["dynamic_offset_limit"]), 1e-6)
-        infeasible_penalty = self.infeasible_penalty_weight * max(0.0, target_ratio - 0.85) ** 2
-
-        emergency = str(info.get("reject_reason", "none")) == "emergency_brake"
-        intervention = bool(info.get("mppi_triggered", False)) or str(info.get("action_source", "intent_prior")) == "fallback"
-        intervention_penalty = 0.0 if emergency else self.intervention_penalty_weight * float(intervention)
-
-        jitter_penalty = 0.0
-        if self.has_prev_target:
-            progress_delta = abs(float(params["target_progress_speed"]) - self.prev_target_progress_speed)
-            lateral_delta = abs(float(params["target_lateral_offset"]) - self.prev_target_lateral_offset)
-            jitter_penalty = self.jitter_penalty_weight * (progress_delta ** 2 + lateral_delta ** 2)
-
-        training_reward = float(env_reward - risk_penalty - infeasible_penalty - intervention_penalty - jitter_penalty)
-        return training_reward, {
-            "risk_penalty": risk_penalty,
-            "infeasible_penalty": infeasible_penalty,
-            "intervention_penalty": intervention_penalty,
-            "jitter_penalty": jitter_penalty,
-        }

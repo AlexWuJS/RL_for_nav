@@ -274,7 +274,7 @@ def _dynamic_lateral_offset_limit_v3(
 
 
 try:
-    from frenet_utils import frenet_reward
+    from frenet_utils import SharedRewardConfig, compute_shared_reward, frenet_reward
 except ImportError:
     def frenet_reward(delta_s: float, frenet_d: float, heading_error: float) -> dict:
         abs_d = abs(frenet_d)
@@ -295,8 +295,8 @@ except ImportError:
 class MPPIDBaSConfig:
     """Configuration for the conservative MPPI-DBaS safety filter."""
 
-    num_samples: int = 128
-    horizon: int = 12
+    num_samples: int = 64
+    horizon: int = 15
     lambda_: float = 1.5
     safe_distance: float = 0.55
     collision_distance: float = 0.25
@@ -315,7 +315,7 @@ class MPPIDBaSConfig:
     heading_weight: float = 1.5
     obstacle_weight: float = 4.0
     dbas_weight: float = 3.0
-    trust_region_weight: float = 18.0
+    trust_region_weight: float = 5.0
     control_weight: float = 0.04
     smoothness_weight: float = 0.5
     ttc_weight: float = 2.0
@@ -343,7 +343,7 @@ class MPPIDBaSConfig:
     always_run_mppi: bool = False
     execute_mppi: bool = True
     final_safety_check: bool = True
-    reward_improvement_threshold: float = 0.05
+    reward_improvement_threshold: float = 0.02
     emergency_brake_distance: float = 0.35
     env_safe_distance: float = 0.45
     env_out_of_bounds_limit: float = 3.0
@@ -1416,7 +1416,9 @@ class MPPIDBaSOptimizer:
             "candidate_min_distance": float(candidate_metrics["min_distance"]),
             "candidate_pred_collision": bool(candidate_metrics["collision_risk"] > 0.0),
             "candidate_pred_out_of_bounds": bool(candidate_metrics["out_of_bounds_risk"] > 0.0),
-            "fallback_risk": float(fallback_metrics["risk_score"]),
+            "prior_predicted_reward": float(prior_metrics["predicted_reward"]),
+                "candidate_predicted_reward": float(candidate_metrics["predicted_reward"]),
+                "fallback_risk": float(fallback_metrics["risk_score"]),
             "fallback_progress": float(fallback_metrics["progress"]),
             "fallback_max_lateral_error": float(fallback_metrics["max_lateral_error"]),
             "fallback_ttc_cost": float(fallback_metrics["ttc_cost"]),
@@ -1614,6 +1616,8 @@ class MPPIDBaSOptimizer:
             "front_obstacle_distance": float(radar["front_min"]),
             "left_clearance": float(radar["left_min"]),
             "right_clearance": float(radar["right_min"]),
+            "prior_predicted_reward": float(prior_metrics["predicted_reward"]),
+            "candidate_predicted_reward": float(candidate_metrics["predicted_reward"]),
             "global_obstacle_distance": float(radar["global_min"]),
         }
 
@@ -1789,6 +1793,8 @@ class MPPIDBaSOptimizer:
                 ),
                 "fallback_active": bool(fallback_active),
                 "fallback_accept": bool(fallback_accept),
+                "prior_predicted_reward": float(prior_metrics["predicted_reward"]),
+                "candidate_predicted_reward": float(candidate_metrics["predicted_reward"]),
                 "fallback_risk": float(fallback_metrics["risk_score"]),
                 "fallback_progress": float(fallback_metrics["progress"]),
             }
@@ -1985,6 +1991,8 @@ class MPPIDBaSOptimizer:
                 "mode_current_lateral_offset": float(params["current_lateral_offset"]),
                 "fallback_active": bool(fallback_active),
                 "fallback_accept": bool(fallback_accept),
+                "prior_predicted_reward": float(prior_metrics["predicted_reward"]),
+                "candidate_predicted_reward": float(candidate_metrics["predicted_reward"]),
                 "fallback_risk": float(fallback_metrics["risk_score"]),
                 "fallback_progress": float(fallback_metrics["progress"]),
                 "fallback_max_lateral_error": float(fallback_metrics["max_lateral_error"]),
@@ -2090,6 +2098,8 @@ class MPPIDBaSOptimizer:
             "front_obstacle_distance": float(radar["front_min"]),
             "left_clearance": float(radar["left_min"]),
             "right_clearance": float(radar["right_min"]),
+            "prior_predicted_reward": float(prior_metrics["predicted_reward"]),
+            "candidate_predicted_reward": float(candidate_metrics["predicted_reward"]),
             "global_obstacle_distance": float(radar["global_min"]),
         }
 
@@ -2217,17 +2227,14 @@ class MPPIDBaSOptimizer:
                 terminal = "success"
                 terminal_step = step_idx
                 break
-
-            env_reward = (
-                delta_s * 30.0
-                - self._piecewise_lateral_penalty(lateral_error)
-                - (abs(float(heading_error)) / math.pi) * 1.5
-            ) * cfg.env_frenet_reward_scale
-            if obstacle_dist < cfg.env_safe_distance:
-                penalty = math.exp(5.0 * (cfg.env_safe_distance - obstacle_dist)) - 1.0
-                env_reward -= min(penalty, 10.0)
-            env_reward -= abs(action[0] - prev_action[0]) * 0.2 + abs(action[1] - prev_action[1]) * 0.1
-            env_reward -= 0.1
+            env_reward = compute_shared_reward(
+                delta_s=delta_s,
+                frenet_d=frenet_d,
+                heading_error=heading_error,
+                min_laser_dist=obstacle_dist,
+                prev_action=prev_action,
+                current_action=action,
+            )
             predicted_reward += env_reward
             prev_s = frenet_s
             prev_action = effective_action
@@ -2444,7 +2451,9 @@ class MPPIDBaSOptimizer:
             "mppi_min_obstacle_distance": float(candidate_metrics["min_distance"]),
             "base_risk": float(base_metrics["risk_score"]),
             "candidate_risk": float(candidate_metrics["risk_score"]),
-            "fallback_risk": float(fallback_metrics["risk_score"]),
+            "prior_predicted_reward": float(prior_metrics["predicted_reward"]),
+                "candidate_predicted_reward": float(candidate_metrics["predicted_reward"]),
+                "fallback_risk": float(fallback_metrics["risk_score"]),
             "base_min_distance": float(base_metrics["min_distance"]),
             "candidate_min_distance": float(candidate_metrics["min_distance"]),
             "fallback_min_distance": float(fallback_metrics["min_distance"]),
@@ -2460,6 +2469,8 @@ class MPPIDBaSOptimizer:
             "front_obstacle_distance": float(radar["front_min"]),
             "left_clearance": float(radar["left_min"]),
             "right_clearance": float(radar["right_min"]),
+            "prior_predicted_reward": float(prior_metrics["predicted_reward"]),
+            "candidate_predicted_reward": float(candidate_metrics["predicted_reward"]),
             "global_obstacle_distance": float(radar["global_min"]),
         }
 
@@ -2688,7 +2699,9 @@ class MPPIDBaSOptimizer:
             "mppi_min_obstacle_distance": float(candidate_metrics["min_distance"]),
             "base_risk": float(base_metrics["risk_score"]),
             "candidate_risk": float(candidate_metrics["risk_score"]),
-            "fallback_risk": float(fallback_metrics["risk_score"]),
+            "prior_predicted_reward": float(prior_metrics["predicted_reward"]),
+                "candidate_predicted_reward": float(candidate_metrics["predicted_reward"]),
+                "fallback_risk": float(fallback_metrics["risk_score"]),
             "base_min_distance": float(base_metrics["min_distance"]),
             "candidate_min_distance": float(candidate_metrics["min_distance"]),
             "fallback_min_distance": float(fallback_metrics["min_distance"]),
@@ -2704,6 +2717,8 @@ class MPPIDBaSOptimizer:
             "front_obstacle_distance": float(radar["front_min"]),
             "left_clearance": float(radar["left_min"]),
             "right_clearance": float(radar["right_min"]),
+            "prior_predicted_reward": float(prior_metrics["predicted_reward"]),
+            "candidate_predicted_reward": float(candidate_metrics["predicted_reward"]),
             "global_obstacle_distance": float(radar["global_min"]),
         }
 
@@ -2937,7 +2952,9 @@ class MPPIDBaSOptimizer:
             "fallback_accept": bool(accept),
             "action_source": "fallback" if accept else "sac",
             "terminal_source": "fallback" if accept else "sac",
-            "fallback_risk": float(fallback_metrics["risk_score"]),
+            "prior_predicted_reward": float(prior_metrics["predicted_reward"]),
+                "candidate_predicted_reward": float(candidate_metrics["predicted_reward"]),
+                "fallback_risk": float(fallback_metrics["risk_score"]),
             "fallback_min_distance": float(fallback_metrics["min_distance"]),
             "fallback_ttc_cost": float(fallback_metrics["ttc_cost"]),
             "fallback_max_lateral_error": float(fallback_metrics["max_lateral_error"]),
@@ -3093,6 +3110,8 @@ class MPPIDBaSOptimizer:
             "front_obstacle_distance": float(radar["front_min"]),
             "left_clearance": float(radar["left_min"]),
             "right_clearance": float(radar["right_min"]),
+            "prior_predicted_reward": float(prior_metrics["predicted_reward"]),
+            "candidate_predicted_reward": float(candidate_metrics["predicted_reward"]),
             "global_obstacle_distance": float(radar["global_min"]),
         }
 
