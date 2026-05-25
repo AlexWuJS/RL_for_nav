@@ -28,12 +28,24 @@ from hierarchical_mppi_wrapper import (
 )
 from mppi_dbas import MPPIDBaSConfig
 from mppi_dbas_wrapper import MppiDbaSActionWrapper
+from rl_driven_mppi import (
+    RLDrivenMPPIActionWrapper,
+    SB3SacPolicyAdapter,
+    rl_driven_mppi_config,
+)
 from ros_env import MyCarEnv
 
 
 SHIELD_RESIDUAL_LOW = (-0.15, -0.18)
 SHIELD_RESIDUAL_HIGH = (0.06, 0.18)
 DICT_OBS_KEYS = {"radar_image", "kinematics"}
+RLMPPI_MODES = {
+    "pure_mppi",
+    "rl_driven_mppi",
+    "rl_driven_mppi_no_hss",
+    "rl_driven_mppi_fixed_sigma",
+    "rl_driven_mppi_no_q",
+}
 
 
 def unwrap_env(env):
@@ -176,7 +188,7 @@ def resolve_obs_mode(requested_mode: str, model_space) -> str:
     return observation_space_kind(model_space)
 
 
-def make_env(mode: str, seed: int, log_dir: str, obs_mode: str):
+def make_env(mode: str, seed: int, log_dir: str, obs_mode: str, rl_policy_model_path: str | None = None, device: str = "auto"):
     def _init():
         env = MyCarEnv()
         if mode in ("hierarchical_mppi", "hierarchical_mppi_shield"):
@@ -213,6 +225,15 @@ def make_env(mode: str, seed: int, log_dir: str, obs_mode: str):
                 config=hierarchical_mppi_v4_config(seed=seed, reward_profile="enhanced"),
                 reward_profile="enhanced",
             )
+        elif mode in RLMPPI_MODES:
+            adapter = None
+            if rl_policy_model_path:
+                adapter = SB3SacPolicyAdapter(SAC.load(rl_policy_model_path, env=None, device=device))
+            env = RLDrivenMPPIActionWrapper(
+                env,
+                config=rl_driven_mppi_config(mode, seed),
+                policy_adapter=adapter,
+            )
         elif mode != "baseline":
             env = MppiDbaSActionWrapper(env, config_for_mode(mode, seed))
         if obs_mode == "dict":
@@ -223,8 +244,16 @@ def make_env(mode: str, seed: int, log_dir: str, obs_mode: str):
     return _init
 
 
-def build_eval_env(mode: str, seed: int, log_dir: str, frame_stack: int, obs_mode: str):
-    env = DummyVecEnv([make_env(mode, seed, log_dir, obs_mode)])
+def build_eval_env(
+    mode: str,
+    seed: int,
+    log_dir: str,
+    frame_stack: int,
+    obs_mode: str,
+    rl_policy_model_path: str | None = None,
+    device: str = "auto",
+):
+    env = DummyVecEnv([make_env(mode, seed, log_dir, obs_mode, rl_policy_model_path, device)])
     if obs_mode == "flat" and frame_stack > 1:
         env = VecFrameStack(env, n_stack=frame_stack)
     return env
@@ -362,6 +391,8 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
                 "source_hierarchical_mppi_v3": float(info.get("action_source", "sac") == "hierarchical_mppi_v3"),
                 "source_hierarchical_mppi_v4": float(info.get("action_source", "sac") == "hierarchical_mppi_v4"),
                 "source_hierarchical_mppi_v41": float(info.get("action_source", "sac") == "hierarchical_mppi_v41"),
+                "source_rl_driven_mppi": float(info.get("action_source", "sac") == "rl_driven_mppi"),
+                "source_pure_mppi": float(info.get("action_source", "sac") == "pure_mppi"),
                 "mppi_triggered": float(bool(info.get("mppi_triggered", info.get("mppi_active", False)))),
                 "candidate_accepted": float(bool(info.get("candidate_accepted", info.get("mppi_accept", False)))),
                 "sac_intent_target_speed": float(info.get("sac_intent_target_speed", 0.0)),
@@ -392,6 +423,19 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
                 "structured_target_feasible": float(bool(info.get("structured_target_feasible", True))),
                 "structured_intervention_penalty": float(info.get("structured_intervention_penalty", 0.0)),
                 "structured_target_jitter_penalty": float(info.get("structured_target_jitter_penalty", 0.0)),
+                "rlmppi_terminal_q_used": float(bool(info.get("rlmppi_terminal_q_used", False))),
+                "rlmppi_hss_enabled": float(bool(info.get("rlmppi_hss_enabled", False))),
+                "rlmppi_update_sigma": float(bool(info.get("rlmppi_update_sigma", False))),
+                "rlmppi_num_rl_rollouts": float(info.get("rlmppi_num_rl_rollouts", 0.0)),
+                "rlmppi_num_mppi_rollouts": float(info.get("rlmppi_num_mppi_rollouts", 0.0)),
+                "rlmppi_num_iterations": float(info.get("rlmppi_num_iterations", 0.0)),
+                "rlmppi_top_z": float(info.get("rlmppi_top_z", 0.0)),
+                "rlmppi_sigma_mean": float(info.get("rlmppi_sigma_mean", 0.0)),
+                "rlmppi_sigma_min": float(info.get("rlmppi_sigma_min", 0.0)),
+                "rlmppi_sigma_max": float(info.get("rlmppi_sigma_max", 0.0)),
+                "rlmppi_cost_best": float(info.get("rlmppi_cost_best", 0.0)),
+                "rlmppi_cost_mean": float(info.get("rlmppi_cost_mean", 0.0)),
+                "rlmppi_online_time_ms": float(info.get("rlmppi_online_time_ms", 0.0)),
             })
 
         trace_rows.append({
@@ -523,6 +567,21 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
             "structured_candidate_risk_score": float(info.get("structured_candidate_risk_score", 0.0)),
             "structured_intervention_penalty": float(info.get("structured_intervention_penalty", 0.0)),
             "structured_target_jitter_penalty": float(info.get("structured_target_jitter_penalty", 0.0)),
+            "rlmppi_init_source": info.get("rlmppi_init_source", "none"),
+            "rlmppi_hss_enabled": int(bool(info.get("rlmppi_hss_enabled", False))),
+            "rlmppi_terminal_q_enabled": int(bool(info.get("rlmppi_terminal_q_enabled", False))),
+            "rlmppi_terminal_q_used": int(bool(info.get("rlmppi_terminal_q_used", False))),
+            "rlmppi_update_sigma": int(bool(info.get("rlmppi_update_sigma", False))),
+            "rlmppi_num_rl_rollouts": int(info.get("rlmppi_num_rl_rollouts", 0)),
+            "rlmppi_num_mppi_rollouts": int(info.get("rlmppi_num_mppi_rollouts", 0)),
+            "rlmppi_num_iterations": int(info.get("rlmppi_num_iterations", 0)),
+            "rlmppi_top_z": int(info.get("rlmppi_top_z", 0)),
+            "rlmppi_sigma_mean": float(info.get("rlmppi_sigma_mean", 0.0)),
+            "rlmppi_sigma_min": float(info.get("rlmppi_sigma_min", 0.0)),
+            "rlmppi_sigma_max": float(info.get("rlmppi_sigma_max", 0.0)),
+            "rlmppi_cost_best": float(info.get("rlmppi_cost_best", 0.0)),
+            "rlmppi_cost_mean": float(info.get("rlmppi_cost_mean", 0.0)),
+            "rlmppi_online_time_ms": float(info.get("rlmppi_online_time_ms", 0.0)),
             "terminal_reason": info.get("terminal_reason", "running"),
         })
         step_idx += 1
@@ -597,6 +656,8 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
                 "mean_source_hierarchical_mppi_v3": mean_debug(mppi_debug, "source_hierarchical_mppi_v3"),
                 "mean_source_hierarchical_mppi_v4": mean_debug(mppi_debug, "source_hierarchical_mppi_v4"),
                 "mean_source_hierarchical_mppi_v41": mean_debug(mppi_debug, "source_hierarchical_mppi_v41"),
+                "mean_source_rl_driven_mppi": mean_debug(mppi_debug, "source_rl_driven_mppi"),
+                "mean_source_pure_mppi": mean_debug(mppi_debug, "source_pure_mppi"),
                 "mean_mppi_triggered": mean_debug(mppi_debug, "mppi_triggered"),
                 "mean_candidate_accepted": mean_debug(mppi_debug, "candidate_accepted"),
                 "mean_sac_intent_target_speed": mean_debug(mppi_debug, "sac_intent_target_speed"),
@@ -649,6 +710,19 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
                 "mean_out_of_bounds_cost": mean_debug(mppi_debug, "out_of_bounds_cost"),
                 "mean_min_predicted_obstacle_distance": mean_debug(mppi_debug, "min_predicted_obstacle_distance"),
                 "mean_exploration_noise_scale": mean_debug(mppi_debug, "exploration_noise_scale"),
+                "mean_rlmppi_terminal_q_used": mean_debug(mppi_debug, "rlmppi_terminal_q_used"),
+                "mean_rlmppi_hss_enabled": mean_debug(mppi_debug, "rlmppi_hss_enabled"),
+                "mean_rlmppi_update_sigma": mean_debug(mppi_debug, "rlmppi_update_sigma"),
+                "mean_rlmppi_num_rl_rollouts": mean_debug(mppi_debug, "rlmppi_num_rl_rollouts"),
+                "mean_rlmppi_num_mppi_rollouts": mean_debug(mppi_debug, "rlmppi_num_mppi_rollouts"),
+                "mean_rlmppi_num_iterations": mean_debug(mppi_debug, "rlmppi_num_iterations"),
+                "mean_rlmppi_top_z": mean_debug(mppi_debug, "rlmppi_top_z"),
+                "mean_rlmppi_sigma_mean": mean_debug(mppi_debug, "rlmppi_sigma_mean"),
+                "mean_rlmppi_sigma_min": mean_debug(mppi_debug, "rlmppi_sigma_min"),
+                "mean_rlmppi_sigma_max": mean_debug(mppi_debug, "rlmppi_sigma_max"),
+                "mean_rlmppi_cost_best": mean_debug(mppi_debug, "rlmppi_cost_best"),
+                "mean_rlmppi_cost_mean": mean_debug(mppi_debug, "rlmppi_cost_mean"),
+                "mean_rlmppi_online_time_ms": mean_debug(mppi_debug, "rlmppi_online_time_ms"),
                 **mode_metrics,
             }
 
@@ -684,7 +758,16 @@ def run_mode(args, mode: str, model_path: str, obs_mode: str) -> List[Dict[str, 
     trace_dir = os.path.join(args.output_dir, "traces")
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(trace_dir, exist_ok=True)
-    vec_env = build_eval_env(mode, args.seed, log_dir, args.frame_stack, obs_mode)
+    rl_policy_model_path = model_path if mode in RLMPPI_MODES else None
+    vec_env = build_eval_env(
+        mode,
+        args.seed,
+        log_dir,
+        args.frame_stack,
+        obs_mode,
+        rl_policy_model_path=rl_policy_model_path,
+        device=args.device,
+    )
     model = SAC.load(model_path, env=vec_env, device=args.device)
 
     rows = []
@@ -807,6 +890,11 @@ def parse_args():
             "mppi_dbas",
             "trust_mppi",
             "trust_mppi_dbas",
+            "pure_mppi",
+            "rl_driven_mppi",
+            "rl_driven_mppi_no_hss",
+            "rl_driven_mppi_fixed_sigma",
+            "rl_driven_mppi_no_q",
             "hierarchical_mppi",
             "hierarchical_mppi_shield",
             "hierarchical_mppi_v2",
@@ -825,6 +913,7 @@ def parse_args():
             "hierarchical_ablation_v4",
             "both",
             "ablation",
+            "ablation_rlmppi",
         ],
         default="both",
     )
@@ -879,6 +968,15 @@ def main():
         modes = ["baseline", "shield_first"]
     elif args.mode == "ablation":
         modes = ["baseline", "shield_only", "shield_mppi_teacher", "shield_mppi_execute"]
+    elif args.mode == "ablation_rlmppi":
+        modes = [
+            "baseline",
+            "pure_mppi",
+            "rl_driven_mppi",
+            "rl_driven_mppi_no_hss",
+            "rl_driven_mppi_fixed_sigma",
+            "rl_driven_mppi_no_q",
+        ]
     elif args.mode == "hierarchical_ablation":
         modes = ["baseline", "shield_only", "hierarchical_mppi"]
     elif args.mode == "hierarchical_ablation_v2":

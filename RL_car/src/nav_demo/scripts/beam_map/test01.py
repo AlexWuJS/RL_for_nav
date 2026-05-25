@@ -20,15 +20,30 @@ from hierarchical_mppi_wrapper import (
 )
 from mppi_dbas import MPPIDBaSConfig
 from mppi_dbas_wrapper import MppiDbaSActionWrapper
+from rl_driven_mppi import RLDrivenMPPIActionWrapper, SB3SacPolicyAdapter, rl_driven_mppi_config
 from ros_env import MyCarEnv
 
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 
+RLMPPI_MODES = {
+    "pure_mppi",
+    "rl_driven_mppi",
+    "rl_driven_mppi_no_hss",
+    "rl_driven_mppi_fixed_sigma",
+    "rl_driven_mppi_no_q",
+}
+
+
 def config_for_mode(mode: str, seed: int) -> MPPIDBaSConfig | None:
     if mode in (
         "baseline",
+        "pure_mppi",
+        "rl_driven_mppi",
+        "rl_driven_mppi_no_hss",
+        "rl_driven_mppi_fixed_sigma",
+        "rl_driven_mppi_no_q",
         "hierarchical_mppi",
         "hierarchical_mppi_v2",
         "hierarchical_mppi_v3",
@@ -74,7 +89,7 @@ def config_for_mode(mode: str, seed: int) -> MPPIDBaSConfig | None:
     raise ValueError(f"Unsupported mode: {mode}")
 
 
-def make_env(mode: str, seed: int) -> gym.Env:
+def make_env(mode: str, seed: int, model_path: str | None = None, device: str = "auto") -> gym.Env:
     env = MyCarEnv()
     if mode == "hierarchical_mppi":
         return HierarchicalMppiWrapper(env, config=hierarchical_mppi_config(seed=seed))
@@ -90,6 +105,11 @@ def make_env(mode: str, seed: int) -> gym.Env:
         return HierarchicalMppiV4Wrapper(env, config=hierarchical_mppi_v4_config(seed=seed, reward_profile="compat"), reward_profile="compat")
     if mode == "hierarchical_mppi_v4_enhanced":
         return HierarchicalMppiV4Wrapper(env, config=hierarchical_mppi_v4_config(seed=seed, reward_profile="enhanced"), reward_profile="enhanced")
+    if mode in RLMPPI_MODES:
+        adapter = None
+        if model_path:
+            adapter = SB3SacPolicyAdapter(SAC.load(model_path, env=None, device=device))
+        return RLDrivenMPPIActionWrapper(env, config=rl_driven_mppi_config(mode, seed), policy_adapter=adapter)
     config = config_for_mode(mode, seed)
     if config is None:
         return env
@@ -100,34 +120,50 @@ def unwrap_env(env: gym.Env) -> gym.Env:
     return getattr(env, "unwrapped", env)
 
 
-def choose_model_path(model_arg: str | None) -> str | None:
-    candidates = [
-        model_arg,
-        "./training_hierarchical_mppi_v3_results/best_model.zip",
-        "./training_hierarchical_mppi_v3_results/best_model",
-        "./training_hierarchical_mppi_v3_results/final_model_hierarchical_v3.zip",
-        "./training_hierarchical_mppi_v41_guided_results/best_model.zip",
-        "./training_hierarchical_mppi_v41_guided_results/best_model",
-        "./training_hierarchical_mppi_v41_guided_results/final_model_hierarchical_v41_guided.zip",
-        "./training_hierarchical_mppi_v41_compat_results/best_model.zip",
-        "./training_hierarchical_mppi_v41_compat_results/best_model",
-        "./training_hierarchical_mppi_v41_compat_results/final_model_hierarchical_v41_compat.zip",
-        "./training_hierarchical_mppi_v4_compat_results/best_model.zip",
-        "./training_hierarchical_mppi_v4_compat_results/best_model",
-        "./training_hierarchical_mppi_v4_compat_results/final_model_hierarchical_v4_compat.zip",
-        "./training_hierarchical_mppi_v4_enhanced_results/best_model.zip",
-        "./training_hierarchical_mppi_v4_enhanced_results/best_model",
-        "./training_hierarchical_mppi_v4_enhanced_results/final_model_hierarchical_v4_enhanced.zip",
-        "./training_hierarchical_mppi_v2_results/best_model.zip",
-        "./training_hierarchical_mppi_v2_results/best_model",
-        "./training_hierarchical_mppi_v2_results/final_model_hierarchical_v2.zip",
-        "./training_hierarchical_mppi_results/best_model.zip",
-        "./training_hierarchical_mppi_results/best_model",
-        "./training_hierarchical_mppi_results/final_model_hierarchical.zip",
+def choose_model_path(model_arg: str | None, mode: str) -> str | None:
+    baseline_candidates = [
         "./training_usv_v2_results/best_model.zip",
         "./training_usv_v2_results/best_model",
         "./training_usv_v2_results/final_model_stacked.zip",
     ]
+    mode_candidates = {
+        "hierarchical_mppi": [
+            "./training_hierarchical_mppi_results/best_model.zip",
+            "./training_hierarchical_mppi_results/best_model",
+            "./training_hierarchical_mppi_results/final_model_hierarchical.zip",
+        ],
+        "hierarchical_mppi_v2": [
+            "./training_hierarchical_mppi_v2_results/best_model.zip",
+            "./training_hierarchical_mppi_v2_results/best_model",
+            "./training_hierarchical_mppi_v2_results/final_model_hierarchical_v2.zip",
+        ],
+        "hierarchical_mppi_v3": [
+            "./training_hierarchical_mppi_v3_results/best_model.zip",
+            "./training_hierarchical_mppi_v3_results/best_model",
+            "./training_hierarchical_mppi_v3_results/final_model_hierarchical_v3.zip",
+        ],
+        "hierarchical_mppi_v41_compat": [
+            "./training_hierarchical_mppi_v41_compat_results/best_model.zip",
+            "./training_hierarchical_mppi_v41_compat_results/best_model",
+            "./training_hierarchical_mppi_v41_compat_results/final_model_hierarchical_v41_compat.zip",
+        ],
+        "hierarchical_mppi_v41_guided": [
+            "./training_hierarchical_mppi_v41_guided_results/best_model.zip",
+            "./training_hierarchical_mppi_v41_guided_results/best_model",
+            "./training_hierarchical_mppi_v41_guided_results/final_model_hierarchical_v41_guided.zip",
+        ],
+        "hierarchical_mppi_v4_compat": [
+            "./training_hierarchical_mppi_v4_compat_results/best_model.zip",
+            "./training_hierarchical_mppi_v4_compat_results/best_model",
+            "./training_hierarchical_mppi_v4_compat_results/final_model_hierarchical_v4_compat.zip",
+        ],
+        "hierarchical_mppi_v4_enhanced": [
+            "./training_hierarchical_mppi_v4_enhanced_results/best_model.zip",
+            "./training_hierarchical_mppi_v4_enhanced_results/best_model",
+            "./training_hierarchical_mppi_v4_enhanced_results/final_model_hierarchical_v4_enhanced.zip",
+        ],
+    }
+    candidates = [model_arg] + mode_candidates.get(mode, baseline_candidates)
     for path in candidates:
         if path and os.path.exists(path):
             return path
@@ -144,6 +180,11 @@ def parse_args():
             "shield_first",
             "shield_mppi_teacher",
             "shield_mppi_execute",
+            "pure_mppi",
+            "rl_driven_mppi",
+            "rl_driven_mppi_no_hss",
+            "rl_driven_mppi_fixed_sigma",
+            "rl_driven_mppi_no_q",
             "hierarchical_mppi",
             "hierarchical_mppi_v2",
             "hierarchical_mppi_v3",
@@ -199,12 +240,17 @@ def print_shield_debug(step: int, info: dict, last_source: str | None, log_every
 
 def main():
     args = parse_args()
-    print(f"DEBUG: 启动仿真测试，mode={args.mode}")
+    print(f"DEBUG: starting Gazebo evaluation, mode={args.mode}")
+
+    model_path = choose_model_path(args.model, args.mode)
+    if model_path is None:
+        print("ERROR: model file not found. Please pass --model with a SAC model path.")
+        return
 
     raw_env_holder: dict[str, gym.Env] = {}
 
     def env_factory():
-        env = make_env(args.mode, args.seed)
+        env = make_env(args.mode, args.seed, model_path=model_path, device=args.device)
         raw_env_holder["env"] = env
         return env
 
@@ -214,14 +260,9 @@ def main():
 
     raw_env = raw_env_holder["env"]
 
-    model_path = choose_model_path(args.model)
-    if model_path is None:
-        print("错误：找不到模型文件，请使用 --model 指定 SAC 模型路径。")
-        return
-
     print(f"DEBUG: 加载模型: {model_path}")
     model = SAC.load(model_path, env=env, device=args.device)
-    print("DEBUG: 模型加载成功，开始导航测试。按 Ctrl+C 停止。")
+    print("DEBUG: model loaded; navigation test started. Press Ctrl+C to stop.")
 
     obs = env.reset()
     print_episode_header(raw_env, "第一回合")
