@@ -29,6 +29,7 @@ from hierarchical_mppi_wrapper import (
 from mppi_dbas import MPPIDBaSConfig
 from mppi_dbas_wrapper import MppiDbaSActionWrapper
 from rl_driven_mppi import (
+    DSACPolicyAdapter,
     RLDrivenMPPIActionWrapper,
     SB3SacPolicyAdapter,
     rl_driven_mppi_config,
@@ -46,6 +47,13 @@ RLMPPI_MODES = {
     "rl_driven_mppi_fixed_sigma",
     "rl_driven_mppi_no_q",
 }
+DSAC_RLMPPI_MODES = {
+    "dsac_rl_driven_mppi",
+    "dsac_rl_driven_mppi_no_hss",
+    "dsac_rl_driven_mppi_fixed_sigma",
+    "dsac_rl_driven_mppi_no_q",
+}
+DSAC_MODES = {"dsac"} | DSAC_RLMPPI_MODES
 
 
 def unwrap_env(env):
@@ -234,6 +242,16 @@ def make_env(mode: str, seed: int, log_dir: str, obs_mode: str, rl_policy_model_
                 config=rl_driven_mppi_config(mode, seed),
                 policy_adapter=adapter,
             )
+        elif mode in DSAC_RLMPPI_MODES:
+            if not rl_policy_model_path:
+                raise ValueError(f"{mode} requires --dsac-model or --model.")
+            env = RLDrivenMPPIActionWrapper(
+                env,
+                config=rl_driven_mppi_config(mode, seed),
+                policy_adapter=DSACPolicyAdapter.load(rl_policy_model_path, device=device),
+            )
+        elif mode == "dsac":
+            pass
         elif mode != "baseline":
             env = MppiDbaSActionWrapper(env, config_for_mode(mode, seed))
         if obs_mode == "dict":
@@ -393,6 +411,7 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
                 "source_hierarchical_mppi_v41": float(info.get("action_source", "sac") == "hierarchical_mppi_v41"),
                 "source_rl_driven_mppi": float(info.get("action_source", "sac") == "rl_driven_mppi"),
                 "source_pure_mppi": float(info.get("action_source", "sac") == "pure_mppi"),
+                "source_dsac_rl_driven_mppi": float(info.get("action_source", "sac") == "dsac_rl_driven_mppi"),
                 "mppi_triggered": float(bool(info.get("mppi_triggered", info.get("mppi_active", False)))),
                 "candidate_accepted": float(bool(info.get("candidate_accepted", info.get("mppi_accept", False)))),
                 "sac_intent_target_speed": float(info.get("sac_intent_target_speed", 0.0)),
@@ -658,6 +677,7 @@ def run_episode(model: SAC, vec_env, deterministic: bool, mode: str, episode_idx
                 "mean_source_hierarchical_mppi_v41": mean_debug(mppi_debug, "source_hierarchical_mppi_v41"),
                 "mean_source_rl_driven_mppi": mean_debug(mppi_debug, "source_rl_driven_mppi"),
                 "mean_source_pure_mppi": mean_debug(mppi_debug, "source_pure_mppi"),
+                "mean_source_dsac_rl_driven_mppi": mean_debug(mppi_debug, "source_dsac_rl_driven_mppi"),
                 "mean_mppi_triggered": mean_debug(mppi_debug, "mppi_triggered"),
                 "mean_candidate_accepted": mean_debug(mppi_debug, "candidate_accepted"),
                 "mean_sac_intent_target_speed": mean_debug(mppi_debug, "sac_intent_target_speed"),
@@ -758,7 +778,7 @@ def run_mode(args, mode: str, model_path: str, obs_mode: str) -> List[Dict[str, 
     trace_dir = os.path.join(args.output_dir, "traces")
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(trace_dir, exist_ok=True)
-    rl_policy_model_path = model_path if mode in RLMPPI_MODES else None
+    rl_policy_model_path = model_path if mode in (RLMPPI_MODES | DSAC_RLMPPI_MODES) else None
     vec_env = build_eval_env(
         mode,
         args.seed,
@@ -768,7 +788,12 @@ def run_mode(args, mode: str, model_path: str, obs_mode: str) -> List[Dict[str, 
         rl_policy_model_path=rl_policy_model_path,
         device=args.device,
     )
-    model = SAC.load(model_path, env=vec_env, device=args.device)
+    if mode in DSAC_MODES:
+        from dsac import DSACPolicy
+
+        model = DSACPolicy.load(model_path, device=args.device)
+    else:
+        model = SAC.load(model_path, env=vec_env, device=args.device)
 
     rows = []
     for episode_idx in range(args.episodes):
@@ -874,6 +899,7 @@ def parse_args():
     parser.add_argument("--hierarchical-v41-guided-model", default=None, help="Path to the structured hierarchical SAC-MPPI v4.1 guided model.")
     parser.add_argument("--hierarchical-v4-compat-model", default=None, help="Path to the semi-discrete hierarchical SAC-MPPI v4 compat model.")
     parser.add_argument("--hierarchical-v4-enhanced-model", default=None, help="Path to the semi-discrete hierarchical SAC-MPPI v4 enhanced model.")
+    parser.add_argument("--dsac-model", default=None, help="Path to a trained DSAC model directory.")
     parser.add_argument("--episodes", "--episode", type=int, default=30)
     parser.add_argument(
         "--mode",
@@ -890,6 +916,11 @@ def parse_args():
             "mppi_dbas",
             "trust_mppi",
             "trust_mppi_dbas",
+            "dsac",
+            "dsac_rl_driven_mppi",
+            "dsac_rl_driven_mppi_no_hss",
+            "dsac_rl_driven_mppi_fixed_sigma",
+            "dsac_rl_driven_mppi_no_q",
             "pure_mppi",
             "rl_driven_mppi",
             "rl_driven_mppi_no_hss",
@@ -914,6 +945,7 @@ def parse_args():
             "both",
             "ablation",
             "ablation_rlmppi",
+            "ablation_dsac_rlmppi",
         ],
         default="both",
     )
@@ -947,6 +979,8 @@ def model_path_for_mode(args, mode: str) -> str:
         model_path = args.hierarchical_v4_enhanced_model or args.hierarchical_model or args.model
     elif mode in ("hierarchical_mppi_v2", "hierarchical_mppi_v2_shield", "hierarchical_mppi_v2_consistency"):
         model_path = args.hierarchical_v2_model or args.hierarchical_model or args.model
+    elif mode in DSAC_MODES:
+        model_path = args.dsac_model or args.model
     elif mode in ("hierarchical_mppi", "hierarchical_mppi_shield"):
         model_path = args.hierarchical_model or args.model
     else:
@@ -957,6 +991,8 @@ def model_path_for_mode(args, mode: str) -> str:
 
 
 def obs_mode_for_model(args, model_path: str) -> str:
+    if model_path and os.path.isdir(model_path) and os.path.exists(os.path.join(model_path, "config.json")):
+        return args.obs_mode if args.obs_mode != "auto" else "flat"
     probe_model = SAC.load(model_path, env=None, device=args.device)
     return resolve_obs_mode(args.obs_mode, probe_model.observation_space)
 
@@ -976,6 +1012,16 @@ def main():
             "rl_driven_mppi_no_hss",
             "rl_driven_mppi_fixed_sigma",
             "rl_driven_mppi_no_q",
+        ]
+    elif args.mode == "ablation_dsac_rlmppi":
+        modes = [
+            "baseline",
+            "pure_mppi",
+            "dsac",
+            "dsac_rl_driven_mppi",
+            "dsac_rl_driven_mppi_no_hss",
+            "dsac_rl_driven_mppi_fixed_sigma",
+            "dsac_rl_driven_mppi_no_q",
         ]
     elif args.mode == "hierarchical_ablation":
         modes = ["baseline", "shield_only", "hierarchical_mppi"]

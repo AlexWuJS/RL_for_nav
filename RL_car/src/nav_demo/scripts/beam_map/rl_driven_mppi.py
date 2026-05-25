@@ -25,6 +25,9 @@ class RLDrivenMPPIConfig(MPPIDBaSConfig):
     use_terminal_q: bool = True
     terminal_q_weight: float = 0.001
     pure_mppi: bool = False
+    strict_terminal_q: bool = False
+    observation_stack: int = 1
+    controller_name: str = "rl_driven_mppi"
 
 
 class SB3SacPolicyAdapter:
@@ -76,6 +79,51 @@ class SB3SacPolicyAdapter:
             return float(-q_value.detach().cpu().numpy().reshape(-1)[0]), True
         except Exception:
             return 0.0, False
+
+
+class DSACPolicyAdapter:
+    """Strict adapter for DSAC actor and distributional critic."""
+
+    def __init__(self, policy: Any):
+        self.policy = policy
+
+    @classmethod
+    def load(cls, path: str, device: str = "auto") -> "DSACPolicyAdapter":
+        from dsac import DSACPolicy
+
+        return cls(DSACPolicy.load(path, device=device))
+
+    def predict_mean(self, observation: Any, fallback_action: np.ndarray) -> np.ndarray:
+        action, _ = self.policy.predict(observation, deterministic=True)
+        return np.asarray(action, dtype=float).reshape(-1)[:2]
+
+    def sample_action(self, observation: Any, fallback_action: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+        action, _ = self.policy.predict(observation, deterministic=False)
+        return np.asarray(action, dtype=float).reshape(-1)[:2]
+
+    def action_std(self, observation: Any = None) -> np.ndarray:
+        if observation is None:
+            raise ValueError("DSACPolicyAdapter requires an observation for action_std().")
+        return np.asarray(self.policy.action_std(observation), dtype=float).reshape(-1)[:2]
+
+    def estimate_terminal_cost(self, observation: Any, action: np.ndarray) -> Tuple[float, bool]:
+        if observation is None:
+            raise ValueError("DSAC terminal cost requires a stacked observation.")
+        return float(self.policy.terminal_cost(observation, action)), True
+
+
+class TransitionModel:
+    """Interface reserved for learned dynamics models used by MPPI rollouts."""
+
+    def predict_next(self, state: Dict[str, Any], action: np.ndarray) -> Dict[str, Any]:
+        raise NotImplementedError
+
+
+class USVApproxTransitionModel(TransitionModel):
+    """Marker for the current analytic USV rollout implemented in the optimizer."""
+
+    def predict_next(self, state: Dict[str, Any], action: np.ndarray) -> Dict[str, Any]:
+        raise NotImplementedError("The analytic USV rollout is implemented by RLDrivenMPPIOptimizer._rollout_metrics().")
 
 
 class RLDrivenMPPIOptimizer(MPPIDBaSOptimizer):
@@ -188,7 +236,13 @@ class RLDrivenMPPIOptimizer(MPPIDBaSOptimizer):
             mean = np.tile(policy_mean.reshape(1, 2), (cfg.horizon, 1))
             source = "rl_policy"
 
-        initial_sigma = self.policy_adapter.action_std() if cfg.use_rl_initialization and not cfg.pure_mppi else np.asarray(cfg.initial_sigma)
+        if cfg.use_rl_initialization and not cfg.pure_mppi:
+            try:
+                initial_sigma = self.policy_adapter.action_std(observation)
+            except TypeError:
+                initial_sigma = self.policy_adapter.action_std()
+        else:
+            initial_sigma = np.asarray(cfg.initial_sigma)
         sigma = np.tile(np.asarray(initial_sigma, dtype=float).reshape(1, 2), (cfg.horizon, 1))
         sigma = np.maximum(sigma, np.asarray(cfg.sigma_min, dtype=float).reshape(1, 2))
         return self._clip_sequence(mean), sigma, source
@@ -248,7 +302,14 @@ class RLDrivenMPPIOptimizer(MPPIDBaSOptimizer):
         cfg = self.config
         if cfg.pure_mppi or not cfg.use_terminal_q:
             return 0.0, False
-        terminal_cost, used = self.policy_adapter.estimate_terminal_cost(observation, action)
+        try:
+            terminal_cost, used = self.policy_adapter.estimate_terminal_cost(observation, action)
+        except Exception:
+            if cfg.strict_terminal_q:
+                raise
+            return 0.0, False
+        if cfg.strict_terminal_q and not used:
+            raise RuntimeError("Strict RL-driven MPPI requires DSAC terminal critic cost.")
         return float(cfg.terminal_q_weight * terminal_cost), bool(used)
 
     def _make_debug(
@@ -286,8 +347,8 @@ class RLDrivenMPPIOptimizer(MPPIDBaSOptimizer):
             "mppi_reject": False,
             "mppi_selected": True,
             "mppi_dbas_enabled": True,
-            "action_source": "rl_driven_mppi" if not cfg.pure_mppi else "pure_mppi",
-            "terminal_source": "rl_driven_mppi" if not cfg.pure_mppi else "pure_mppi",
+            "action_source": cfg.controller_name if not cfg.pure_mppi else "pure_mppi",
+            "terminal_source": cfg.controller_name if not cfg.pure_mppi else "pure_mppi",
             "mppi_decision_reason": "rl_driven_mppi_update" if not cfg.pure_mppi else "pure_mppi_update",
             "selected_reason": "select_rl_driven_mppi" if not cfg.pure_mppi else "select_pure_mppi",
             "reject_reason": "none",
@@ -353,6 +414,14 @@ class RLDrivenMPPIOptimizer(MPPIDBaSOptimizer):
 
 
 def rl_driven_mppi_config(mode: str, seed: int) -> RLDrivenMPPIConfig:
+    if mode == "dsac_rl_driven_mppi":
+        return RLDrivenMPPIConfig(seed=seed, strict_terminal_q=True, observation_stack=4, controller_name="dsac_rl_driven_mppi")
+    if mode == "dsac_rl_driven_mppi_no_hss":
+        return RLDrivenMPPIConfig(seed=seed, use_hss=False, strict_terminal_q=True, observation_stack=4, controller_name="dsac_rl_driven_mppi")
+    if mode == "dsac_rl_driven_mppi_fixed_sigma":
+        return RLDrivenMPPIConfig(seed=seed, update_sigma=False, strict_terminal_q=True, observation_stack=4, controller_name="dsac_rl_driven_mppi")
+    if mode == "dsac_rl_driven_mppi_no_q":
+        return RLDrivenMPPIConfig(seed=seed, use_terminal_q=False, strict_terminal_q=False, observation_stack=4, controller_name="dsac_rl_driven_mppi")
     if mode == "pure_mppi":
         return RLDrivenMPPIConfig(
             seed=seed,
@@ -382,19 +451,24 @@ class RLDrivenMPPIActionWrapper(gym.Wrapper):
         super().__init__(env)
         self.optimizer = RLDrivenMPPIOptimizer(config, policy_adapter)
         self.last_observation = None
+        self.observation_stack = int(self.optimizer.config.observation_stack)
+        self._obs_history = []
 
     def reset(self, **kwargs):
         self.optimizer.reset()
         obs, info = self.env.reset(**kwargs)
         self.last_observation = obs
+        self._obs_history = [np.asarray(obs, dtype=np.float32).copy() for _ in range(max(self.observation_stack, 1))]
         return obs, info
 
     def step(self, action):
         planner_state = self.env.get_planner_state()
         raw_action = np.asarray(action, dtype=np.float32).reshape(-1)[:2]
-        optimized_action, debug = self.optimizer.optimize(raw_action, planner_state, self.last_observation)
+        adapter_observation = self._stacked_observation()
+        optimized_action, debug = self.optimizer.optimize(raw_action, planner_state, adapter_observation)
         obs, reward, terminated, truncated, info = self.env.step(optimized_action)
         self.last_observation = obs
+        self._push_observation(obs)
         info = dict(info)
         info.update(debug)
         info["raw_action"] = raw_action.astype(np.float32)
@@ -405,3 +479,17 @@ class RLDrivenMPPIActionWrapper(gym.Wrapper):
 
     def get_planner_state(self):
         return self.env.get_planner_state()
+
+    def _push_observation(self, obs: Any) -> None:
+        if self.observation_stack <= 1:
+            self._obs_history = [np.asarray(obs, dtype=np.float32).copy()]
+            return
+        self._obs_history.append(np.asarray(obs, dtype=np.float32).copy())
+        self._obs_history = self._obs_history[-self.observation_stack :]
+
+    def _stacked_observation(self):
+        if not self._obs_history:
+            return self.last_observation
+        if self.observation_stack <= 1:
+            return self._obs_history[-1]
+        return np.concatenate([np.asarray(obs, dtype=np.float32).reshape(-1) for obs in self._obs_history], axis=0)

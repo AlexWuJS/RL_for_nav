@@ -20,7 +20,7 @@ from hierarchical_mppi_wrapper import (
 )
 from mppi_dbas import MPPIDBaSConfig
 from mppi_dbas_wrapper import MppiDbaSActionWrapper
-from rl_driven_mppi import RLDrivenMPPIActionWrapper, SB3SacPolicyAdapter, rl_driven_mppi_config
+from rl_driven_mppi import DSACPolicyAdapter, RLDrivenMPPIActionWrapper, SB3SacPolicyAdapter, rl_driven_mppi_config
 from ros_env import MyCarEnv
 
 
@@ -34,6 +34,13 @@ RLMPPI_MODES = {
     "rl_driven_mppi_fixed_sigma",
     "rl_driven_mppi_no_q",
 }
+DSAC_RLMPPI_MODES = {
+    "dsac_rl_driven_mppi",
+    "dsac_rl_driven_mppi_no_hss",
+    "dsac_rl_driven_mppi_fixed_sigma",
+    "dsac_rl_driven_mppi_no_q",
+}
+DSAC_MODES = {"dsac"} | DSAC_RLMPPI_MODES
 
 
 def config_for_mode(mode: str, seed: int) -> MPPIDBaSConfig | None:
@@ -44,6 +51,11 @@ def config_for_mode(mode: str, seed: int) -> MPPIDBaSConfig | None:
         "rl_driven_mppi_no_hss",
         "rl_driven_mppi_fixed_sigma",
         "rl_driven_mppi_no_q",
+        "dsac",
+        "dsac_rl_driven_mppi",
+        "dsac_rl_driven_mppi_no_hss",
+        "dsac_rl_driven_mppi_fixed_sigma",
+        "dsac_rl_driven_mppi_no_q",
         "hierarchical_mppi",
         "hierarchical_mppi_v2",
         "hierarchical_mppi_v3",
@@ -110,6 +122,16 @@ def make_env(mode: str, seed: int, model_path: str | None = None, device: str = 
         if model_path:
             adapter = SB3SacPolicyAdapter(SAC.load(model_path, env=None, device=device))
         return RLDrivenMPPIActionWrapper(env, config=rl_driven_mppi_config(mode, seed), policy_adapter=adapter)
+    if mode in DSAC_RLMPPI_MODES:
+        if not model_path:
+            raise ValueError(f"{mode} requires a DSAC model path.")
+        return RLDrivenMPPIActionWrapper(
+            env,
+            config=rl_driven_mppi_config(mode, seed),
+            policy_adapter=DSACPolicyAdapter.load(model_path, device=device),
+        )
+    if mode == "dsac":
+        return env
     config = config_for_mode(mode, seed)
     if config is None:
         return env
@@ -127,6 +149,26 @@ def choose_model_path(model_arg: str | None, mode: str) -> str | None:
         "./training_usv_v2_results/final_model_stacked.zip",
     ]
     mode_candidates = {
+        "dsac": [
+            "./training_dsac_usv_results/best_model",
+            "./training_dsac_usv_results/final_model_dsac",
+        ],
+        "dsac_rl_driven_mppi": [
+            "./training_dsac_usv_results/best_model",
+            "./training_dsac_usv_results/final_model_dsac",
+        ],
+        "dsac_rl_driven_mppi_no_hss": [
+            "./training_dsac_usv_results/best_model",
+            "./training_dsac_usv_results/final_model_dsac",
+        ],
+        "dsac_rl_driven_mppi_fixed_sigma": [
+            "./training_dsac_usv_results/best_model",
+            "./training_dsac_usv_results/final_model_dsac",
+        ],
+        "dsac_rl_driven_mppi_no_q": [
+            "./training_dsac_usv_results/best_model",
+            "./training_dsac_usv_results/final_model_dsac",
+        ],
         "hierarchical_mppi": [
             "./training_hierarchical_mppi_results/best_model.zip",
             "./training_hierarchical_mppi_results/best_model",
@@ -185,6 +227,11 @@ def parse_args():
             "rl_driven_mppi_no_hss",
             "rl_driven_mppi_fixed_sigma",
             "rl_driven_mppi_no_q",
+            "dsac",
+            "dsac_rl_driven_mppi",
+            "dsac_rl_driven_mppi_no_hss",
+            "dsac_rl_driven_mppi_fixed_sigma",
+            "dsac_rl_driven_mppi_no_q",
             "hierarchical_mppi",
             "hierarchical_mppi_v2",
             "hierarchical_mppi_v3",
@@ -261,7 +308,12 @@ def main():
     raw_env = raw_env_holder["env"]
 
     print(f"DEBUG: 加载模型: {model_path}")
-    model = SAC.load(model_path, env=env, device=args.device)
+    if args.mode in DSAC_MODES:
+        from dsac import DSACPolicy
+
+        model = DSACPolicy.load(model_path, device=args.device)
+    else:
+        model = SAC.load(model_path, env=env, device=args.device)
     print("DEBUG: model loaded; navigation test started. Press Ctrl+C to stop.")
 
     obs = env.reset()
