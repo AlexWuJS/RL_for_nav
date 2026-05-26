@@ -10,7 +10,7 @@ from geometry_msgs.msg import Pose
 from visualization_msgs.msg import Marker, MarkerArray
 import math
 import tf.transformations
-from frenet_utils import FrenetTransform, frenet_reward
+from frenet_utils import FrenetTransform, compute_tracking_reward
 
 class MyCarEnv(gym.Env):
     def __init__(self):
@@ -42,6 +42,7 @@ class MyCarEnv(gym.Env):
         self.frenet_transform = None
         self.start_pos = np.array([0.0, 0.0])
         self.last_frenet_s = 0.0
+        self.last_abs_frenet_d = 0.0
         
         self.pub_cmd_vel = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
         
@@ -195,7 +196,6 @@ class MyCarEnv(gym.Env):
         # ---------------------------------------------------------
         
         # 7.1 终结状态判别：碰撞惩罚与到达终点奖励
-        max_frenet_d_allowed = 3.0
 
         if min_laser_dist < 0.25:
             reward = -100.0
@@ -203,38 +203,23 @@ class MyCarEnv(gym.Env):
             terminal_reason = "collision"
             print("Collision detected!")
             
-        elif abs(frenet_d) > max_frenet_d_allowed:  # 越界死亡逻辑
-            reward = -100.0
-            terminated = True
-            terminal_reason = "out_of_bounds"
-            print(f"Out of bounds! Deviated {frenet_d:.2f}m from path.")
-            
-        elif distance_remaining < self.goal_reach_threshold:
+        elif distance_remaining < self.goal_reach_threshold and abs(frenet_d) <= 1.0:
             reward = +1000.0
             terminated = True
             terminal_reason = "success"
             print("Goal reached!")
             
         else:
-            # 7.2 路径跟踪奖励 (Frenet，放大2.5倍鼓励探索)
-            frenet_reward_dict = frenet_reward(delta_s, frenet_d, heading_to_path)
-            frenet_amplification_factor = 2.5
-            reward += frenet_reward_dict['total'] * frenet_amplification_factor
-
-            # 7.3 安全避障惩罚（收缩边界，k=5.0，上限10.0）
-            safe_distance = 0.45
-            if min_laser_dist < safe_distance:
-                k = 5.0
-                penalty = math.exp(k * (safe_distance - min_laser_dist)) - 1
-                reward -= min(penalty, 10.0)  # 上限-10
-
-            # 7.4 动作平滑度约束（削弱系数，降低前期探索阻力）
-            surge_change_penalty = abs(action[0] - self.last_action[0]) * 0.2
-            yaw_change_penalty = abs(action[1] - self.last_action[1]) * 0.1
-            reward -= surge_change_penalty + yaw_change_penalty
-
-            # 7.5 存活时间惩罚
-            reward -= 0.1
+            reward_dict = compute_tracking_reward(
+                delta_s,
+                frenet_d,
+                heading_to_path,
+                min_obstacle_dist=min_laser_dist,
+                previous_abs_frenet_d=self.last_abs_frenet_d,
+                action=action,
+                previous_action=self.last_action,
+            )
+            reward += reward_dict["total"]
 
         # ---------------------------------------------------------
 
@@ -247,6 +232,7 @@ class MyCarEnv(gym.Env):
 
         # 9. 更新上一帧的 s 值
         self.last_frenet_s = frenet_s
+        self.last_abs_frenet_d = abs(float(frenet_d))
         # 10. 更新上一帧动作（用于下一step的动作平滑度惩罚）
         self.last_action = np.array([float(action[0]), float(action[1])])
 
@@ -263,10 +249,10 @@ class MyCarEnv(gym.Env):
             "frenet_d": float(frenet_d),
             "heading_to_path": float(heading_to_path),
             "min_laser_dist": float(min_laser_dist),
-            "is_success": bool(distance_remaining < self.goal_reach_threshold),
+            "is_success": bool(distance_remaining < self.goal_reach_threshold and abs(frenet_d) <= 1.0),
             "is_collision": bool(min_laser_dist < 0.25),
             "is_timeout": bool(truncated),
-            "is_out_of_bounds": bool(terminal_reason == "out_of_bounds"),
+            "is_out_of_bounds": bool(abs(frenet_d) > 3.0),
             "terminal_reason": terminal_reason,
         }
 
@@ -280,6 +266,7 @@ class MyCarEnv(gym.Env):
         self.velocity = np.array([0.0, 0.0, 0.0])
         # 重置动作平滑度状态
         self.last_action = np.array([0.0, 0.0])
+        self.last_abs_frenet_d = 0.0
 
         range_limit = 20.0
         start_x = np.random.uniform(-range_limit/2, range_limit/2)
@@ -338,6 +325,7 @@ class MyCarEnv(gym.Env):
         self.current_pos = np.array([start_x, start_y])
         self.current_yaw = yaw
         self.last_frenet_s = 0.0
+        self.last_abs_frenet_d = 0.0
         path_length = self.frenet_transform.path_length
         self.max_steps = int((path_length / 0.2) * 10 * 2) + 200
 

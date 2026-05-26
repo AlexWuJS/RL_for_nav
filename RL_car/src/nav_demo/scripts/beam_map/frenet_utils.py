@@ -164,6 +164,136 @@ def frenet_reward(delta_s: float, frenet_d: float, heading_error: float) -> dict
     return {'total': reward, 'components': components}
 
 
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, float(value)))
+
+
+def obstacle_tracking_scale(
+    min_obstacle_dist: float = None,
+    near_distance: float = 0.6,
+    far_distance: float = 1.5,
+    min_scale: float = 0.45,
+) -> float:
+    """Return the lateral tracking weight under obstacle pressure."""
+    if min_obstacle_dist is None or not np.isfinite(min_obstacle_dist):
+        return 1.0
+    if min_obstacle_dist <= near_distance:
+        return float(min_scale)
+    if min_obstacle_dist >= far_distance:
+        return 1.0
+    ratio = (float(min_obstacle_dist) - near_distance) / max(far_distance - near_distance, 1e-6)
+    smooth = ratio * ratio * (3.0 - 2.0 * ratio)
+    return float(min_scale + (1.0 - min_scale) * smooth)
+
+
+def piecewise_lateral_penalty(frenet_d: float) -> float:
+    """Positive soft-boundary cost for lateral path deviation."""
+    abs_d = abs(float(frenet_d))
+    if abs_d <= 0.35:
+        return 0.0
+    if abs_d <= 1.2:
+        return float(5.0 * (abs_d - 0.35) ** 2)
+    stage_1 = 5.0 * (1.2 - 0.35) ** 2
+    if abs_d <= 2.4:
+        return float(stage_1 + 14.0 * (abs_d - 1.2) ** 2)
+    stage_2 = stage_1 + 14.0 * (2.4 - 1.2) ** 2
+    excess = abs_d - 2.4
+    return float(stage_2 + 80.0 * excess * excess + 45.0 * excess)
+
+
+def obstacle_avoidance_penalty(min_obstacle_dist: float = None, safe_distance: float = 0.45) -> float:
+    if min_obstacle_dist is None or not np.isfinite(min_obstacle_dist):
+        return 0.0
+    if min_obstacle_dist >= safe_distance:
+        return 0.0
+    penalty = math.exp(5.0 * (safe_distance - float(min_obstacle_dist))) - 1.0
+    return float(min(penalty, 10.0))
+
+
+def compute_tracking_reward(
+    delta_s: float,
+    frenet_d: float,
+    heading_error: float,
+    min_obstacle_dist: float = None,
+    previous_abs_frenet_d: float = None,
+    safe_distance: float = 0.45,
+    action=None,
+    previous_action=None,
+    progress_gain: float = 30.0,
+    heading_gain: float = 1.5,
+    recovery_gain: float = 8.0,
+    reward_scale: float = 2.5,
+    living_penalty: float = 0.1,
+) -> dict:
+    """Shared DSAC/MPPI reward with soft path boundaries and obstacle-aware tracking."""
+    abs_d = abs(float(frenet_d))
+    tracking_scale = obstacle_tracking_scale(min_obstacle_dist)
+    track_factor = clamp(1.0 - abs_d / 3.0, 0.0, 1.0)
+    lateral_cost = piecewise_lateral_penalty(abs_d)
+
+    progress_reward = float(delta_s) * progress_gain * track_factor
+    lateral_penalty = -tracking_scale * lateral_cost
+    heading_penalty = -(abs(float(heading_error)) / math.pi) * heading_gain
+
+    recover_center_bonus = 0.0
+    if previous_abs_frenet_d is not None and np.isfinite(previous_abs_frenet_d):
+        recovery = float(previous_abs_frenet_d) - abs_d
+        recover_center_bonus = clamp(recovery_gain * recovery * tracking_scale, -4.0, 4.0)
+
+    obstacle_penalty = -obstacle_avoidance_penalty(min_obstacle_dist, safe_distance)
+
+    smoothness_penalty = 0.0
+    if action is not None and previous_action is not None:
+        action_arr = np.asarray(action, dtype=float).reshape(-1)
+        prev_arr = np.asarray(previous_action, dtype=float).reshape(-1)
+        if action_arr.size >= 2 and prev_arr.size >= 2:
+            smoothness_penalty = -(
+                abs(float(action_arr[0] - prev_arr[0])) * 0.2
+                + abs(float(action_arr[1] - prev_arr[1])) * 0.1
+            )
+
+    components = {
+        "s_progress": progress_reward,
+        "track_factor": track_factor,
+        "tracking_scale": tracking_scale,
+        "lateral_deviation": lateral_penalty,
+        "lateral_barrier_cost": lateral_cost,
+        "heading_penalty": heading_penalty,
+        "recover_center_bonus": recover_center_bonus,
+        "obstacle_penalty": obstacle_penalty,
+        "smoothness_penalty": smoothness_penalty,
+        "living_penalty": -float(living_penalty),
+    }
+    shaped_total = (
+        progress_reward
+        + lateral_penalty
+        + heading_penalty
+        + recover_center_bonus
+    ) * reward_scale
+    total = shaped_total + obstacle_penalty + smoothness_penalty - float(living_penalty)
+    return {"total": float(total), "components": components}
+
+
+def frenet_reward(
+    delta_s: float,
+    frenet_d: float,
+    heading_error: float,
+    min_obstacle_dist: float = None,
+    previous_abs_frenet_d: float = None,
+) -> dict:
+    """Backward-compatible wrapper around the shared tracking reward."""
+    return compute_tracking_reward(
+        delta_s,
+        frenet_d,
+        heading_error,
+        min_obstacle_dist=min_obstacle_dist,
+        previous_abs_frenet_d=previous_abs_frenet_d,
+        action=None,
+        previous_action=None,
+        living_penalty=0.0,
+    )
+
+
 if __name__ == "__main__":
     # ==========================================
     # 交互与可视化测试

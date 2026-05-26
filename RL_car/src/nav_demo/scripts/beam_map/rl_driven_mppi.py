@@ -156,7 +156,7 @@ class RLDrivenMPPIOptimizer(MPPIDBaSOptimizer):
         base_action = self._clip_action(base_action)
         obstacles = self._scan_to_obstacle_points(planner_state)
         base_sequence = np.tile(base_action.reshape(1, 2), (cfg.horizon, 1))
-        base_metrics = self._rollout_metrics(base_sequence, base_action, planner_state, obstacles)
+        base_metrics = self._sequence_metrics(base_sequence, base_action, planner_state, obstacles)
 
         mean_sequence, sigma_sequence, init_source = self._initial_distribution(base_action, observation)
         guided_sequences = self._sample_guided_rollouts(mean_sequence, sigma_sequence, observation, base_action)
@@ -216,6 +216,17 @@ class RLDrivenMPPIOptimizer(MPPIDBaSOptimizer):
             action_delta=action_delta,
         )
         return executed.astype(np.float32), debug
+
+    def _sequence_metrics(
+        self,
+        sequence: np.ndarray,
+        base_action: np.ndarray,
+        planner_state: Dict[str, Any],
+        obstacles: Optional[np.ndarray],
+    ) -> Dict[str, float]:
+        if self.config.use_reward_aligned_cost:
+            return self._reward_aligned_rollout(sequence, base_action, planner_state, obstacles)
+        return self._rollout_metrics(sequence, base_action, planner_state, obstacles)
 
     def _initial_distribution(
         self,
@@ -288,7 +299,7 @@ class RLDrivenMPPIOptimizer(MPPIDBaSOptimizer):
         metrics = []
         q_used_flags = []
         for sequence in sequences:
-            rollout_metrics = self._rollout_metrics(sequence, base_action, planner_state, obstacles)
+            rollout_metrics = self._sequence_metrics(sequence, base_action, planner_state, obstacles)
             terminal_cost, q_used = self._terminal_cost(observation, sequence[-1])
             cost = float(rollout_metrics["total_cost"] + terminal_cost)
             enriched = dict(rollout_metrics)
@@ -415,13 +426,13 @@ class RLDrivenMPPIOptimizer(MPPIDBaSOptimizer):
 
 def rl_driven_mppi_config(mode: str, seed: int) -> RLDrivenMPPIConfig:
     if mode == "dsac_rl_driven_mppi":
-        return RLDrivenMPPIConfig(seed=seed, strict_terminal_q=True, observation_stack=4, controller_name="dsac_rl_driven_mppi")
+        return RLDrivenMPPIConfig(seed=seed, strict_terminal_q=True, observation_stack=4, controller_name="dsac_rl_driven_mppi", use_reward_aligned_cost=True, terminal_q_weight=0.05)
     if mode == "dsac_rl_driven_mppi_no_hss":
-        return RLDrivenMPPIConfig(seed=seed, use_hss=False, strict_terminal_q=True, observation_stack=4, controller_name="dsac_rl_driven_mppi")
+        return RLDrivenMPPIConfig(seed=seed, use_hss=False, strict_terminal_q=True, observation_stack=4, controller_name="dsac_rl_driven_mppi", use_reward_aligned_cost=True, terminal_q_weight=0.05)
     if mode == "dsac_rl_driven_mppi_fixed_sigma":
-        return RLDrivenMPPIConfig(seed=seed, update_sigma=False, strict_terminal_q=True, observation_stack=4, controller_name="dsac_rl_driven_mppi")
+        return RLDrivenMPPIConfig(seed=seed, update_sigma=False, strict_terminal_q=True, observation_stack=4, controller_name="dsac_rl_driven_mppi", use_reward_aligned_cost=True, terminal_q_weight=0.05)
     if mode == "dsac_rl_driven_mppi_no_q":
-        return RLDrivenMPPIConfig(seed=seed, use_terminal_q=False, strict_terminal_q=False, observation_stack=4, controller_name="dsac_rl_driven_mppi")
+        return RLDrivenMPPIConfig(seed=seed, use_terminal_q=False, strict_terminal_q=False, observation_stack=4, controller_name="dsac_rl_driven_mppi", use_reward_aligned_cost=True)
     if mode == "pure_mppi":
         return RLDrivenMPPIConfig(
             seed=seed,
@@ -429,6 +440,7 @@ def rl_driven_mppi_config(mode: str, seed: int) -> RLDrivenMPPIConfig:
             use_rl_initialization=False,
             use_hss=False,
             use_terminal_q=False,
+            use_reward_aligned_cost=True,
         )
     if mode == "rl_driven_mppi_no_hss":
         return RLDrivenMPPIConfig(seed=seed, use_hss=False)

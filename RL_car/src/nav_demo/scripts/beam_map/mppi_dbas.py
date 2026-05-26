@@ -274,21 +274,37 @@ def _dynamic_lateral_offset_limit_v3(
 
 
 try:
-    from frenet_utils import frenet_reward
+    from frenet_utils import compute_tracking_reward, piecewise_lateral_penalty
 except ImportError:
-    def frenet_reward(delta_s: float, frenet_d: float, heading_error: float) -> dict:
-        abs_d = abs(frenet_d)
-        lateral_penalty = 0.0 if abs_d <= 0.5 else max(-(abs_d - 0.5) * 1.5, -5.0)
-        heading_penalty = -(abs(heading_error) / math.pi) * 1.5
-        total = delta_s * 30.0 + lateral_penalty + heading_penalty
-        return {
-            "total": total,
-            "components": {
-                "s_progress": delta_s * 30.0,
-                "lateral_deviation": lateral_penalty,
-                "heading_penalty": heading_penalty,
-            },
-        }
+    def piecewise_lateral_penalty(frenet_d: float) -> float:
+        abs_d = abs(float(frenet_d))
+        if abs_d <= 0.35:
+            return 0.0
+        if abs_d <= 1.2:
+            return float(5.0 * (abs_d - 0.35) ** 2)
+        stage_1 = 5.0 * (1.2 - 0.35) ** 2
+        if abs_d <= 2.4:
+            return float(stage_1 + 14.0 * (abs_d - 1.2) ** 2)
+        stage_2 = stage_1 + 14.0 * (2.4 - 1.2) ** 2
+        excess = abs_d - 2.4
+        return float(stage_2 + 80.0 * excess * excess + 45.0 * excess)
+
+    def compute_tracking_reward(
+        delta_s: float,
+        frenet_d: float,
+        heading_error: float,
+        min_obstacle_dist: float = None,
+        previous_abs_frenet_d: float = None,
+        action=None,
+        previous_action=None,
+        **kwargs,
+    ) -> dict:
+        abs_d = abs(float(frenet_d))
+        track_factor = max(0.0, min(1.0, 1.0 - abs_d / 3.0))
+        lateral_penalty = -piecewise_lateral_penalty(abs_d)
+        heading_penalty = -(abs(float(heading_error)) / math.pi) * 1.5
+        total = (float(delta_s) * 30.0 * track_factor + lateral_penalty + heading_penalty) * 2.5
+        return {"total": float(total), "components": {}}
 
 
 @dataclass
@@ -2146,12 +2162,14 @@ class MPPIDBaSOptimizer:
         prev_action = np.asarray(planner_state.get("last_action", self.last_action), dtype=float).reshape(-1)[:2]
 
         if frenet_transform is not None:
-            prev_s, _ = frenet_transform.cartesian_to_frenet(position)
+            prev_s, prev_d = frenet_transform.cartesian_to_frenet(position)
             start_s = float(prev_s)
+            prev_abs_d = abs(float(prev_d))
             path_length = float(frenet_transform.path_length)
         else:
             prev_s = 0.0
             start_s = 0.0
+            prev_abs_d = 0.0
             path_length = float(np.linalg.norm(target - position) + 1.0)
 
         predicted_reward = 0.0
@@ -2206,30 +2224,28 @@ class MPPIDBaSOptimizer:
                 terminal_step = step_idx
                 break
             if lateral_error > cfg.env_out_of_bounds_limit:
-                predicted_reward -= cfg.env_terminal_reward
-                hard_safety_penalty += cfg.hard_safety_penalty
-                total_oob_cost += (lateral_error - cfg.env_out_of_bounds_limit) ** 2 + 1.0
-                terminal = "out_of_bounds"
-                terminal_step = step_idx
-                break
-            if distance_remaining < cfg.env_goal_threshold:
+                total_oob_cost += piecewise_lateral_penalty(lateral_error)
+            if distance_remaining < cfg.env_goal_threshold and lateral_error <= 1.0:
                 predicted_reward += cfg.env_success_reward
                 terminal = "success"
                 terminal_step = step_idx
                 break
 
-            env_reward = (
-                delta_s * 30.0
-                - self._piecewise_lateral_penalty(lateral_error)
-                - (abs(float(heading_error)) / math.pi) * 1.5
-            ) * cfg.env_frenet_reward_scale
-            if obstacle_dist < cfg.env_safe_distance:
-                penalty = math.exp(5.0 * (cfg.env_safe_distance - obstacle_dist)) - 1.0
-                env_reward -= min(penalty, 10.0)
-            env_reward -= abs(action[0] - prev_action[0]) * 0.2 + abs(action[1] - prev_action[1]) * 0.1
-            env_reward -= 0.1
+            reward_info = compute_tracking_reward(
+                delta_s,
+                frenet_d,
+                heading_error,
+                min_obstacle_dist=obstacle_dist,
+                previous_abs_frenet_d=prev_abs_d,
+                safe_distance=cfg.env_safe_distance,
+                action=action,
+                previous_action=prev_action,
+                reward_scale=cfg.env_frenet_reward_scale,
+            )
+            env_reward = float(reward_info["total"])
             predicted_reward += env_reward
             prev_s = frenet_s
+            prev_abs_d = lateral_error
             prev_action = effective_action
 
         trust_delta = action_sequence - base_action.reshape(1, 2)
@@ -2342,19 +2358,7 @@ class MPPIDBaSOptimizer:
         return self._clip_action(action)
 
     def _piecewise_lateral_penalty(self, lateral_error: float) -> float:
-        cfg = self.config
-        lateral_error = abs(float(lateral_error))
-        if lateral_error <= cfg.lateral_deadband:
-            return 0.0
-        if lateral_error <= cfg.lateral_soft_limit:
-            normalized = (lateral_error - cfg.lateral_deadband) / max(
-                cfg.lateral_soft_limit - cfg.lateral_deadband,
-                1e-6,
-            )
-            return float(1.5 * normalized * normalized)
-        if lateral_error <= cfg.env_out_of_bounds_limit:
-            return float(1.5 + 6.0 * (lateral_error - cfg.lateral_soft_limit) ** 2)
-        return float(100.0 + 50.0 * (lateral_error - cfg.env_out_of_bounds_limit) ** 2)
+        return piecewise_lateral_penalty(lateral_error)
 
     @staticmethod
     def _reward_aligned_reject_reason(reward_ok: bool, trust_ok: bool, safety_ok: bool) -> str:
