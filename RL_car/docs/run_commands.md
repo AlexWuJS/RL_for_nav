@@ -71,7 +71,7 @@ python train_dsac.py \
 
 注意：当前奖励函数已改为软边界跟线奖励，旧 DSAC 模型不会自动具备新的跟线行为。建议重新训练后再评估 `dsac` 和 `dsac_rl_driven_mppi`。
 
-训练过程中终端会每隔 `--log-interval` 步输出一次汇总信息，包括：
+训练过程中终端会每隔 `--log-interval` 步以表格形式输出一次汇总信息，包括：
 
 - 当前 step、episode 数、replay buffer 大小和 FPS。
 - 当前 episode reward 和当前 episode 长度。

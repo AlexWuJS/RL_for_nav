@@ -322,18 +322,29 @@ class DSACTrainer:
         recent_log_probs,
     ) -> str:
         fps = step / max(elapsed, 1e-6)
-        return (
-            f"[DSAC] step={step}/{total_timesteps} "
-            f"episodes={episode_count} buffer={self.buffer.count} fps={fps:.1f} "
-            f"current_reward={current_episode_reward:.2f} current_len={current_episode_length} "
-            f"mean_reward_100={self._format_float(self._mean_or_nan(recent_rewards), 2)} "
-            f"mean_len_100={self._format_float(self._mean_or_nan(recent_lengths), 1)} "
-            f"actor_loss={self._format_float(self._mean_or_nan(recent_actor_losses))} "
-            f"critic_loss={self._format_float(self._mean_or_nan(recent_critic_losses))} "
-            f"mean_q={self._format_float(self._mean_or_nan(recent_q_values))} "
-            f"mean_log_prob={self._format_float(self._mean_or_nan(recent_log_probs))} "
-            f"alpha={self.config.alpha:.3f}"
-        )
+        rows = [
+            ("time/iterations", step),
+            ("time/total_timesteps", f"{step}/{total_timesteps}"),
+            ("time/fps", f"{fps:.1f}"),
+            ("rollout/episodes", episode_count),
+            ("rollout/ep_rew_mean", self._format_float(self._mean_or_nan(recent_rewards), 2)),
+            ("rollout/ep_len_mean", self._format_float(self._mean_or_nan(recent_lengths), 1)),
+            ("rollout/current_ep_reward", f"{current_episode_reward:.2f}"),
+            ("rollout/current_ep_len", current_episode_length),
+            ("train/buffer_size", self.buffer.count),
+            ("train/actor_loss", self._format_float(self._mean_or_nan(recent_actor_losses))),
+            ("train/critic_loss", self._format_float(self._mean_or_nan(recent_critic_losses))),
+            ("train/mean_q", self._format_float(self._mean_or_nan(recent_q_values))),
+            ("train/mean_log_prob", self._format_float(self._mean_or_nan(recent_log_probs))),
+            ("train/alpha", f"{self.config.alpha:.3f}"),
+        ]
+        key_width = max(len(str(key)) for key, _ in rows)
+        value_width = max(len(str(value)) for _, value in rows)
+        border = "-" * (key_width + value_width + 7)
+        lines = [border]
+        lines.extend(f"| {key:<{key_width}} | {str(value):>{value_width}} |" for key, value in rows)
+        lines.append(border)
+        return "\n".join(lines)
 
     def update(self) -> Dict[str, float]:
         batch = self.buffer.sample(self.config.batch_size, self.policy.device)
