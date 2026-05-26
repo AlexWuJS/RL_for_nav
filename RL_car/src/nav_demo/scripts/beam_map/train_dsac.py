@@ -47,7 +47,7 @@ def main():
     print(f"DSAC observation_dim={obs_dim}, action_low={action_low}, action_high={action_high}")
     print(f"Saving DSAC models to: {args.save_dir}")
     try:
-        trainer.learn(args.total_timesteps, args.save_dir)
+        trainer.learn(args.total_timesteps, args.save_dir, log_interval=args.log_interval)
     except KeyboardInterrupt:
         print("DSAC training interrupted; saving current model.")
 

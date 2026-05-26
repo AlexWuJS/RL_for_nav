@@ -57,6 +57,7 @@ python train_dsac.py \
 ```bash
 python train_dsac.py \
   --total-timesteps 300000 \
+  --log-interval 1000 \
   --save-dir ./training_dsac_usv_results \
   --log-dir ./logs_dsac
 ```
@@ -69,6 +70,13 @@ python train_dsac.py \
 ```
 
 注意：当前奖励函数已改为软边界跟线奖励，旧 DSAC 模型不会自动具备新的跟线行为。建议重新训练后再评估 `dsac` 和 `dsac_rl_driven_mppi`。
+
+训练过程中终端会每隔 `--log-interval` 步输出一次汇总信息，包括：
+
+- 当前 step、episode 数、replay buffer 大小和 FPS。
+- 当前 episode reward 和当前 episode 长度。
+- 最近 100 个 episode 的平均 reward 和平均步数。
+- 最近更新窗口的 `actor_loss`、`critic_loss`、`mean_q`、`mean_log_prob` 和 `alpha`。
 
 ## 训练 SAC Baseline
 

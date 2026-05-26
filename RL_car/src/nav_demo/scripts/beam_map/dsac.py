@@ -1,7 +1,9 @@
 import argparse
 import json
 import os
+import time
 from dataclasses import asdict, dataclass
+from collections import deque
 from typing import Any, Dict, Tuple
 
 import numpy as np
@@ -238,6 +240,15 @@ class DSACTrainer:
         obs = self.env.reset()
         obs = np.asarray(obs, dtype=np.float32).reshape(-1)
         episode_reward = 0.0
+        episode_length = 0
+        episode_count = 0
+        recent_rewards = deque(maxlen=100)
+        recent_lengths = deque(maxlen=100)
+        recent_actor_losses = deque(maxlen=100)
+        recent_critic_losses = deque(maxlen=100)
+        recent_q_values = deque(maxlen=100)
+        recent_log_probs = deque(maxlen=100)
+        start_time = time.time()
         for step in range(1, int(total_timesteps) + 1):
             if step < self.config.learning_starts:
                 action = np.asarray([self.env.action_space.sample()]).reshape(-1)
@@ -251,19 +262,80 @@ class DSACTrainer:
             self.buffer.add(obs, action, reward, next_obs_flat, done)
             obs = next_obs_flat
             episode_reward += reward
+            episode_length += 1
             if done:
+                episode_count += 1
+                recent_rewards.append(float(episode_reward))
+                recent_lengths.append(int(episode_length))
                 obs = np.asarray(self.env.reset(), dtype=np.float32).reshape(-1)
                 episode_reward = 0.0
+                episode_length = 0
             if self.buffer.count >= self.config.learning_starts and step % self.config.train_freq == 0:
                 for _ in range(self.config.gradient_steps):
-                    self.update()
+                    metrics = self.update()
+                    recent_actor_losses.append(metrics["actor_loss"])
+                    recent_critic_losses.append(metrics["critic_loss"])
+                    recent_q_values.append(metrics["mean_q"])
+                    recent_log_probs.append(metrics["mean_log_prob"])
             if log_interval > 0 and step % log_interval == 0:
-                print(f"[DSAC] step={step} buffer={self.buffer.count} episode_reward={episode_reward:.2f}")
+                print(self._format_log_line(
+                    step=step,
+                    total_timesteps=int(total_timesteps),
+                    elapsed=time.time() - start_time,
+                    episode_count=episode_count,
+                    current_episode_reward=episode_reward,
+                    current_episode_length=episode_length,
+                    recent_rewards=recent_rewards,
+                    recent_lengths=recent_lengths,
+                    recent_actor_losses=recent_actor_losses,
+                    recent_critic_losses=recent_critic_losses,
+                    recent_q_values=recent_q_values,
+                    recent_log_probs=recent_log_probs,
+                ))
             if step % max(log_interval, 1) == 0:
                 self.policy.save(os.path.join(save_dir, "best_model"))
         return self.policy
 
-    def update(self) -> None:
+    def _mean_or_nan(self, values) -> float:
+        if not values:
+            return float("nan")
+        return float(np.mean(values))
+
+    def _format_float(self, value: float, digits: int = 3) -> str:
+        if not np.isfinite(value):
+            return "n/a"
+        return f"{value:.{digits}f}"
+
+    def _format_log_line(
+        self,
+        step: int,
+        total_timesteps: int,
+        elapsed: float,
+        episode_count: int,
+        current_episode_reward: float,
+        current_episode_length: int,
+        recent_rewards,
+        recent_lengths,
+        recent_actor_losses,
+        recent_critic_losses,
+        recent_q_values,
+        recent_log_probs,
+    ) -> str:
+        fps = step / max(elapsed, 1e-6)
+        return (
+            f"[DSAC] step={step}/{total_timesteps} "
+            f"episodes={episode_count} buffer={self.buffer.count} fps={fps:.1f} "
+            f"current_reward={current_episode_reward:.2f} current_len={current_episode_length} "
+            f"mean_reward_100={self._format_float(self._mean_or_nan(recent_rewards), 2)} "
+            f"mean_len_100={self._format_float(self._mean_or_nan(recent_lengths), 1)} "
+            f"actor_loss={self._format_float(self._mean_or_nan(recent_actor_losses))} "
+            f"critic_loss={self._format_float(self._mean_or_nan(recent_critic_losses))} "
+            f"mean_q={self._format_float(self._mean_or_nan(recent_q_values))} "
+            f"mean_log_prob={self._format_float(self._mean_or_nan(recent_log_probs))} "
+            f"alpha={self.config.alpha:.3f}"
+        )
+
+    def update(self) -> Dict[str, float]:
         batch = self.buffer.sample(self.config.batch_size, self.policy.device)
         with torch.no_grad():
             next_action, next_log_prob = self.policy.sample_tensor(batch["next_obs"], deterministic=False)
@@ -286,6 +358,14 @@ class DSACTrainer:
         with torch.no_grad():
             for param, target_param in zip(self.policy.critic.parameters(), self.policy.critic_target.parameters()):
                 target_param.data.mul_(1.0 - self.config.tau).add_(self.config.tau * param.data)
+            mean_q = actor_q.mean()
+            mean_log_prob = log_prob.mean()
+        return {
+            "actor_loss": float(actor_loss.detach().cpu().item()),
+            "critic_loss": float(critic_loss.detach().cpu().item()),
+            "mean_q": float(mean_q.detach().cpu().item()),
+            "mean_log_prob": float(mean_log_prob.detach().cpu().item()),
+        }
 
 
 def parse_dsac_args():
@@ -299,4 +379,5 @@ def parse_dsac_args():
     parser.add_argument("--learning-starts", type=int, default=10000)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--buffer-size", type=int, default=200000)
+    parser.add_argument("--log-interval", type=int, default=1000)
     return parser.parse_args()
