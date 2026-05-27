@@ -2353,7 +2353,7 @@ class MPPIDBaSOptimizer:
 
     def _emergency_brake_action(self, base_action: np.ndarray) -> np.ndarray:
         action = base_action.astype(float).copy()
-        action[0] = min(action[0], self.config.hard_brake_surge)
+        action[0] = self.config.hard_brake_surge
         action[1] = 0.0
         return self._clip_action(action)
 
@@ -2960,7 +2960,10 @@ class MPPIDBaSOptimizer:
             lateral_error = abs(float(frenet_d))
 
         recover_speed = cfg.hard_brake_surge if (radar["global_min"] < cfg.safe_distance or lateral_error > 1.2) else cfg.fallback_surge
-        action[0] = min(action[0], recover_speed)
+        if radar["global_min"] < cfg.safe_distance:
+            action[0] = recover_speed
+        else:
+            action[0] = min(action[0], recover_speed)
 
         clearance_delta = radar["left_min"] - radar["right_min"]
         path_center_yaw = self._yaw_toward_path_center(planner_state, default_yaw=0.0)

@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 import gymnasium as gym
 import numpy as np
@@ -14,6 +14,42 @@ from mppi_dbas import (
     intent_to_params_v2,
     intent_to_structured_params_v41,
 )
+
+
+class _GymEnvAdapter(gym.Env):
+    """Adapt lightweight test doubles to gymnasium.Env without changing runtime envs."""
+
+    def __init__(self, env):
+        self.env = env
+        self.observation_space = getattr(env, "observation_space", None)
+        self.action_space = getattr(env, "action_space", None)
+        self.metadata = getattr(env, "metadata", {})
+        self.render_mode = getattr(env, "render_mode", None)
+
+    def reset(self, **kwargs):
+        return self.env.reset(**kwargs)
+
+    def step(self, action):
+        return self.env.step(action)
+
+    def render(self):
+        if hasattr(self.env, "render"):
+            return self.env.render()
+        return None
+
+    def close(self):
+        if hasattr(self.env, "close"):
+            return self.env.close()
+        return None
+
+    def get_planner_state(self):
+        return self.env.get_planner_state()
+
+
+def _as_gym_env(env):
+    if isinstance(env, gym.Env):
+        return env
+    return _GymEnvAdapter(env)
 
 
 def hierarchical_mppi_config(seed: Optional[int] = None) -> MPPIDBaSConfig:
@@ -151,7 +187,7 @@ class HierarchicalMppiWrapper(gym.Wrapper):
         optimizer: Optional[MPPIDBaSOptimizer] = None,
         seed: Optional[int] = None,
     ):
-        super().__init__(env)
+        super().__init__(_as_gym_env(env))
         self.optimizer = optimizer or MPPIDBaSOptimizer(config or hierarchical_mppi_config(seed=seed))
         self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float32)
 
@@ -202,7 +238,7 @@ class HierarchicalMppiV2Wrapper(gym.Wrapper):
         delta_penalty_alpha: float = 0.08,
         delta_deadband: float = 0.10,
     ):
-        super().__init__(env)
+        super().__init__(_as_gym_env(env))
         self.optimizer = optimizer or MPPIDBaSOptimizer(config or hierarchical_mppi_v2_config(seed=seed))
         self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float32)
         self.intent_ema_alpha = float(np.clip(intent_ema_alpha, 0.0, 1.0))
@@ -326,7 +362,7 @@ class HierarchicalMppiV3Wrapper(gym.Wrapper):
         intent_ema_alpha: float = 0.6,
         intent_hold_steps: int = 2,
     ):
-        super().__init__(env)
+        super().__init__(_as_gym_env(env))
         self.optimizer = optimizer or MPPIDBaSOptimizer(config or hierarchical_mppi_v3_config(seed=seed))
         self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float32)
         self.intent_ema_alpha = float(np.clip(intent_ema_alpha, 0.0, 1.0))
@@ -418,7 +454,7 @@ class HierarchicalMppiV4Wrapper(gym.Wrapper):
         hazard_mode_bonus: float = 0.08,
         conservative_overuse_penalty: float = 0.04,
     ):
-        super().__init__(env)
+        super().__init__(_as_gym_env(env))
         self.reward_profile = str(reward_profile).lower()
         self.optimizer = optimizer or MPPIDBaSOptimizer(config or hierarchical_mppi_v4_config(seed=seed, reward_profile=self.reward_profile))
         self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(8,), dtype=np.float32)
@@ -512,7 +548,7 @@ class HierarchicalMppiV4Wrapper(gym.Wrapper):
     def get_planner_state(self):
         return self.env.get_planner_state()
 
-    def _select_mode(self, decoded: dict) -> tuple[str, int, bool]:
+    def _select_mode(self, decoded: Dict) -> Tuple[str, int, bool]:
         raw_mode_name = str(decoded["mode_name"])
         raw_mode_index = int(decoded["mode_index"])
         emergency_mode = raw_mode_name == "brake"
@@ -573,7 +609,7 @@ class HierarchicalMppiV4Wrapper(gym.Wrapper):
         current_mode: str,
         mode_switched: bool,
         post_lateral_error: float,
-    ) -> tuple[float, dict]:
+    ) -> Tuple[float, Dict]:
         if self.reward_profile != "enhanced":
             return float(env_reward), {
                 "switch_penalty": 0.0,
@@ -626,7 +662,7 @@ class HierarchicalMppiV41Wrapper(gym.Wrapper):
         intervention_penalty_weight: float = 0.04,
         jitter_penalty_weight: float = 0.05,
     ):
-        super().__init__(env)
+        super().__init__(_as_gym_env(env))
         self.reward_profile = str(reward_profile).lower()
         self.optimizer = optimizer or MPPIDBaSOptimizer(config or hierarchical_mppi_v41_config(seed=seed, reward_profile=self.reward_profile))
         self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float32)
@@ -683,7 +719,7 @@ class HierarchicalMppiV41Wrapper(gym.Wrapper):
     def get_planner_state(self):
         return self.env.get_planner_state()
 
-    def _training_reward(self, env_reward: float, info: dict, params: dict) -> tuple[float, dict]:
+    def _training_reward(self, env_reward: float, info: Dict, params: Dict) -> Tuple[float, Dict]:
         if self.reward_profile != "guided":
             return float(env_reward), {
                 "risk_penalty": 0.0,
