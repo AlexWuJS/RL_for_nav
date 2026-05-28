@@ -37,6 +37,16 @@ class RLDrivenMPPIConfig(MPPIDBaSConfig):
     rlmppi_center_assist: bool = False
     rlmppi_center_assist_distance: float = 2.2
     rlmppi_center_assist_lateral: float = 0.75
+    rlmppi_shield_fallback: bool = False
+    rlmppi_shield_front_trigger_distance: float = 1.2
+    rlmppi_shield_approach_surge: float = 0.15
+    rlmppi_progress_assist: bool = False
+    rlmppi_progress_assist_distance: float = 1.2
+    rlmppi_progress_assist_surge: float = 0.85
+    rlmppi_progress_heading_gain: float = 1.25
+    rlmppi_progress_center_gain: float = 0.20
+    rlmppi_progress_recovery_lateral: float = 1.0
+    rlmppi_progress_recovery_surge: float = 0.55
 
 
 class SB3SacPolicyAdapter:
@@ -169,25 +179,58 @@ class RLDrivenMPPIOptimizer(MPPIDBaSOptimizer):
         base_metrics = self._sequence_metrics(base_sequence, base_action, planner_state, obstacles)
 
         if cfg.rlmppi_accept_gate and not self._rlmppi_hazard_active(base_metrics, radar):
-            executed = self._center_assist_action(base_action, planner_state, radar)
+            executed, shield_metrics, shield_active, shield_accept, shield_reason = self._shield_fallback_action(
+                base_action=base_action,
+                base_metrics=base_metrics,
+                planner_state=planner_state,
+                obstacles=obstacles,
+                radar=radar,
+            )
+            if not shield_accept:
+                executed = self._progress_assist_action(base_action, planner_state, radar)
+                executed = self._center_assist_action(executed, planner_state, radar)
             self.last_action = executed.astype(np.float32)
+            selected_metrics = shield_metrics if shield_accept else base_metrics
             debug = self._make_debug(
                 base_action=base_action,
                 executed=executed,
                 base_metrics=base_metrics,
-                best_metrics=base_metrics,
+                best_metrics=selected_metrics,
                 best_sequence=base_sequence,
-                costs=np.array([base_metrics["total_cost"]], dtype=float),
+                costs=np.array([selected_metrics["total_cost"]], dtype=float),
                 sigma_sequence=np.zeros_like(base_sequence, dtype=float),
                 elapsed_ms=(time.perf_counter() - start_time) * 1000.0,
-                init_source="pre_gate",
+                init_source="shield_fallback" if shield_accept else "pre_gate",
                 terminal_q_used=False,
                 top_count=0,
                 action_delta=executed - base_action,
             )
-            self._apply_accept_gate_debug(debug, False, "base_safe_gate", base_action, executed)
+            reject_reason = shield_reason if shield_active else "base_safe_gate"
+            self._apply_accept_gate_debug(debug, False, reject_reason, base_action, executed)
             debug["mppi_active"] = False
             debug["mppi_triggered"] = False
+            debug["fallback_active"] = bool(shield_active)
+            debug["fallback_accept"] = bool(shield_accept)
+            debug["fallback_reason"] = shield_reason
+            debug["fallback_pred_collision"] = bool(shield_metrics.get("collision_risk", 0.0) > 0.0)
+            debug["fallback_pred_out_of_bounds"] = bool(shield_metrics.get("out_of_bounds_risk", 0.0) > 0.0)
+            debug["fallback_min_obstacle_distance"] = float(shield_metrics.get("min_distance", base_metrics["min_distance"]))
+            debug["fallback_risk"] = float(shield_metrics.get("risk_score", base_metrics["risk_score"]))
+            debug["fallback_min_distance"] = float(shield_metrics.get("min_distance", base_metrics["min_distance"]))
+            debug["fallback_ttc_cost"] = float(shield_metrics.get("ttc_cost", base_metrics["ttc_cost"]))
+            debug["fallback_max_lateral_error"] = float(shield_metrics.get("max_lateral_error", base_metrics["max_lateral_error"]))
+            debug["fallback_progress"] = float(shield_metrics.get("progress", base_metrics["progress"]))
+            debug["candidate_fallback_score"] = float(-shield_metrics.get("total_cost", base_metrics["total_cost"]))
+            if shield_accept:
+                debug["selected_reason"] = "select_fallback"
+                debug["action_source"] = "fallback"
+                debug["terminal_source"] = "fallback"
+                debug["mppi_decision_reason"] = shield_reason
+            elif np.linalg.norm(executed - base_action) > 1e-6:
+                debug["selected_reason"] = "select_progress_assist"
+                debug["action_source"] = "sac"
+                debug["terminal_source"] = "sac"
+                debug["mppi_decision_reason"] = "progress_assist"
             debug["rlmppi_num_rl_rollouts"] = 0
             debug["rlmppi_num_mppi_rollouts"] = 0
             debug["rlmppi_num_iterations"] = 0
@@ -424,6 +467,53 @@ class RLDrivenMPPIOptimizer(MPPIDBaSOptimizer):
     def _rlmppi_hazard_active(self, base_metrics: Dict[str, float], radar: Dict[str, float]) -> bool:
         return False
 
+    def _shield_fallback_action(
+        self,
+        base_action: np.ndarray,
+        base_metrics: Dict[str, float],
+        planner_state: Dict[str, Any],
+        obstacles: Optional[np.ndarray],
+        radar: Dict[str, float],
+    ) -> Tuple[np.ndarray, Dict[str, float], bool, bool, str]:
+        cfg = self.config
+        if not cfg.rlmppi_shield_fallback or not cfg.enable_fallback:
+            return base_action.astype(float).copy(), base_metrics, False, False, "shield_disabled"
+        if not self._rlmppi_shield_should_run(base_action, base_metrics, radar):
+            return base_action.astype(float).copy(), base_metrics, False, False, "shield_not_needed"
+
+        fallback_action = self._fallback_action(base_action, planner_state, radar)
+        fallback_sequence = np.tile(fallback_action.reshape(1, 2), (cfg.horizon, 1))
+        fallback_metrics = self._sequence_metrics(fallback_sequence, base_action, planner_state, obstacles)
+        accept, fallback_reason = self._accept_fallback(base_metrics, fallback_metrics)
+        if self._emergency_brake_needed(base_metrics, fallback_metrics, radar):
+            emergency_action = self._emergency_brake_action(base_action)
+            emergency_sequence = np.tile(emergency_action.reshape(1, 2), (cfg.horizon, 1))
+            emergency_metrics = self._sequence_metrics(emergency_sequence, base_action, planner_state, obstacles)
+            emergency_accept, emergency_reason = self._accept_fallback(base_metrics, emergency_metrics)
+            if emergency_accept or not accept:
+                return emergency_action, emergency_metrics, True, bool(emergency_accept), emergency_reason
+        executed = fallback_action if accept else base_action
+        return executed.astype(float).copy(), fallback_metrics, True, bool(accept), fallback_reason
+
+    def _rlmppi_shield_should_run(
+        self,
+        base_action: np.ndarray,
+        base_metrics: Dict[str, float],
+        radar: Dict[str, float],
+    ) -> bool:
+        cfg = self.config
+        if radar["global_min"] < cfg.fallback_trigger_distance:
+            return True
+        if radar["front_min"] < cfg.rlmppi_shield_front_trigger_distance and float(base_action[0]) > cfg.rlmppi_shield_approach_surge:
+            return True
+        if base_metrics.get("collision_risk", 0.0) > 0.0:
+            return True
+        if base_metrics.get("min_distance", radar["global_min"]) < cfg.safe_distance:
+            return True
+        if base_metrics.get("ttc_cost", 0.0) > 0.0:
+            return True
+        return False
+
     def _center_assist_action(
         self,
         base_action: np.ndarray,
@@ -442,6 +532,34 @@ class RLDrivenMPPIOptimizer(MPPIDBaSOptimizer):
             return base_action.astype(float).copy()
         assisted = base_action.astype(float).copy()
         assisted[1] = self._yaw_toward_path_center(planner_state, default_yaw=float(base_action[1]))
+        return self._clip_action(assisted)
+
+    def _progress_assist_action(
+        self,
+        base_action: np.ndarray,
+        planner_state: Dict[str, Any],
+        radar: Dict[str, float],
+    ) -> np.ndarray:
+        cfg = self.config
+        if not cfg.rlmppi_progress_assist or radar["global_min"] < cfg.rlmppi_progress_assist_distance:
+            return base_action.astype(float).copy()
+        frenet_transform = planner_state.get("frenet_transform")
+        if frenet_transform is None:
+            return base_action.astype(float).copy()
+
+        position = np.asarray(planner_state.get("position", np.zeros(2)), dtype=float)
+        yaw = float(planner_state.get("yaw", 0.0))
+        frenet_s, frenet_d = frenet_transform.cartesian_to_frenet(position)
+        heading_error = float(frenet_transform.get_heading_error(yaw, frenet_s))
+        assisted = base_action.astype(float).copy()
+        target_surge = cfg.rlmppi_progress_assist_surge
+        if abs(float(frenet_d)) > cfg.rlmppi_progress_recovery_lateral:
+            target_surge = min(target_surge, cfg.rlmppi_progress_recovery_surge)
+        if radar["front_min"] < cfg.rlmppi_shield_front_trigger_distance:
+            target_surge = min(target_surge, cfg.fallback_surge)
+        assisted[0] = max(float(assisted[0]), target_surge)
+        yaw_cmd = cfg.rlmppi_progress_heading_gain * heading_error - cfg.rlmppi_progress_center_gain * float(frenet_d)
+        assisted[1] = float(np.clip(yaw_cmd, cfg.action_low[1], cfg.action_high[1]))
         return self._clip_action(assisted)
 
     def _apply_accept_gate_debug(
@@ -586,7 +704,7 @@ class RLDrivenMPPIOptimizer(MPPIDBaSOptimizer):
 
 def rl_driven_mppi_config(mode: str, seed: int) -> RLDrivenMPPIConfig:
     if mode == "dsac_rl_driven_mppi":
-        return RLDrivenMPPIConfig(seed=seed, strict_terminal_q=True, observation_stack=4, controller_name="dsac_rl_driven_mppi", use_reward_aligned_cost=True, terminal_q_weight=0.05, rlmppi_accept_gate=True, rlmppi_lateral_trigger=99.0, rlmppi_min_reward_gain=5.0, rlmppi_min_action_delta=0.12)
+        return RLDrivenMPPIConfig(seed=seed, strict_terminal_q=True, observation_stack=4, controller_name="dsac_rl_driven_mppi", use_reward_aligned_cost=True, terminal_q_weight=0.05, rlmppi_accept_gate=True, rlmppi_lateral_trigger=99.0, rlmppi_min_reward_gain=5.0, rlmppi_min_action_delta=0.12, rlmppi_shield_fallback=True, fallback_trigger_distance=1.0, safe_distance=0.65, fallback_surge=0.35, hard_brake_surge=0.22, rlmppi_shield_front_trigger_distance=1.6, rlmppi_progress_assist=True, rlmppi_progress_assist_distance=1.0, rlmppi_progress_heading_gain=1.4, rlmppi_progress_center_gain=0.35)
     if mode == "dsac_rl_driven_mppi_no_hss":
         return RLDrivenMPPIConfig(seed=seed, use_hss=False, strict_terminal_q=True, observation_stack=4, controller_name="dsac_rl_driven_mppi", use_reward_aligned_cost=True, terminal_q_weight=0.05, rlmppi_accept_gate=True, rlmppi_lateral_trigger=99.0, rlmppi_min_reward_gain=5.0, rlmppi_min_action_delta=0.12)
     if mode == "dsac_rl_driven_mppi_fixed_sigma":

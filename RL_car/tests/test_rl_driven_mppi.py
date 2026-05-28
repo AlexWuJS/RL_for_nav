@@ -163,6 +163,28 @@ class RLDrivenMPPITests(unittest.TestCase):
 
         self.assertFalse(debug["rlmppi_update_sigma"])
 
+    def test_accept_gate_can_use_shield_fallback_near_obstacle(self):
+        optimizer, adapter = self.make_optimizer(
+            rlmppi_accept_gate=True,
+            rlmppi_shield_fallback=True,
+            fallback_trigger_distance=0.8,
+            safe_distance=0.55,
+            hard_brake_surge=0.0,
+        )
+
+        action, debug = optimizer.optimize(
+            np.array([0.6, 0.0]),
+            planner_state(scan_ranges=[0.45, 0.45, 0.45, 2.0, 2.0]),
+            observation=np.zeros(4),
+        )
+
+        self.assertEqual(adapter.sample_calls, 0)
+        self.assertFalse(debug["mppi_active"])
+        self.assertTrue(debug["fallback_active"])
+        self.assertTrue(debug["fallback_accept"])
+        self.assertEqual(debug["action_source"], "fallback")
+        self.assertLessEqual(action[0], optimizer.config.fallback_surge)
+
 
 if __name__ == "__main__":
     unittest.main()
