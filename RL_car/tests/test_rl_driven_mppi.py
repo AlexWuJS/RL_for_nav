@@ -125,9 +125,27 @@ class RLDrivenMPPITests(unittest.TestCase):
         action, debug = optimizer.optimize(np.array([0.2, 0.0]), planner_state(), observation=np.zeros(4))
 
         self.assertEqual(adapter.sample_calls, optimizer.config.num_rl_rollouts)
+        self.assertEqual(
+            len(optimizer.last_sampled_sequences),
+            optimizer.config.num_rl_rollouts + optimizer.config.num_mppi_rollouts,
+        )
         self.assertEqual(debug["rlmppi_num_rl_rollouts"], optimizer.config.num_rl_rollouts)
         self.assertEqual(debug["rlmppi_num_iterations"], optimizer.config.num_iterations)
         self.assertEqual(action.shape, (2,))
+
+    def test_visualization_trajectories_use_last_candidates_and_weighted_mean(self):
+        optimizer, _ = self.make_optimizer()
+
+        optimizer.optimize(np.array([0.2, 0.0]), planner_state(), observation=np.zeros(4))
+        trajectories = optimizer.get_last_visualization_trajectories(planner_state())
+
+        self.assertTrue(trajectories["active"])
+        self.assertEqual(
+            len(trajectories["sampled"]),
+            optimizer.config.num_rl_rollouts + optimizer.config.num_mppi_rollouts,
+        )
+        self.assertEqual(trajectories["weighted"].shape, (optimizer.config.horizon + 1, 2))
+        self.assertTrue(all(path.shape == (optimizer.config.horizon + 1, 2) for path in trajectories["sampled"]))
 
     def test_top_z_update_keeps_sigma_above_minimum_and_actions_bounded(self):
         optimizer, _ = self.make_optimizer()
@@ -145,6 +163,7 @@ class RLDrivenMPPITests(unittest.TestCase):
         _, debug = optimizer.optimize(np.array([0.2, 0.0]), planner_state(), observation=np.zeros(4))
 
         self.assertEqual(adapter.sample_calls, 0)
+        self.assertEqual(len(optimizer.last_sampled_sequences), optimizer.config.num_mppi_rollouts)
         self.assertFalse(debug["rlmppi_hss_enabled"])
         self.assertEqual(debug["rlmppi_num_rl_rollouts"], 0)
 
@@ -163,7 +182,7 @@ class RLDrivenMPPITests(unittest.TestCase):
 
         self.assertFalse(debug["rlmppi_update_sigma"])
 
-    def test_accept_gate_can_use_shield_fallback_near_obstacle(self):
+    def test_accept_gate_triggers_online_mppi_near_obstacle(self):
         optimizer, adapter = self.make_optimizer(
             rlmppi_accept_gate=True,
             rlmppi_shield_fallback=True,
@@ -178,12 +197,47 @@ class RLDrivenMPPITests(unittest.TestCase):
             observation=np.zeros(4),
         )
 
+        self.assertEqual(adapter.sample_calls, optimizer.config.num_rl_rollouts)
+        self.assertTrue(debug["mppi_active"])
+        self.assertTrue(debug["mppi_triggered"])
+        self.assertEqual(debug["rlmppi_num_iterations"], optimizer.config.num_iterations)
+        self.assertEqual(action.shape, (2,))
+
+    def test_accept_gate_skips_online_mppi_when_base_is_safe(self):
+        optimizer, adapter = self.make_optimizer(
+            rlmppi_accept_gate=True,
+            rlmppi_shield_fallback=True,
+            rlmppi_trigger_distance=1.0,
+            safe_distance=0.55,
+        )
+
+        action, debug = optimizer.optimize(
+            np.array([0.2, 0.0]),
+            planner_state(scan_ranges=[3.0, 3.0, 3.0, 3.0, 3.0]),
+            observation=np.zeros(4),
+        )
+
         self.assertEqual(adapter.sample_calls, 0)
         self.assertFalse(debug["mppi_active"])
-        self.assertTrue(debug["fallback_active"])
-        self.assertTrue(debug["fallback_accept"])
-        self.assertEqual(debug["action_source"], "fallback")
-        self.assertLessEqual(action[0], optimizer.config.fallback_surge)
+        self.assertFalse(debug["mppi_triggered"])
+        self.assertEqual(debug["reject_reason"], "base_safe_gate")
+        self.assertIsNone(optimizer.last_sampled_sequences)
+        self.assertFalse(optimizer.get_last_visualization_trajectories(planner_state())["active"])
+        np.testing.assert_allclose(action, np.array([0.2, 0.0], dtype=np.float32))
+
+    def test_dynamic_obstacle_velocity_contributes_to_ttc(self):
+        optimizer, _ = self.make_optimizer()
+        position = np.array([0.0, 0.0], dtype=float)
+        robot_velocity = np.array([0.0, 0.0], dtype=float)
+        obstacles = np.array([[1.0, 0.0]], dtype=float)
+        approaching = np.array([[-1.0, 0.0]], dtype=float)
+        receding = np.array([[1.0, 0.0]], dtype=float)
+
+        approaching_cost = optimizer._ttc_cost(position, robot_velocity, obstacles, approaching, np.array([0.0]))
+        receding_cost = optimizer._ttc_cost(position, robot_velocity, obstacles, receding, np.array([0.0]))
+
+        self.assertGreater(approaching_cost, 0.0)
+        self.assertEqual(receding_cost, 0.0)
 
 
 if __name__ == "__main__":

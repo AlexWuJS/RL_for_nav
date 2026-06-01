@@ -361,10 +361,10 @@ class MPPIDBaSConfig:
     final_safety_check: bool = True
     reward_improvement_threshold: float = 0.05
     emergency_brake_distance: float = 0.35
-    env_safe_distance: float = 0.45
+    env_safe_distance: float = 0.7
     env_out_of_bounds_limit: float = 3.0
     env_goal_threshold: float = 0.4
-    env_terminal_reward: float = 100.0
+    env_terminal_reward: float = 1000.0
     env_success_reward: float = 1000.0
     env_frenet_reward_scale: float = 2.5
     hard_safety_penalty: float = 1000.0
@@ -410,6 +410,36 @@ class MPPIDBaSOptimizer:
         self.last_action = np.zeros(2, dtype=np.float32)
         self.last_noise_scale = 1.0
         self.best_sequence = None
+
+    def rollout_trajectory_points(
+        self,
+        action_sequence: np.ndarray,
+        planner_state: Dict[str, Any],
+    ) -> np.ndarray:
+        """Predict XY points for RViz using the same kinematics as MPPI rollouts."""
+        cfg = self.config
+        dt = float(planner_state.get("dt", 0.1))
+        mass = float(planner_state.get("mass", 2.0))
+        damping = float(planner_state.get("damping", 0.5))
+        position = np.asarray(planner_state["position"], dtype=float).copy()
+        yaw = float(planner_state.get("yaw", 0.0))
+        velocity = np.asarray(planner_state.get("velocity", [0.0, 0.0, 0.0]), dtype=float).copy()
+        prev_action = np.asarray(planner_state.get("last_action", self.last_action), dtype=float).reshape(-1)[:2]
+        sequence = np.asarray(action_sequence, dtype=float).reshape(-1, 2)
+
+        points = [position[:2].copy()]
+        for action in sequence:
+            effective_action = cfg.action_lag_alpha * prev_action + (1.0 - cfg.action_lag_alpha) * action
+            control_input = np.array([float(effective_action[0]), 0.0, float(effective_action[1])], dtype=float)
+            acceleration = (control_input / mass) - (damping * velocity)
+            velocity = velocity + acceleration * dt
+            yaw = self._wrap_angle(yaw + velocity[2] * dt)
+            heading_vec = np.array([math.cos(yaw), math.sin(yaw)], dtype=float)
+            position = position + heading_vec * velocity[0] * dt
+            points.append(position[:2].copy())
+            prev_action = effective_action
+
+        return np.asarray(points, dtype=float)
 
     def optimize(self, base_action: Any, planner_state: Dict[str, Any]) -> Tuple[np.ndarray, Dict[str, float]]:
         cfg = self.config
@@ -1239,7 +1269,7 @@ class MPPIDBaSOptimizer:
         final_d = float(start_d)
         terminal = "running"
 
-        for action in action_sequence:
+        for step_idx, action in enumerate(action_sequence):
             effective_action = cfg.action_lag_alpha * prev_action + (1.0 - cfg.action_lag_alpha) * action
             control_input = np.array([float(effective_action[0]), 0.0, float(effective_action[1])], dtype=float)
             acceleration = (control_input / mass) - (damping * velocity)
@@ -1263,9 +1293,20 @@ class MPPIDBaSOptimizer:
             max_heading_error = max(max_heading_error, abs(float(heading_error)))
             lateral_target_error_sum += (float(frenet_d) - float(params["target_lateral_offset"])) ** 2
 
-            obstacle_dist = self._min_obstacle_distance(position, obstacles, planner_state)
+            robot_velocity_vec = heading_vec * velocity[0]
+            dynamic_obstacles = self._dynamic_obstacles_at(planner_state, (step_idx + 1) * dt)
+            obstacle_dist = self._min_obstacle_distance(position, obstacles, planner_state, dynamic_obstacles)
             min_distance = min(min_distance, obstacle_dist)
-            total_ttc_cost += self._ttc_cost(position, heading_vec * velocity[0], obstacles)
+            total_ttc_cost += max(
+                self._ttc_cost(position, robot_velocity_vec, obstacles),
+                self._ttc_cost(
+                    position,
+                    robot_velocity_vec,
+                    dynamic_obstacles[0] if dynamic_obstacles is not None else None,
+                    dynamic_obstacles[1] if dynamic_obstacles is not None else None,
+                    dynamic_obstacles[2] if dynamic_obstacles is not None else None,
+                ),
+            )
             if lateral_error > cfg.env_out_of_bounds_limit:
                 total_oob_cost += (lateral_error - cfg.env_out_of_bounds_limit) ** 2 + 1.0
                 terminal = "out_of_bounds"
@@ -2210,10 +2251,21 @@ class MPPIDBaSOptimizer:
             max_lateral_error = max(max_lateral_error, lateral_error)
             max_heading_error = max(max_heading_error, abs(float(heading_error)))
 
-            obstacle_dist = self._min_obstacle_distance(position, obstacles, planner_state)
+            robot_velocity_vec = heading_vec * velocity[0]
+            dynamic_obstacles = self._dynamic_obstacles_at(planner_state, (step_idx + 1) * dt)
+            obstacle_dist = self._min_obstacle_distance(position, obstacles, planner_state, dynamic_obstacles)
             min_distance = min(min_distance, obstacle_dist)
             dbas_cost = self._dbas_cost(obstacle_dist)
-            ttc_cost = self._ttc_cost(position, heading_vec * velocity[0], obstacles)
+            ttc_cost = max(
+                self._ttc_cost(position, robot_velocity_vec, obstacles),
+                self._ttc_cost(
+                    position,
+                    robot_velocity_vec,
+                    dynamic_obstacles[0] if dynamic_obstacles is not None else None,
+                    dynamic_obstacles[1] if dynamic_obstacles is not None else None,
+                    dynamic_obstacles[2] if dynamic_obstacles is not None else None,
+                ),
+            )
             total_dbas_cost += dbas_cost
             total_ttc_cost += ttc_cost
 
@@ -2755,7 +2807,7 @@ class MPPIDBaSOptimizer:
         max_lateral_error = 0.0
         max_heading_error = 0.0
 
-        for action in action_sequence:
+        for step_idx, action in enumerate(action_sequence):
             effective_action = cfg.action_lag_alpha * prev_action + (1.0 - cfg.action_lag_alpha) * action
             control_input = np.array([float(effective_action[0]), 0.0, float(effective_action[1])], dtype=float)
             acceleration = (control_input / mass) - (damping * velocity)
@@ -2779,10 +2831,21 @@ class MPPIDBaSOptimizer:
                 if lateral_error > cfg.out_of_bounds_limit:
                     out_of_bounds_cost = (lateral_error - cfg.out_of_bounds_limit) ** 2 + 1.0
 
-            obstacle_dist = self._min_obstacle_distance(position, obstacles, planner_state)
+            robot_velocity_vec = heading_vec * velocity[0]
+            dynamic_obstacles = self._dynamic_obstacles_at(planner_state, (step_idx + 1) * dt)
+            obstacle_dist = self._min_obstacle_distance(position, obstacles, planner_state, dynamic_obstacles)
             min_distance = min(min_distance, obstacle_dist)
             dbas_cost = self._dbas_cost(obstacle_dist)
-            ttc_cost = self._ttc_cost(position, heading_vec * velocity[0], obstacles)
+            ttc_cost = max(
+                self._ttc_cost(position, robot_velocity_vec, obstacles),
+                self._ttc_cost(
+                    position,
+                    robot_velocity_vec,
+                    dynamic_obstacles[0] if dynamic_obstacles is not None else None,
+                    dynamic_obstacles[1] if dynamic_obstacles is not None else None,
+                    dynamic_obstacles[2] if dynamic_obstacles is not None else None,
+                ),
+            )
 
             obstacle_cost = 0.0
             if obstacle_dist < cfg.safe_distance:
@@ -3125,16 +3188,38 @@ class MPPIDBaSOptimizer:
         normalized_violation = (cfg.safe_distance - obstacle_distance) / max(cfg.safe_distance - cfg.collision_distance, 1e-6)
         return float(normalized_violation ** 2)
 
-    def _ttc_cost(self, position: np.ndarray, velocity_vec: np.ndarray, obstacles: Optional[np.ndarray]) -> float:
+    def _ttc_cost(
+        self,
+        position: np.ndarray,
+        velocity_vec: np.ndarray,
+        obstacles: Optional[np.ndarray],
+        obstacle_velocities: Optional[np.ndarray] = None,
+        obstacle_radii: Optional[np.ndarray] = None,
+    ) -> float:
         if obstacles is None or len(obstacles) == 0:
             return 0.0
-        speed = float(np.linalg.norm(velocity_vec))
-        if speed < 1e-4:
+        obstacles = np.asarray(obstacles, dtype=float).reshape(-1, 2)
+        velocity_vec = np.asarray(velocity_vec, dtype=float).reshape(2)
+        if obstacle_velocities is None:
+            obstacle_velocities = np.zeros_like(obstacles)
+        else:
+            obstacle_velocities = np.asarray(obstacle_velocities, dtype=float).reshape(-1, 2)
+            if obstacle_velocities.shape[0] != obstacles.shape[0]:
+                obstacle_velocities = np.zeros_like(obstacles)
+        if obstacle_radii is None:
+            obstacle_radii = np.zeros(obstacles.shape[0], dtype=float)
+        else:
+            obstacle_radii = np.asarray(obstacle_radii, dtype=float).reshape(-1)
+            if obstacle_radii.shape[0] != obstacles.shape[0]:
+                obstacle_radii = np.zeros(obstacles.shape[0], dtype=float)
+        relative_velocities = velocity_vec.reshape(1, 2) - obstacle_velocities
+        if float(np.max(np.linalg.norm(relative_velocities, axis=1))) < 1e-4:
             return 0.0
         rel = obstacles - position.reshape(1, 2)
-        distances = np.linalg.norm(rel, axis=1)
-        unit_rel = rel / (distances.reshape(-1, 1) + 1e-6)
-        closing_speed = unit_rel @ velocity_vec
+        center_distances = np.linalg.norm(rel, axis=1)
+        distances = np.maximum(center_distances - obstacle_radii, 1e-6)
+        unit_rel = rel / (center_distances.reshape(-1, 1) + 1e-6)
+        closing_speed = np.sum(unit_rel * relative_velocities, axis=1)
         valid = closing_speed > 1e-4
         if not np.any(valid):
             return 0.0
@@ -3143,6 +3228,56 @@ class MPPIDBaSOptimizer:
         if min_ttc >= self.config.ttc_horizon:
             return 0.0
         return ((self.config.ttc_horizon - min_ttc) / self.config.ttc_horizon) ** 2
+
+    def _dynamic_obstacles_at(
+        self,
+        planner_state: Dict[str, Any],
+        elapsed: float,
+    ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        dynamic_obstacles = planner_state.get("dynamic_obstacles")
+        if not dynamic_obstacles:
+            return None
+
+        positions = []
+        velocities = []
+        radii = []
+        if isinstance(dynamic_obstacles, dict):
+            raw_positions = np.asarray(dynamic_obstacles.get("positions", []), dtype=float)
+            if raw_positions.size == 0:
+                return None
+            raw_positions = raw_positions.reshape(-1, 2)
+            raw_velocities = np.asarray(dynamic_obstacles.get("velocities", np.zeros_like(raw_positions)), dtype=float)
+            if raw_velocities.size == 0:
+                raw_velocities = np.zeros_like(raw_positions)
+            raw_velocities = raw_velocities.reshape(-1, 2)
+            raw_radii = np.asarray(dynamic_obstacles.get("radii", np.full(raw_positions.shape[0], 0.4)), dtype=float).reshape(-1)
+            if raw_velocities.shape[0] != raw_positions.shape[0]:
+                raw_velocities = np.zeros_like(raw_positions)
+            if raw_radii.shape[0] != raw_positions.shape[0]:
+                raw_radii = np.full(raw_positions.shape[0], 0.4, dtype=float)
+            positions = raw_positions + raw_velocities * float(elapsed)
+            return positions, raw_velocities, raw_radii
+
+        for obstacle in dynamic_obstacles:
+            if not isinstance(obstacle, dict):
+                continue
+            position = np.asarray(obstacle.get("position", []), dtype=float).reshape(-1)
+            if position.size < 2:
+                continue
+            velocity = np.asarray(obstacle.get("velocity", [0.0, 0.0]), dtype=float).reshape(-1)
+            if velocity.size < 2:
+                velocity = np.zeros(2, dtype=float)
+            positions.append(position[:2] + velocity[:2] * float(elapsed))
+            velocities.append(velocity[:2])
+            radii.append(float(obstacle.get("radius", 0.4)))
+
+        if not positions:
+            return None
+        return (
+            np.asarray(positions, dtype=float),
+            np.asarray(velocities, dtype=float),
+            np.asarray(radii, dtype=float),
+        )
 
     def _scan_to_obstacle_points(self, planner_state: Dict[str, Any]) -> Optional[np.ndarray]:
         scan = planner_state.get("scan")
@@ -3203,12 +3338,21 @@ class MPPIDBaSOptimizer:
         position: np.ndarray,
         obstacles: Optional[np.ndarray],
         planner_state: Dict[str, Any],
+        dynamic_obstacles: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
     ) -> float:
-        if obstacles is None or len(obstacles) == 0:
-            return float(planner_state.get("max_laser_range", 10.0))
+        min_distance = float(planner_state.get("max_laser_range", 10.0))
 
-        distances = np.linalg.norm(obstacles - position.reshape(1, 2), axis=1)
-        return float(np.min(distances))
+        if obstacles is not None and len(obstacles) > 0:
+            distances = np.linalg.norm(obstacles - position.reshape(1, 2), axis=1)
+            min_distance = min(min_distance, float(np.min(distances)))
+
+        if dynamic_obstacles is not None:
+            dynamic_positions, _, dynamic_radii = dynamic_obstacles
+            if len(dynamic_positions) > 0:
+                dynamic_distances = np.linalg.norm(dynamic_positions - position.reshape(1, 2), axis=1) - dynamic_radii
+                min_distance = min(min_distance, float(np.min(dynamic_distances)))
+
+        return max(0.0, float(min_distance))
 
     def _clip_action(self, action: Any) -> np.ndarray:
         action_arr = np.asarray(action, dtype=float).reshape(-1)

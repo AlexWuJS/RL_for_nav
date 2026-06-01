@@ -158,11 +158,13 @@ class RLDrivenMPPIOptimizer(MPPIDBaSOptimizer):
         self.policy_adapter = policy_adapter or SB3SacPolicyAdapter()
         self.last_mean_sequence: Optional[np.ndarray] = None
         self.last_sigma_sequence: Optional[np.ndarray] = None
+        self.last_sampled_sequences: Optional[np.ndarray] = None
 
     def reset(self) -> None:
         super().reset()
         self.last_mean_sequence = None
         self.last_sigma_sequence = None
+        self.last_sampled_sequences = None
 
     def optimize(
         self,
@@ -179,6 +181,9 @@ class RLDrivenMPPIOptimizer(MPPIDBaSOptimizer):
         base_metrics = self._sequence_metrics(base_sequence, base_action, planner_state, obstacles)
 
         if cfg.rlmppi_accept_gate and not self._rlmppi_hazard_active(base_metrics, radar):
+            self.last_mean_sequence = None
+            self.last_sigma_sequence = None
+            self.last_sampled_sequences = None
             executed, shield_metrics, shield_active, shield_accept, shield_reason = self._shield_fallback_action(
                 base_action=base_action,
                 base_metrics=base_metrics,
@@ -246,6 +251,7 @@ class RLDrivenMPPIOptimizer(MPPIDBaSOptimizer):
         best_sequence = mean_sequence.copy()
         terminal_q_used = False
         selected_top_count = 0
+        self.last_sampled_sequences = None
 
         for _ in range(int(cfg.num_iterations)):
             mppi_sequences = self._sample_mppi_rollouts(mean_sequence, sigma_sequence)
@@ -253,6 +259,7 @@ class RLDrivenMPPIOptimizer(MPPIDBaSOptimizer):
                 candidates = np.concatenate([guided_sequences, mppi_sequences], axis=0)
             else:
                 candidates = mppi_sequences
+            self.last_sampled_sequences = candidates.copy()
 
             costs, metrics, q_used_flags = self._score_sequences(candidates, base_action, planner_state, obstacles, observation)
             all_iteration_costs.append(costs)
@@ -309,6 +316,17 @@ class RLDrivenMPPIOptimizer(MPPIDBaSOptimizer):
         if cfg.rlmppi_accept_gate:
             self._apply_accept_gate_debug(debug, accept_candidate, reject_reason, base_action, executed)
         return executed.astype(np.float32), debug
+
+    def get_last_visualization_trajectories(self, planner_state: Dict[str, Any]) -> Dict[str, Any]:
+        if self.last_sampled_sequences is None or self.last_mean_sequence is None:
+            return {"sampled": [], "weighted": None, "active": False}
+
+        sampled = [
+            self.rollout_trajectory_points(sequence, planner_state)
+            for sequence in np.asarray(self.last_sampled_sequences, dtype=float)
+        ]
+        weighted = self.rollout_trajectory_points(self.last_mean_sequence, planner_state)
+        return {"sampled": sampled, "weighted": weighted, "active": True}
 
     def _sequence_metrics(
         self,
@@ -465,6 +483,17 @@ class RLDrivenMPPIOptimizer(MPPIDBaSOptimizer):
         return True, "none"
 
     def _rlmppi_hazard_active(self, base_metrics: Dict[str, float], radar: Dict[str, float]) -> bool:
+        cfg = self.config
+        if base_metrics.get("collision_risk", 0.0) > 0.0:
+            return True
+        if radar["global_min"] < cfg.rlmppi_trigger_distance:
+            return True
+        if base_metrics.get("min_distance", radar["global_min"]) < cfg.safe_distance:
+            return True
+        if base_metrics.get("ttc_cost", 0.0) > 0.0:
+            return True
+        if base_metrics.get("out_of_bounds_risk", 0.0) > 0.0:
+            return True
         return False
 
     def _shield_fallback_action(
@@ -632,6 +661,7 @@ class RLDrivenMPPIOptimizer(MPPIDBaSOptimizer):
             "mppi_delta_norm": float(np.linalg.norm(action_delta)),
             "mppi_delta_penalty": float(np.dot(action_delta, action_delta)),
             "mppi_active": True,
+            "mppi_triggered": True,
             "mppi_accept": True,
             "mppi_reject": False,
             "mppi_selected": True,
@@ -757,6 +787,9 @@ class RLDrivenMPPIActionWrapper(gym.Wrapper):
         adapter_observation = self._stacked_observation()
         optimized_action, debug = self.optimizer.optimize(raw_action, planner_state, adapter_observation)
         obs, reward, terminated, truncated, info = self.env.step(optimized_action)
+        current_planner_state = self.env.get_planner_state()
+        self._publish_mppi_trajectories(current_planner_state)
+        self._publish_mppi_action_commands(raw_action, optimized_action, current_planner_state)
         self.last_observation = obs
         self._push_observation(obs)
         info = dict(info)
@@ -769,6 +802,26 @@ class RLDrivenMPPIActionWrapper(gym.Wrapper):
 
     def get_planner_state(self):
         return self.env.get_planner_state()
+
+    def _publish_mppi_trajectories(self, planner_state: Dict[str, Any]) -> None:
+        publisher = getattr(self.env, "publish_mppi_trajectories", None)
+        if publisher is None:
+            return
+        trajectories = self.optimizer.get_last_visualization_trajectories(planner_state)
+        if not trajectories["active"]:
+            return
+        publisher(trajectories["sampled"], trajectories["weighted"])
+
+    def _publish_mppi_action_commands(
+        self,
+        raw_action: np.ndarray,
+        optimized_action: np.ndarray,
+        planner_state: Dict[str, Any],
+    ) -> None:
+        publisher = getattr(self.env, "publish_mppi_action_commands", None)
+        if publisher is None:
+            return
+        publisher(raw_action, optimized_action, planner_state)
 
     def _push_observation(self, obs: Any) -> None:
         if self.observation_stack <= 1:

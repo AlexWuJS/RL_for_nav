@@ -42,7 +42,8 @@ def main():
         seed=args.seed,
     )
     policy = DSACPolicy(config, device=args.device)
-    trainer = DSACTrainer(policy, env, config)
+    tensorboard_log = args.tensorboard_log or os.path.join(args.log_dir, "tensorboard")
+    trainer = DSACTrainer(policy, env, config, tensorboard_log=tensorboard_log)
 
     print(f"DSAC observation_dim={obs_dim}, action_low={action_low}, action_high={action_high}")
     print(f"Saving DSAC models to: {args.save_dir}")
@@ -50,6 +51,8 @@ def main():
         trainer.learn(args.total_timesteps, args.save_dir, log_interval=args.log_interval)
     except KeyboardInterrupt:
         print("DSAC training interrupted; saving current model.")
+    finally:
+        trainer.close()
 
     policy.save(os.path.join(args.save_dir, "final_model_dsac"))
     policy.save(os.path.join(args.save_dir, "best_model"))

@@ -4,7 +4,7 @@ import os
 import time
 from dataclasses import asdict, dataclass
 from collections import deque
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -228,13 +228,23 @@ def quantile_huber_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tenso
 
 
 class DSACTrainer:
-    def __init__(self, policy: DSACPolicy, env: Any, config: DSACConfig):
+    def __init__(self, policy: DSACPolicy, env: Any, config: DSACConfig, tensorboard_log: Optional[str] = None):
         self.policy = policy
         self.env = env
         self.config = config
         self.buffer = DSACReplayBuffer(config.observation_dim, config.action_dim, config.buffer_size, config.seed)
         self.actor_opt = torch.optim.Adam(self.policy.actor.parameters(), lr=config.actor_lr)
         self.critic_opt = torch.optim.Adam(self.policy.critic.parameters(), lr=config.critic_lr)
+        self.writer = None
+        if tensorboard_log:
+            try:
+                from torch.utils.tensorboard import SummaryWriter
+
+                os.makedirs(tensorboard_log, exist_ok=True)
+                self.writer = SummaryWriter(tensorboard_log)
+                print(f"TensorBoard logs: {tensorboard_log}")
+            except Exception as exc:
+                print(f"TensorBoard disabled: {exc}")
 
     def learn(self, total_timesteps: int, save_dir: str, log_interval: int = 1000) -> DSACPolicy:
         obs = self.env.reset()
@@ -267,6 +277,9 @@ class DSACTrainer:
                 episode_count += 1
                 recent_rewards.append(float(episode_reward))
                 recent_lengths.append(int(episode_length))
+                self._write_scalar("rollout/ep_rew", episode_reward, step)
+                self._write_scalar("rollout/ep_len", episode_length, step)
+                self._write_scalar("rollout/episodes", episode_count, step)
                 obs = np.asarray(self.env.reset(), dtype=np.float32).reshape(-1)
                 episode_reward = 0.0
                 episode_length = 0
@@ -277,7 +290,15 @@ class DSACTrainer:
                     recent_critic_losses.append(metrics["critic_loss"])
                     recent_q_values.append(metrics["mean_q"])
                     recent_log_probs.append(metrics["mean_log_prob"])
+                    self._write_training_metrics(metrics, step)
             if log_interval > 0 and step % log_interval == 0:
+                fps = step / max(time.time() - start_time, 1e-6)
+                self._write_scalar("time/fps", fps, step)
+                self._write_scalar("train/buffer_size", self.buffer.count, step)
+                self._write_scalar("rollout/ep_rew_mean", self._mean_or_nan(recent_rewards), step)
+                self._write_scalar("rollout/ep_len_mean", self._mean_or_nan(recent_lengths), step)
+                self._write_scalar("rollout/current_ep_reward", episode_reward, step)
+                self._write_scalar("rollout/current_ep_len", episode_length, step)
                 print(self._format_log_line(
                     step=step,
                     total_timesteps=int(total_timesteps),
@@ -294,7 +315,30 @@ class DSACTrainer:
                 ))
             if step % max(log_interval, 1) == 0:
                 self.policy.save(os.path.join(save_dir, "best_model"))
+                self._flush_writer()
+        self._flush_writer()
         return self.policy
+
+    def close(self) -> None:
+        if self.writer is not None:
+            self.writer.close()
+            self.writer = None
+
+    def _write_scalar(self, tag: str, value: float, step: int) -> None:
+        if self.writer is None or not np.isfinite(float(value)):
+            return
+        self.writer.add_scalar(tag, float(value), int(step))
+
+    def _write_training_metrics(self, metrics: Dict[str, float], step: int) -> None:
+        self._write_scalar("train/actor_loss", metrics["actor_loss"], step)
+        self._write_scalar("train/critic_loss", metrics["critic_loss"], step)
+        self._write_scalar("train/mean_q", metrics["mean_q"], step)
+        self._write_scalar("train/mean_log_prob", metrics["mean_log_prob"], step)
+        self._write_scalar("train/alpha", self.config.alpha, step)
+
+    def _flush_writer(self) -> None:
+        if self.writer is not None:
+            self.writer.flush()
 
     def _mean_or_nan(self, values) -> float:
         if not values:
@@ -391,4 +435,5 @@ def parse_dsac_args():
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--buffer-size", type=int, default=200000)
     parser.add_argument("--log-interval", type=int, default=1000)
+    parser.add_argument("--tensorboard-log", default=None, help="TensorBoard event directory. Defaults to <log-dir>/tensorboard.")
     return parser.parse_args()

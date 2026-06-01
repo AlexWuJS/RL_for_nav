@@ -13,6 +13,15 @@ import tf.transformations
 from frenet_utils import FrenetTransform, compute_tracking_reward
 
 class MyCarEnv(gym.Env):
+    collision_reward = -1000.0
+    success_reward = 1000.0
+    soft_out_of_bounds_limit = 3.0
+    hard_out_of_bounds_limit = 4.0
+    soft_out_of_bounds_penalty = -50.0
+    hard_out_of_bounds_reward = -300.0
+    shaping_reward_low = -50.0
+    shaping_reward_high = 50.0
+
     def __init__(self):
         super(MyCarEnv, self).__init__()
         
@@ -37,6 +46,8 @@ class MyCarEnv(gym.Env):
         
         # 路径可视化
         self.pub_path_marker = rospy.Publisher('/global_path_marker', MarkerArray, queue_size=1, latch=True)
+        self.pub_mppi_trajectories_marker = rospy.Publisher('/mppi_trajectories_marker', MarkerArray, queue_size=1)
+        self.pub_mppi_action_marker = rospy.Publisher('/mppi_action_marker', MarkerArray, queue_size=1)
         # 小车姿态箭头可视化
         self.pub_car_pose_marker = rospy.Publisher('/car_pose_marker', Marker, queue_size=1)
         self.frenet_transform = None
@@ -75,6 +86,9 @@ class MyCarEnv(gym.Env):
         # 机器人状态异步回调缓存
         self.usv_pos = np.array([0.0, 0.0])
         self.usv_yaw = 0.0
+        self.dynamic_obstacles = []
+        self.dynamic_obstacle_prefixes = ("obs_", "dynamic_obstacle_")
+        self.dynamic_obstacle_radius = 0.4
         rospy.Subscriber('/gazebo/model_states', ModelStates, self._model_states_callback, queue_size=1)
 
         # ROS 仿真时间频率控制器（锁定 MDP 步长为 10Hz，对应 dt=0.1）
@@ -93,6 +107,7 @@ class MyCarEnv(gym.Env):
             "target_position": self.target_pos.copy(),
             "frenet_transform": self.frenet_transform,
             "scan": self.latest_scan,
+            "dynamic_obstacles": [dict(obstacle) for obstacle in self.dynamic_obstacles],
             "action_low": self.action_space.low.copy(),
             "action_high": self.action_space.high.copy(),
             "dt": float(self.dt),
@@ -106,6 +121,7 @@ class MyCarEnv(gym.Env):
         self.latest_scan = msg
 
     def _model_states_callback(self, msg):
+        dynamic_obstacles = []
         try:
             idx = msg.name.index('usv')
             pos = msg.pose[idx].position
@@ -115,6 +131,22 @@ class MyCarEnv(gym.Env):
             self.usv_yaw = yaw
         except ValueError:
             pass
+        for idx, name in enumerate(msg.name):
+            if name == 'usv' or not name.startswith(self.dynamic_obstacle_prefixes):
+                continue
+            pos = msg.pose[idx].position
+            twist = msg.twist[idx] if idx < len(msg.twist) else None
+            if twist is None:
+                velocity = np.zeros(2, dtype=float)
+            else:
+                velocity = np.array([twist.linear.x, twist.linear.y], dtype=float)
+            dynamic_obstacles.append({
+                "name": name,
+                "position": np.array([pos.x, pos.y], dtype=float),
+                "velocity": velocity,
+                "radius": float(self.dynamic_obstacle_radius),
+            })
+        self.dynamic_obstacles = dynamic_obstacles
 
     def step(self, action):
         # 1. 解析动作为控制输入 (欠驱动 USV: action[0]=Surge期望, action[1]=Yaw期望)
@@ -135,12 +167,15 @@ class MyCarEnv(gym.Env):
         vel_msg.angular.z = self.velocity[2]  # 实际 Yaw 角速度
         self.pub_cmd_vel.publish(vel_msg)
 
-        # 2. 获取激光雷达数据（非阻塞回调）
+        # 等待当前控制量被 Gazebo 物理步实际执行后，再采样下一状态。
+        self.rate.sleep()
+
+        # 4. 获取激光雷达数据（非阻塞回调）
         while self.latest_scan is None:
             rospy.sleep(0.01)
         scan_data = self.latest_scan
 
-        # 3. 获取机器人当前状态与目标距离
+        # 5. 获取机器人当前状态与目标距离
         self.current_pos, self.current_yaw = self._get_robot_position()
         dist_to_goal = np.linalg.norm(self.target_pos - self.current_pos)
 
@@ -197,14 +232,24 @@ class MyCarEnv(gym.Env):
         
         # 7.1 终结状态判别：碰撞惩罚与到达终点奖励
 
+        abs_frenet_d = abs(float(frenet_d))
+        soft_out_of_bounds = abs_frenet_d > self.soft_out_of_bounds_limit
+        hard_out_of_bounds = abs_frenet_d > self.hard_out_of_bounds_limit
+
         if min_laser_dist < 0.25:
-            reward = -100.0
+            reward = self.collision_reward
             terminated = True
             terminal_reason = "collision"
             print("Collision detected!")
-            
-        elif distance_remaining < self.goal_reach_threshold and abs(frenet_d) <= 1.0:
-            reward = +1000.0
+
+        elif hard_out_of_bounds:
+            reward = self.hard_out_of_bounds_reward
+            terminated = True
+            terminal_reason = "out_of_bounds"
+            print("Out of bounds!")
+
+        elif distance_remaining < self.goal_reach_threshold and abs_frenet_d <= 1.0:
+            reward = self.success_reward
             terminated = True
             terminal_reason = "success"
             print("Goal reached!")
@@ -219,7 +264,9 @@ class MyCarEnv(gym.Env):
                 action=action,
                 previous_action=self.last_action,
             )
-            reward += reward_dict["total"]
+            reward = float(np.clip(reward_dict["total"], self.shaping_reward_low, self.shaping_reward_high))
+            if soft_out_of_bounds:
+                reward = min(reward + self.soft_out_of_bounds_penalty, self.soft_out_of_bounds_penalty)
 
         # ---------------------------------------------------------
 
@@ -236,9 +283,6 @@ class MyCarEnv(gym.Env):
         # 10. 更新上一帧动作（用于下一step的动作平滑度惩罚）
         self.last_action = np.array([float(action[0]), float(action[1])])
 
-        # 11. 锁定 MDP 步长为仿真时间 10Hz
-        self.rate.sleep()
-
         info = {
             "current_position": self.current_pos.copy(),
             "current_yaw": float(self.current_yaw),
@@ -249,10 +293,10 @@ class MyCarEnv(gym.Env):
             "frenet_d": float(frenet_d),
             "heading_to_path": float(heading_to_path),
             "min_laser_dist": float(min_laser_dist),
-            "is_success": bool(distance_remaining < self.goal_reach_threshold and abs(frenet_d) <= 1.0),
+            "is_success": bool(distance_remaining < self.goal_reach_threshold and abs_frenet_d <= 1.0),
             "is_collision": bool(min_laser_dist < 0.25),
             "is_timeout": bool(truncated),
-            "is_out_of_bounds": bool(abs(frenet_d) > 3.0),
+            "is_out_of_bounds": bool(soft_out_of_bounds),
             "terminal_reason": terminal_reason,
         }
 
@@ -412,6 +456,188 @@ class MyCarEnv(gym.Env):
 
         # 发布
         self.pub_path_marker.publish(marker_array)
+
+    def publish_mppi_trajectories(self, sampled, weighted, frame_id="odom"):
+        marker_array = MarkerArray()
+        stamp = rospy.Time(0)
+        lifetime = rospy.Duration(0.8)
+
+        clear_marker = Marker()
+        clear_marker.header.frame_id = frame_id
+        clear_marker.header.stamp = stamp
+        clear_marker.action = Marker.DELETEALL
+        marker_array.markers.append(clear_marker)
+
+        for marker_id, trajectory in enumerate(sampled or []):
+            marker = self._make_trajectory_marker(
+                trajectory,
+                frame_id=frame_id,
+                stamp=stamp,
+                namespace="mppi_samples",
+                marker_id=marker_id,
+                color=(0.2, 1.0, 0.2, 0.18),
+                line_width=0.012,
+                lifetime=lifetime,
+                z=0.16,
+            )
+            if marker is not None:
+                marker_array.markers.append(marker)
+
+        weighted_marker = self._make_trajectory_marker(
+            weighted,
+            frame_id=frame_id,
+            stamp=stamp,
+            namespace="mppi_weighted",
+            marker_id=0,
+            color=(1.0, 0.0, 0.0, 1.0),
+            line_width=0.04,
+            lifetime=lifetime,
+            z=0.2,
+        )
+        if weighted_marker is not None:
+            marker_array.markers.append(weighted_marker)
+
+        self.pub_mppi_trajectories_marker.publish(marker_array)
+
+    def publish_mppi_action_commands(self, raw_action, optimized_action, planner_state=None, frame_id="odom"):
+        marker_array = MarkerArray()
+        stamp = rospy.Time(0)
+        lifetime = rospy.Duration(0.8)
+
+        clear_marker = Marker()
+        clear_marker.header.frame_id = frame_id
+        clear_marker.header.stamp = stamp
+        clear_marker.action = Marker.DELETEALL
+        marker_array.markers.append(clear_marker)
+
+        if planner_state is None:
+            position = self.current_pos
+            yaw = self.current_yaw
+        else:
+            position = np.asarray(planner_state.get("position", self.current_pos), dtype=float)
+            yaw = float(planner_state.get("yaw", self.current_yaw))
+
+        raw_marker = self._make_action_arrow_marker(
+            raw_action,
+            position=position,
+            yaw=yaw,
+            lateral_offset=0.24,
+            frame_id=frame_id,
+            stamp=stamp,
+            namespace="rl_raw_action",
+            marker_id=0,
+            color=(0.1, 0.65, 1.0, 0.95),
+            lifetime=lifetime,
+            z=0.42,
+        )
+        optimized_marker = self._make_action_arrow_marker(
+            optimized_action,
+            position=position,
+            yaw=yaw,
+            lateral_offset=-0.24,
+            frame_id=frame_id,
+            stamp=stamp,
+            namespace="mppi_final_action",
+            marker_id=0,
+            color=(1.0, 0.25, 0.0, 0.95),
+            lifetime=lifetime,
+            z=0.48,
+        )
+        marker_array.markers.extend([raw_marker, optimized_marker])
+        self.pub_mppi_action_marker.publish(marker_array)
+
+    def _make_action_arrow_marker(
+        self,
+        action,
+        position,
+        yaw,
+        lateral_offset,
+        frame_id,
+        stamp,
+        namespace,
+        marker_id,
+        color,
+        lifetime,
+        z,
+    ):
+        action = np.asarray(action, dtype=float).reshape(-1)
+        surge = float(action[0]) if action.size > 0 else 0.0
+        yaw_cmd = float(action[1]) if action.size > 1 else 0.0
+        direction = float(yaw + 0.8 * yaw_cmd)
+        if surge < 0.0:
+            direction += math.pi
+        length = float(np.clip(0.35 + 0.45 * abs(surge), 0.25, 1.4))
+        heading_vec = np.array([math.cos(direction), math.sin(direction)], dtype=float)
+        lateral_vec = np.array([-math.sin(yaw), math.cos(yaw)], dtype=float)
+        start = np.asarray(position[:2], dtype=float) + lateral_vec * float(lateral_offset)
+        end = start + heading_vec * length
+
+        marker = Marker()
+        marker.header.frame_id = frame_id
+        marker.header.stamp = stamp
+        marker.ns = namespace
+        marker.id = int(marker_id)
+        marker.type = Marker.ARROW
+        marker.action = Marker.ADD
+        marker.lifetime = lifetime
+        marker.scale.x = 0.035
+        marker.scale.y = 0.09
+        marker.scale.z = 0.14
+        marker.color.r = float(color[0])
+        marker.color.g = float(color[1])
+        marker.color.b = float(color[2])
+        marker.color.a = float(color[3])
+
+        p0 = Point()
+        p0.x = float(start[0])
+        p0.y = float(start[1])
+        p0.z = float(z)
+        p1 = Point()
+        p1.x = float(end[0])
+        p1.y = float(end[1])
+        p1.z = float(z)
+        marker.points.extend([p0, p1])
+        return marker
+
+    def _make_trajectory_marker(
+        self,
+        trajectory,
+        frame_id,
+        stamp,
+        namespace,
+        marker_id,
+        color,
+        line_width,
+        lifetime,
+        z,
+    ):
+        if trajectory is None:
+            return None
+        points = np.asarray(trajectory, dtype=float).reshape(-1, 2)
+        if len(points) < 2:
+            return None
+
+        marker = Marker()
+        marker.header.frame_id = frame_id
+        marker.header.stamp = stamp
+        marker.ns = namespace
+        marker.id = int(marker_id)
+        marker.type = Marker.LINE_STRIP
+        marker.action = Marker.ADD
+        marker.lifetime = lifetime
+        marker.pose.orientation.w = 1.0
+        marker.scale.x = float(line_width)
+        marker.color.r = float(color[0])
+        marker.color.g = float(color[1])
+        marker.color.b = float(color[2])
+        marker.color.a = float(color[3])
+        for point in points:
+            p = Point()
+            p.x = float(point[0])
+            p.y = float(point[1])
+            p.z = float(z)
+            marker.points.append(p)
+        return marker
 
     def _visualize_car_pose(self):
         """发布小车当前位置和朝向的箭头 Marker"""

@@ -201,13 +201,14 @@ def piecewise_lateral_penalty(frenet_d: float) -> float:
     return float(stage_2 + 80.0 * excess * excess + 45.0 * excess)
 
 
-def obstacle_avoidance_penalty(min_obstacle_dist: float = None, safe_distance: float = 0.45) -> float:
+def obstacle_avoidance_penalty(min_obstacle_dist: float = None, safe_distance: float = 0.7) -> float:
     if min_obstacle_dist is None or not np.isfinite(min_obstacle_dist):
         return 0.0
     if min_obstacle_dist >= safe_distance:
         return 0.0
-    penalty = math.exp(5.0 * (safe_distance - float(min_obstacle_dist))) - 1.0
-    return float(min(penalty, 10.0))
+    violation = (float(safe_distance) - float(min_obstacle_dist)) / max(float(safe_distance) - 0.25, 1e-6)
+    violation = clamp(violation, 0.0, 1.0)
+    return float(50.0 * violation * violation)
 
 
 def compute_tracking_reward(
@@ -216,12 +217,12 @@ def compute_tracking_reward(
     heading_error: float,
     min_obstacle_dist: float = None,
     previous_abs_frenet_d: float = None,
-    safe_distance: float = 0.45,
+    safe_distance: float = 0.7,
     action=None,
     previous_action=None,
     progress_gain: float = 30.0,
     heading_gain: float = 1.5,
-    recovery_gain: float = 8.0,
+    recovery_gain: float = 12.0,
     reward_scale: float = 2.5,
     living_penalty: float = 0.1,
 ) -> dict:
@@ -238,7 +239,7 @@ def compute_tracking_reward(
     recover_center_bonus = 0.0
     if previous_abs_frenet_d is not None and np.isfinite(previous_abs_frenet_d):
         recovery = float(previous_abs_frenet_d) - abs_d
-        recover_center_bonus = clamp(recovery_gain * recovery * tracking_scale, -4.0, 4.0)
+        recover_center_bonus = clamp(recovery_gain * recovery * tracking_scale, -6.0, 8.0)
 
     obstacle_penalty = -obstacle_avoidance_penalty(min_obstacle_dist, safe_distance)
 

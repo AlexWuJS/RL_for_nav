@@ -89,11 +89,6 @@ Visualization Manager:
         Expand Link Details: false
         Expand Tree: false
         Link Tree Style: Links in Alphabetic Order
-        back_wheel:
-          Alpha: 1
-          Show Axes: false
-          Show Trail: false
-          Value: true
         base_footprint:
           Alpha: 1
           Show Axes: false
@@ -104,32 +99,22 @@ Visualization Manager:
           Show Axes: false
           Show Trail: false
           Value: true
-        camera:
-          Alpha: 1
-          Show Axes: false
-          Show Trail: false
-          Value: true
-        front_wheel:
-          Alpha: 1
-          Show Axes: false
-          Show Trail: false
-          Value: true
         laser:
           Alpha: 1
           Show Axes: false
           Show Trail: false
           Value: true
-        left_wheel:
-          Alpha: 1
-          Show Axes: false
-          Show Trail: false
-          Value: true
-        right_wheel:
-          Alpha: 1
-          Show Axes: false
-          Show Trail: false
-          Value: true
         support:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        thruster_left:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        thruster_right:
           Alpha: 1
           Show Axes: false
           Show Trail: false
@@ -146,6 +131,15 @@ Visualization Manager:
       Name: MarkerArray
       Namespaces:
         global_path: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /mppi_trajectories_marker
+      Name: MarkerArray
+      Namespaces:
+        mppi_samples: true
+        mppi_weighted: true
       Queue Size: 100
       Value: true
   Enabled: true
@@ -176,7 +170,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/Orbit
-      Distance: 31.058481216430664
+      Distance: 12.692843437194824
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1

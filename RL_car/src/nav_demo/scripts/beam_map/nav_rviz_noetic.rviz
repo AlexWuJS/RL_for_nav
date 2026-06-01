@@ -120,6 +120,34 @@ Visualization Manager:
         Value: /global_path_marker
       Value: true
 
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Name: MPPI Trajectories
+      Namespaces:
+        {}
+      Queue Size: 1
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /mppi_trajectories_marker
+      Value: true
+
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Name: RL vs MPPI Actions
+      Namespaces:
+        {}
+      Queue Size: 1
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /mppi_action_marker
+      Value: true
+
     - Class: rviz/Axes
       Enabled: true
       Length: 1
