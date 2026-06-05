@@ -1,6 +1,7 @@
 import sys
 import types
 import unittest
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -11,8 +12,8 @@ except ModuleNotFoundError:  # pragma: no cover - depends on local ML runtime
     torch = None
 
 
-BEAM_MAP_DIR = Path(__file__).resolve().parents[1] / "src" / "nav_demo" / "scripts" / "beam_map"
-sys.path.insert(0, str(BEAM_MAP_DIR))
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_DIR))
 
 
 try:
@@ -46,8 +47,8 @@ except ModuleNotFoundError:
 
 
 if torch is not None:
-    from dsac import DSACConfig, DSACPolicy, DSACReplayBuffer, DistributionalCritic  # noqa: E402
-    from rl_driven_mppi import DSACPolicyAdapter, RLDrivenMPPIConfig, RLDrivenMPPIOptimizer  # noqa: E402
+    from dsac_mppi.algorithms.dsac import DSACConfig, DSACPolicy, DSACReplayBuffer, DistributionalCritic  # noqa: E402
+    from dsac_mppi.controllers.rl_driven_mppi import DSACPolicyAdapter, RLDrivenMPPIConfig, RLDrivenMPPIOptimizer  # noqa: E402
     from test_rl_driven_mppi import planner_state  # noqa: E402
 
 
@@ -77,6 +78,32 @@ class DSACModuleTests(unittest.TestCase):
         self.assertEqual(sampled_action.shape, (1, 2))
         self.assertTrue(np.all(deterministic_action >= np.asarray(policy.config.action_low) - 1e-6))
         self.assertTrue(np.all(deterministic_action <= np.asarray(policy.config.action_high) + 1e-6))
+
+    def test_policy_supports_three_dimensional_high_level_actions(self):
+        config = DSACConfig(
+            observation_dim=8,
+            action_dim=3,
+            action_low=(0.8, -2.2, 0.2),
+            action_high=(3.5, 2.2, 1.2),
+            hidden_dim=32,
+            num_quantiles=8,
+            seed=3,
+        )
+        policy = DSACPolicy(config, device="cpu")
+        obs = np.zeros(8, dtype=np.float32)
+        action, _ = policy.predict(obs, deterministic=True)
+
+        self.assertEqual(action.shape, (1, 3))
+        self.assertTrue(np.all(action >= np.asarray(config.action_low) - 1e-6))
+        self.assertTrue(np.all(action <= np.asarray(config.action_high) + 1e-6))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            policy.save(tmp)
+            loaded = DSACPolicy.load(tmp, device="cpu")
+            loaded_action, _ = loaded.predict(obs, deterministic=True)
+
+        self.assertEqual(loaded.config.action_dim, 3)
+        self.assertEqual(loaded_action.shape, (1, 3))
 
     def test_distributional_critic_outputs_quantile_distribution(self):
         critic = DistributionalCritic(obs_dim=8, action_dim=2, hidden_dim=32, num_quantiles=8)

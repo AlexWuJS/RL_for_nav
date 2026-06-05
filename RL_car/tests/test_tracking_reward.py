@@ -5,13 +5,13 @@ from pathlib import Path
 import numpy as np
 
 
-BEAM_MAP_DIR = Path(__file__).resolve().parents[1] / "src" / "nav_demo" / "scripts" / "beam_map"
-sys.path.insert(0, str(BEAM_MAP_DIR))
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_DIR))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from test_rl_driven_mppi import planner_state  # noqa: E402
-from frenet_utils import compute_tracking_reward, obstacle_tracking_scale, piecewise_lateral_penalty  # noqa: E402
-from rl_driven_mppi import RLDrivenMPPIConfig, RLDrivenMPPIOptimizer  # noqa: E402
+from dsac_mppi.envs.frenet_utils import compute_tracking_reward, obstacle_tracking_scale, piecewise_lateral_penalty  # noqa: E402
+from dsac_mppi.controllers.rl_driven_mppi import RLDrivenMPPIConfig, RLDrivenMPPIOptimizer  # noqa: E402
 
 
 class TrackingRewardTests(unittest.TestCase):

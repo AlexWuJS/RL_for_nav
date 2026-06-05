@@ -6,8 +6,8 @@ from pathlib import Path
 import numpy as np
 
 
-BEAM_MAP_DIR = Path(__file__).resolve().parents[1] / "src" / "nav_demo" / "scripts" / "beam_map"
-sys.path.insert(0, str(BEAM_MAP_DIR))
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_DIR))
 
 
 class FakeStamp:
@@ -70,9 +70,16 @@ class FakePoint:
         self.z = 0.0
 
 
+class FakeTwist:
+    def __init__(self):
+        self.linear = types.SimpleNamespace(x=0.0, y=0.0, z=0.0)
+        self.angular = types.SimpleNamespace(x=0.0, y=0.0, z=0.0)
+
+
 def install_fake_ros_modules():
     gymnasium = types.ModuleType("gymnasium")
     gymnasium.Env = type("Env", (), {})
+    gymnasium.Wrapper = type("Wrapper", (), {"__init__": lambda self, env: setattr(self, "env", env)})
     gymnasium.spaces = types.SimpleNamespace(Box=lambda *args, **kwargs: None)
     sys.modules["gymnasium"] = gymnasium
 
@@ -90,7 +97,7 @@ def install_fake_ros_modules():
 
     geometry_msgs = types.ModuleType("geometry_msgs")
     geometry_msgs_msg = types.ModuleType("geometry_msgs.msg")
-    geometry_msgs_msg.Twist = type("Twist", (), {})
+    geometry_msgs_msg.Twist = FakeTwist
     geometry_msgs_msg.Point = FakePoint
     geometry_msgs_msg.Pose = type("Pose", (), {})
     sys.modules["geometry_msgs"] = geometry_msgs
@@ -131,7 +138,7 @@ def install_fake_ros_modules():
 
 
 install_fake_ros_modules()
-from ros_env import MyCarEnv  # noqa: E402
+from dsac_mppi.envs.ros_env import MyCarEnv  # noqa: E402
 
 
 class MppiRvizMarkerTests(unittest.TestCase):
@@ -204,6 +211,52 @@ class MppiRvizMarkerTests(unittest.TestCase):
         self.assertAlmostEqual(optimized_marker.color.b, 0.0)
         self.assertEqual(len(optimized_marker.points), 2)
         self.assertGreater(optimized_marker.points[1].x, optimized_marker.points[0].x)
+
+    def test_high_level_action_maps_to_frenet_target_and_low_level_command(self):
+        env = self.make_env_shell()
+        env.control_mode = "high_level_frenet"
+        env.dynamics_model = "ideal"
+        env.LOW_LEVEL_ACTION_LOW = np.array([-1.0, -1.0], dtype=np.float32)
+        env.LOW_LEVEL_ACTION_HIGH = np.array([2.0, 1.0], dtype=np.float32)
+        env.HIGH_LEVEL_ACTION_LOW = np.array([0.8, -2.2, 0.2], dtype=np.float32)
+        env.HIGH_LEVEL_ACTION_HIGH = np.array([3.5, 2.2, 1.2], dtype=np.float32)
+        env.frenet_transform = types.SimpleNamespace(
+            path_length=10.0,
+            cartesian_to_frenet=lambda point: (float(point[0]), float(point[1])),
+            frenet_to_cartesian=lambda s, d: np.array([s, d], dtype=float),
+        )
+
+        low_level, info = env.high_level_action_to_low_level(np.array([2.0, 1.0, 0.8], dtype=np.float32))
+
+        self.assertEqual(low_level.shape, (2,))
+        self.assertGreater(low_level[0], 0.0)
+        self.assertGreater(low_level[1], 0.0)
+        np.testing.assert_allclose(info["high_level_target_point"], np.array([2.0, 1.0], dtype=np.float32))
+
+    def test_ideal_dynamics_publishes_command_without_integrating_inertia(self):
+        env = self.make_env_shell()
+        env.dynamics_model = "ideal"
+        env.velocity = np.zeros(3, dtype=float)
+        env.last_cmd_velocity = np.zeros(3, dtype=float)
+        twist = env._low_level_action_to_twist(np.array([0.7, 0.2], dtype=np.float32))
+
+        self.assertAlmostEqual(twist.linear.x, 0.7, places=6)
+        self.assertAlmostEqual(twist.angular.z, 0.2, places=6)
+        np.testing.assert_allclose(env.velocity, np.zeros(3, dtype=float))
+        np.testing.assert_allclose(env.last_cmd_velocity, np.array([0.7, 0.0, 0.2], dtype=float), atol=1e-6)
+
+    def test_inertia_dynamics_keeps_old_integrated_behavior(self):
+        env = self.make_env_shell()
+        env.dynamics_model = "inertia"
+        env.velocity = np.zeros(3, dtype=float)
+        env.mass = 2.0
+        env.damping = 0.5
+        env.dt = 0.1
+        twist = env._low_level_action_to_twist(np.array([1.0, 0.4], dtype=np.float32))
+
+        self.assertAlmostEqual(twist.linear.x, 0.05, places=6)
+        self.assertAlmostEqual(twist.angular.z, 0.02, places=6)
+        np.testing.assert_allclose(env.velocity, np.array([0.05, 0.0, 0.02], dtype=float), atol=1e-6)
 
 
 if __name__ == "__main__":

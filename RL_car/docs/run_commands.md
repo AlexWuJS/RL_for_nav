@@ -1,213 +1,209 @@
 # 项目运行指令
 
-本文档整理当前 USV ROS/Gazebo 项目中 DSAC、RL-driven MPPI、严格 DSAC + RL-driven MPPI 的常用运行命令。默认从仓库根目录进入脚本目录后执行：
+默认从工作区内层目录运行：
 
 ```bash
-cd RL_car/src/nav_demo/scripts/beam_map
+cd ~/RL_car/RL_car
 ```
-
-如果你的工程路径是双层 `RL_car/RL_car`，则常见路径为：
-
-```bash
-cd ~/RL_car/RL_car/src/nav_demo/scripts/beam_map
-```
-
-## 环境要求
-
-- ROS/Gazebo 仿真环境已启动，且 `/scan`、`/cmd_vel`、`/gazebo/model_states` 等话题可用。
-- Python 环境需要安装 `torch`、`gymnasium`、`stable-baselines3`、`numpy`、`matplotlib` 等依赖。
-- DSAC 训练和严格 DSAC-RLMPPI 运行需要 PyTorch。
-- 如果只运行部分单元测试，缺少 `torch` 时 DSAC 相关测试会跳过，但训练脚本不能运行。
 
 ## 单元测试
 
-从仓库根目录运行：
-
 ```bash
-python -m unittest discover -s RL_car/tests
+python -m unittest discover -s tests
 ```
 
-编译检查核心脚本：
+## 编译检查
 
 ```bash
 python -m py_compile \
-  RL_car/src/nav_demo/scripts/beam_map/frenet_utils.py \
-  RL_car/src/nav_demo/scripts/beam_map/ros_env.py \
-  RL_car/src/nav_demo/scripts/beam_map/dsac.py \
-  RL_car/src/nav_demo/scripts/beam_map/train_dsac.py \
-  RL_car/src/nav_demo/scripts/beam_map/mppi_dbas.py \
-  RL_car/src/nav_demo/scripts/beam_map/rl_driven_mppi.py \
-  RL_car/src/nav_demo/scripts/beam_map/compare_sac_mppi.py \
-  RL_car/src/nav_demo/scripts/beam_map/test01.py
+  dsac_mppi/algorithms/dsac.py \
+  dsac_mppi/controllers/mppi_dbas.py \
+  dsac_mppi/controllers/rl_driven_mppi.py \
+  dsac_mppi/envs/ros_env.py \
+  scripts/train/train_dsac.py \
+  scripts/test/compare_dsac_mppi.py
 ```
+
+## 验证项目是否能运行
+
+建议按下面顺序验证，先确认 Python 代码，再确认 ROS/Gazebo。
+
+### 1. 确认当前分支和目录
+
+```bash
+cd ~/RL_car/RL_car
+git branch --show-current
+pwd
+```
+
+正常情况：
+
+- 分支应为 `project/dsac-mppi`。
+- 当前目录应为内层工程目录 `~/RL_car/RL_car`。
+
+### 2. Python 代码级检查
+
+```bash
+python -m py_compile \
+  dsac_mppi/algorithms/dsac.py \
+  dsac_mppi/controllers/mppi_dbas.py \
+  dsac_mppi/controllers/rl_driven_mppi.py \
+  dsac_mppi/envs/ros_env.py \
+  scripts/train/train_dsac.py \
+  scripts/test/compare_dsac_mppi.py \
+  scripts/test/run_dsac_mppi.py
+
+python -m unittest discover -s tests
+```
+
+正常情况：
+
+- `py_compile` 没有输出。
+- 单元测试显示 `OK`，部分依赖缺失时出现 `skipped` 是可以接受的。
+
+### 3. ROS 包结构检查
+
+```bash
+catkin_make --source src/ros
+```
+
+正常情况：
+
+- `nav_demo` 和 `urdf02_gazebo` 能被 catkin 识别。
+- 编译结束没有 CMake 或 package 找不到的错误。
+
+如果机器上的 CMake 是 4.x，ROS Noetic 自带的部分 catkin/gtest 文件会触发旧版 CMake 兼容警告。当前项目已经在 `src/ros/CMakeLists.txt` 设置了兼容策略；如果仍遇到类似 `Compatibility with CMake < 3.5 has been removed` 的报错，先删除失败生成的目录再重试：
+
+```bash
+rm -rf build devel
+catkin_make --source src/ros
+```
+
+编译完成后加载环境：
+
+```bash
+source devel/setup.bash
+```
+
+### 4. 启动 Gazebo 仿真
+
+另开一个终端：
+
+```bash
+cd ~/RL_car/RL_car
+source devel/setup.bash
+roslaunch urdf02_gazebo RL_car.launch
+```
+
+启动后检查关键接口：
+
+```bash
+rostopic list | grep -E '/scan|/cmd_vel|/gazebo/model_states'
+rosservice list | grep -E '/gazebo/set_model_state|/gazebo/get_model_state|/gazebo/spawn_sdf_model'
+```
+
+正常情况：
+
+- 能看到 `/scan`、`/cmd_vel`、`/gazebo/model_states`。
+- 能看到 Gazebo 的 set/get/spawn model service。
+
+### 5. 运行 DSAC+MPPI 单次测试
+
+在 Gazebo 已启动的情况下运行：
+
+```bash
+python -m scripts.test.run_dsac_mppi \
+  --model data/dsac_high_level/models/best_model \
+  --mode dsac_rl_driven_mppi \
+  --max-steps 200 \
+  --log-every 10
+```
+
+正常情况：
+
+- 终端持续输出 step/reward/info。
+- 默认输出为精简调试信息。
+- Gazebo 中机器人能移动。
+- 如果模型路径不存在，先确认 `data/dsac_high_level/models/best_model/config.json` 和 `model.pt` 是否存在。
+
+### 6. 运行短评估
+
+```bash
+python -m scripts.test.compare_dsac_mppi \
+  --model data/dsac_high_level/models/best_model \
+  --mode dsac \
+  --episodes 1 \
+  --max-steps 200 \
+  --run-name verify_dsac
+```
+
+正常情况：
+
+- 输出 JSON summary。
+- 生成目录 `data/dsac_high_level/eval/verify_dsac/`。
+
+### 7. 训练 smoke test
+
+训练需要 Gazebo 环境正常运行：
+
+```bash
+python -m scripts.train.train_dsac \
+  --model-name dsac_smoke_verify \
+  --control-mode high_level_frenet \
+  --dynamics-model ideal \
+  --curriculum auto \
+  --total-timesteps 1000 \
+  --learning-starts 100
+```
+
+正常情况：
+
+- 训练能开始采样并打印 DSAC 状态。
+- 输出目录为 `data/dsac_smoke_verify/`。
 
 ## 训练 DSAC
 
-快速 smoke 训练，用来检查流程是否能跑通：
-
 ```bash
-python train_dsac.py \
-  --total-timesteps 5000 \
-  --save-dir ./training_dsac_smoke_results \
-  --log-dir ./logs_dsac_smoke
+python -m scripts.train.train_dsac \
+  --model-name dsac_high_level \
+  --control-mode high_level_frenet \
+  --dynamics-model ideal \
+  --curriculum auto \
+  --total-timesteps 300000
 ```
 
-正式训练离线 DSAC 策略：
-
-```bash
-python train_dsac.py \
-  --total-timesteps 300000 \
-  --log-interval 1000 \
-  --save-dir ./training_dsac_usv_results \
-  --log-dir ./logs_dsac
-```
-
-默认输出：
+输出路径：
 
 ```text
-./training_dsac_usv_results/best_model
-./training_dsac_usv_results/final_model_dsac
+data/dsac_high_level/models/best_model
+data/dsac_high_level/models/final_model_dsac
+data/dsac_high_level/logs/
 ```
 
-注意：当前奖励函数已改为软边界跟线奖励，旧 DSAC 模型不会自动具备新的跟线行为。建议重新训练后再评估 `dsac` 和 `dsac_rl_driven_mppi`。
+更多训练参数见 `docs/train_dsac.md`。
 
-训练过程中终端会每隔 `--log-interval` 步以表格形式输出一次汇总信息，包括：
-
-- 当前 step、episode 数、replay buffer 大小和 FPS。
-- 当前 episode reward 和当前 episode 长度。
-- 最近 100 个 episode 的平均 reward 和平均步数。
-- 最近更新窗口的 `actor_loss`、`critic_loss`、`mean_q`、`mean_log_prob` 和 `alpha`。
-
-## 训练 SAC Baseline
-
-如果需要运行旧 SAC baseline 或 SAC-compatible RLMPPI：
+## 评估 DSAC+MPPI
 
 ```bash
-python train.py --total-timesteps 300000
-```
-
-默认输出：
-
-```text
-./training_usv_v2_results/best_model
-```
-
-## 离线评估
-
-单独评估 DSAC，不经过 MPPI：
-
-```bash
-python compare_sac_mppi.py \
-  --dsac-model ./training_dsac_usv_results/best_model \
-  --mode dsac \
-  --episode 10 \
-  --output-dir ./comparison_dsac_only \
-  --plot
-```
-
-评估严格 DSAC + RL-driven MPPI：
-
-```bash
-python compare_sac_mppi.py \
-  --dsac-model ./training_dsac_usv_results/best_model \
+python -m scripts.test.compare_dsac_mppi \
+  --model data/dsac_high_level/models/best_model \
   --mode dsac_rl_driven_mppi \
-  --episode 10 \
-  --output-dir ./comparison_dsac_rl_driven_mppi \
+  --run-name dsac_rlmppi_eval \
   --plot
 ```
 
-运行严格 DSAC-RLMPPI 消融对比：
+输出路径：
 
-```bash
-python compare_sac_mppi.py \
-  --baseline-model ./training_usv_v2_results/best_model \
-  --dsac-model ./training_dsac_usv_results/best_model \
-  --mode ablation_dsac_rlmppi \
-  --episode 30 \
-  --output-dir ./comparison_dsac_rl_driven_mppi_ablation \
-  --plot
+```text
+data/dsac_high_level/eval/dsac_rlmppi_eval/
 ```
 
-评估纯 MPPI：
-
-```bash
-python compare_sac_mppi.py \
-  --mode pure_mppi \
-  --episode 10 \
-  --output-dir ./comparison_pure_mppi \
-  --plot
-```
-
-评估旧 SAC-compatible RL-driven MPPI：
-
-```bash
-python compare_sac_mppi.py \
-  --model ./training_usv_v2_results/best_model \
-  --mode rl_driven_mppi \
-  --episode 10 \
-  --output-dir ./comparison_rl_driven_mppi \
-  --plot
-```
+更多评估模式见 `docs/evaluate_dsac_mppi.md`。
 
 ## Gazebo 单次运行
 
-严格 DSAC + RL-driven MPPI：
-
 ```bash
-python test01.py \
-  --mode dsac_rl_driven_mppi \
-  --model ./training_dsac_usv_results/best_model
+python -m scripts.test.run_dsac_mppi \
+  --model data/dsac_high_level/models/best_model \
+  --mode dsac_rl_driven_mppi
 ```
-
-单独 DSAC：
-
-```bash
-python test01.py \
-  --mode dsac \
-  --model ./training_dsac_usv_results/best_model
-```
-
-旧 SAC-compatible RL-driven MPPI：
-
-```bash
-python test01.py \
-  --mode rl_driven_mppi \
-  --model ./training_usv_v2_results/best_model
-```
-
-## 常用模式说明
-
-- `dsac`：只执行 DSAC actor，不加 MPPI。
-- `pure_mppi`：不使用 RL 初始化、guided rollouts 和 terminal critic。
-- `dsac_rl_driven_mppi`：严格 DSAC + RL-driven MPPI，使用 DSAC actor 初始化、guided rollouts、top-Z 更新和 DSAC distributional critic terminal cost。
-- `dsac_rl_driven_mppi_no_hss`：关闭 guided rollouts。
-- `dsac_rl_driven_mppi_fixed_sigma`：关闭方差更新。
-- `dsac_rl_driven_mppi_no_q`：关闭 terminal critic cost。
-- `ablation_dsac_rlmppi`：批量运行 baseline、pure MPPI、DSAC、完整 DSAC-RLMPPI 和消融模式。
-
-## 输出文件
-
-评估命令会在 `--output-dir` 指定目录中生成：
-
-- 每个模式的 episode CSV。
-- 每步 trace CSV。
-- `summary.json`。
-- 启用 `--plot` 后生成对比图。
-
-重点观察指标：
-
-- `mean_success`
-- `mean_collision`
-- `mean_out_of_bounds`
-- `mean_reward`
-- `mean_frenet_abs_d`
-- `mean_rlmppi_terminal_q_used`
-- `mean_rlmppi_online_time_ms`
-
-## 推荐调试顺序
-
-1. 先跑单元测试，确认代码没有接口错误。
-2. 用 `train_dsac.py --total-timesteps 5000` 做 smoke 训练。
-3. 用 `--mode dsac` 评估新 DSAC 是否学会跟线。
-4. 再用 `--mode dsac_rl_driven_mppi` 评估 MPPI 是否进一步改善。
-5. 如果 DSAC-only 的 `mean_frenet_abs_d` 仍然很高，先继续调奖励或增加训练步数，不要先调 MPPI。

@@ -8,11 +8,18 @@
 # 忽略 Python 缓存 (必须忽略)
 __pycache__/
 *.pyc
+.pytest_cache/
 
 # 忽略 TensorBoard 日志和训练日志
 events.out.tfevents*
 logs/
 training_results/
+build/
+devel/
+RL_car/build/
+RL_car/devel/
+RL_car/**/__pycache__/
+RL_car/**/*.pyc
 
 # 忽略数据文件
 *.npz

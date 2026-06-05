@@ -1,0 +1,27 @@
+{
+  "observation_dim": 1616,
+  "action_dim": 3,
+  "action_low": [
+    0.800000011920929,
+    -2.200000047683716,
+    0.20000000298023224
+  ],
+  "action_high": [
+    3.5,
+    2.200000047683716,
+    1.2000000476837158
+  ],
+  "hidden_dim": 256,
+  "num_quantiles": 32,
+  "gamma": 0.99,
+  "tau": 0.005,
+  "alpha": 0.2,
+  "actor_lr": 0.0003,
+  "critic_lr": 0.0003,
+  "batch_size": 128,
+  "buffer_size": 200000,
+  "learning_starts": 10000,
+  "train_freq": 10,
+  "gradient_steps": 10,
+  "seed": 0
+}

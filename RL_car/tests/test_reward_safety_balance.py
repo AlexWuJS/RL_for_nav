@@ -3,11 +3,11 @@ import unittest
 from pathlib import Path
 
 
-BEAM_MAP_DIR = Path(__file__).resolve().parents[1] / "src" / "nav_demo" / "scripts" / "beam_map"
-sys.path.insert(0, str(BEAM_MAP_DIR))
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_DIR))
 
-from frenet_utils import compute_tracking_reward, obstacle_avoidance_penalty  # noqa: E402
-from mppi_dbas import MPPIDBaSConfig  # noqa: E402
+from dsac_mppi.envs.frenet_utils import compute_tracking_reward, obstacle_avoidance_penalty  # noqa: E402
+from dsac_mppi.controllers.mppi_dbas import MPPIDBaSConfig  # noqa: E402
 
 
 class RewardSafetyBalanceTests(unittest.TestCase):
