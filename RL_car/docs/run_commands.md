@@ -150,7 +150,7 @@ python -m scripts.test.compare_dsac_mppi \
 python -m scripts.train.train_dsac \
   --model-name dsac_smoke_verify \
   --control-mode high_level_frenet \
-  --dynamics-model ideal \
+  --dynamics-model first_order \
   --curriculum auto \
   --total-timesteps 1000 \
   --learning-starts 100
@@ -167,7 +167,7 @@ python -m scripts.train.train_dsac \
 python -m scripts.train.train_dsac \
   --model-name dsac_high_level \
   --control-mode high_level_frenet \
-  --dynamics-model ideal \
+  --dynamics-model first_order \
   --curriculum auto \
   --total-timesteps 300000
 ```

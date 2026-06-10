@@ -250,7 +250,7 @@ def parse_args():
     parser.add_argument("--model", "--dsac-model", dest="model", default=None)
     parser.add_argument("--model-name", default="dsac_high_level")
     parser.add_argument("--control-mode", choices=("auto", "low_level_velocity", "high_level_frenet"), default="auto")
-    parser.add_argument("--dynamics-model", choices=("ideal", "inertia"), default="ideal")
+    parser.add_argument("--dynamics-model", choices=("ideal", "first_order", "inertia"), default="first_order")
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--episodes", "--episode", type=int, default=30)

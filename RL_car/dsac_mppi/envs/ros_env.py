@@ -11,6 +11,14 @@ from visualization_msgs.msg import Marker, MarkerArray
 import math
 import tf.transformations
 from dsac_mppi.envs.frenet_utils import FrenetTransform, compute_tracking_reward
+from dsac_mppi.envs.usv_dynamics import (
+    USVDynamicsConfig,
+    clip_command,
+    frenet_outputs,
+    step_velocity,
+    ur_to_twist_vector,
+    velocity_to_ur,
+)
 
 class MyCarEnv(gym.Env):
     collision_reward = -1000.0
@@ -22,18 +30,18 @@ class MyCarEnv(gym.Env):
     shaping_reward_low = -50.0
     shaping_reward_high = 50.0
 
-    LOW_LEVEL_ACTION_LOW = np.array([-1.0, -1.0], dtype=np.float32)
-    LOW_LEVEL_ACTION_HIGH = np.array([2.0, 1.0], dtype=np.float32)
+    LOW_LEVEL_ACTION_LOW = np.array([0.0, -0.6], dtype=np.float32)
+    LOW_LEVEL_ACTION_HIGH = np.array([1.5, 0.6], dtype=np.float32)
     HIGH_LEVEL_ACTION_LOW = np.array([0.8, -2.2, 0.2], dtype=np.float32)
     HIGH_LEVEL_ACTION_HIGH = np.array([3.5, 2.2, 1.2], dtype=np.float32)
 
-    def __init__(self, control_mode="low_level_velocity", dynamics_model="inertia", curriculum_stage=None):
+    def __init__(self, control_mode="low_level_velocity", dynamics_model="first_order", curriculum_stage=None):
         super(MyCarEnv, self).__init__()
         self.control_mode = str(control_mode)
-        self.dynamics_model = str(dynamics_model)
+        self.dynamics_model = "first_order" if str(dynamics_model) == "inertia" else str(dynamics_model)
         if self.control_mode not in ("low_level_velocity", "high_level_frenet"):
             raise ValueError(f"Unsupported control_mode: {self.control_mode}")
-        if self.dynamics_model not in ("inertia", "ideal"):
+        if self.dynamics_model not in ("first_order", "ideal"):
             raise ValueError(f"Unsupported dynamics_model: {self.dynamics_model}")
         self.curriculum_stage = curriculum_stage
         
@@ -94,12 +102,14 @@ class MyCarEnv(gym.Env):
         self.step_count = 0
         self.max_steps = 500
 
-        # 3-DOF 惯性模型状态 (Surge, Sway, Yaw)
-        self.velocity = np.array([0.0, 0.0, 0.0])  # [u, v, r]
-        self.last_cmd_velocity = np.array([0.0, 0.0, 0.0], dtype=float)
-        self.mass = 2.0    # 质量系数
-        self.damping = 0.5  # 阻尼系数
-        self.dt = 0.1       # 控制周期 (秒)
+        # USV 一阶滞后动力学状态: [u, r]，控制输入: [u_cmd, r_cmd]
+        self.dt = 0.1
+        self.surge_time_constant = 0.6
+        self.yaw_time_constant = 0.4
+        self.max_du = 0.15
+        self.max_dr = 0.12
+        self.velocity = np.array([0.0, 0.0], dtype=float)
+        self.last_cmd_velocity = np.array([0.0, 0.0], dtype=float)
 
         # 激光雷达异步回调缓存
         self.latest_scan = None
@@ -122,11 +132,13 @@ class MyCarEnv(gym.Env):
     def get_planner_state(self):
         """Return a read-only snapshot used by evaluation-time action optimizers."""
         current_pos, current_yaw = self._get_robot_position()
-        planner_velocity = self.velocity if self.dynamics_model == "inertia" else self.last_cmd_velocity
+        planner_velocity = self.velocity if self.dynamics_model == "first_order" else self.last_cmd_velocity
+        dynamics_config = self._usv_dynamics_config()
         return {
             "position": current_pos.copy(),
             "yaw": float(current_yaw),
             "velocity": planner_velocity.copy(),
+            "current_pose": np.array([current_pos[0], current_pos[1], current_yaw], dtype=float),
             "target_position": self.target_pos.copy(),
             "frenet_transform": self.frenet_transform,
             "scan": self.latest_scan,
@@ -137,11 +149,14 @@ class MyCarEnv(gym.Env):
             "dynamics_model": self.dynamics_model,
             "high_level_action_low": self.HIGH_LEVEL_ACTION_LOW.copy(),
             "high_level_action_high": self.HIGH_LEVEL_ACTION_HIGH.copy(),
-            "dt": float(self.dt),
-            "mass": float(self.mass),
-            "damping": float(self.damping),
+            "dt": float(dynamics_config.dt),
+            "surge_time_constant": float(dynamics_config.surge_time_constant),
+            "yaw_time_constant": float(dynamics_config.yaw_time_constant),
+            "max_du": float(dynamics_config.max_du),
+            "max_dr": float(dynamics_config.max_dr),
             "max_laser_range": float(self.max_laser_range),
             "last_action": self.last_action.copy() if hasattr(self, "last_action") else np.zeros(2, dtype=np.float32),
+            "last_command": self.last_cmd_velocity.copy(),
             "last_high_level_action": self.last_high_level_action.copy()
             if hasattr(self, "last_high_level_action")
             else np.zeros(3, dtype=np.float32),
@@ -184,7 +199,7 @@ class MyCarEnv(gym.Env):
             executed_action, high_level_info = self.high_level_action_to_low_level(requested_action)
             self.last_high_level_action = requested_action[:3].astype(np.float32)
         else:
-            executed_action = np.clip(requested_action[:2], self.LOW_LEVEL_ACTION_LOW, self.LOW_LEVEL_ACTION_HIGH)
+            executed_action = clip_command(requested_action[:2], self._usv_dynamics_config()).astype(np.float32)
             high_level_info = {}
 
         vel_msg = self._low_level_action_to_twist(executed_action)
@@ -315,6 +330,13 @@ class MyCarEnv(gym.Env):
             "frenet_s": float(frenet_s),
             "frenet_d": float(frenet_d),
             "heading_to_path": float(heading_to_path),
+            "heading_error": float(heading_to_path),
+            "remaining_path": float(distance_remaining),
+            "current_velocity": self.velocity.copy().astype(np.float32),
+            "current_speed": float(self.velocity[0]),
+            "current_yaw_rate": float(self.velocity[1]),
+            "current_pose": np.array([self.current_pos[0], self.current_pos[1], self.current_yaw], dtype=np.float32),
+            "applied_command": self.last_cmd_velocity.copy().astype(np.float32),
             "min_laser_dist": float(min_laser_dist),
             "is_success": bool(distance_remaining < self.goal_reach_threshold and abs_frenet_d <= 1.0),
             "is_collision": bool(min_laser_dist < 0.25),
@@ -349,13 +371,7 @@ class MyCarEnv(gym.Env):
         heading_scale = max(0.2, math.cos(float(np.clip(heading_error, -math.pi / 2, math.pi / 2))))
         surge = float(target_speed) * heading_scale
         yaw_cmd = float(np.clip(1.8 * heading_error, self.LOW_LEVEL_ACTION_LOW[1], self.LOW_LEVEL_ACTION_HIGH[1]))
-        low_level = np.array(
-            [
-                np.clip(surge, self.LOW_LEVEL_ACTION_LOW[0], self.LOW_LEVEL_ACTION_HIGH[0]),
-                yaw_cmd,
-            ],
-            dtype=np.float32,
-        )
+        low_level = clip_command(np.array([surge, yaw_cmd], dtype=float), self._usv_dynamics_config()).astype(np.float32)
         return low_level, {
             "high_level_delta_s": float(delta_s),
             "high_level_target_d": float(target_d),
@@ -380,22 +396,33 @@ class MyCarEnv(gym.Env):
         return self.frenet_transform.frenet_to_cartesian(target_s, float(target_d))
 
     def _low_level_action_to_twist(self, action):
-        action = np.asarray(action, dtype=np.float32).reshape(-1)
-        surge = float(action[0]) if action.size > 0 else 0.0
-        yaw_cmd = float(action[1]) if action.size > 1 else 0.0
-        if self.dynamics_model == "inertia":
-            control_input = np.array([surge, 0.0, yaw_cmd], dtype=float)
-            acceleration = (control_input / self.mass) - (self.damping * self.velocity)
-            self.velocity = self.velocity + acceleration * self.dt
-            cmd = self.velocity.copy()
-        else:
-            cmd = np.array([surge, 0.0, yaw_cmd], dtype=float)
-            self.last_cmd_velocity = cmd.copy()
+        dynamics_config = self._usv_dynamics_config()
+        new_velocity, applied_command = step_velocity(
+            self.velocity,
+            action,
+            self.last_cmd_velocity,
+            dynamics_config,
+            self.dynamics_model,
+        )
+        self.velocity = new_velocity
+        self.last_cmd_velocity = applied_command
+        cmd = ur_to_twist_vector(new_velocity)
         vel_msg = Twist()
         vel_msg.linear.x = float(cmd[0])
         vel_msg.linear.y = float(cmd[1])
         vel_msg.angular.z = float(cmd[2])
         return vel_msg
+
+    def _usv_dynamics_config(self):
+        return USVDynamicsConfig(
+            dt=float(self.dt),
+            surge_time_constant=float(self.surge_time_constant),
+            yaw_time_constant=float(self.yaw_time_constant),
+            max_du=float(self.max_du),
+            max_dr=float(self.max_dr),
+            action_low=tuple(float(x) for x in self.LOW_LEVEL_ACTION_LOW),
+            action_high=tuple(float(x) for x in self.LOW_LEVEL_ACTION_HIGH),
+        )
 
     @staticmethod
     def _wrap_angle(angle):
@@ -409,9 +436,9 @@ class MyCarEnv(gym.Env):
         super().reset(seed=seed)
         self.pub_cmd_vel.publish(Twist())
         self.step_count = 0
-        # 重置 3-DOF 惯性速度状态
-        self.velocity = np.array([0.0, 0.0, 0.0])
-        self.last_cmd_velocity = np.array([0.0, 0.0, 0.0], dtype=float)
+        # 重置 USV 一阶滞后速度和控制输入状态
+        self.velocity = np.array([0.0, 0.0], dtype=float)
+        self.last_cmd_velocity = np.array([0.0, 0.0], dtype=float)
         # 重置动作平滑度状态
         self.last_action = np.array([0.0, 0.0])
         self.last_high_level_action = np.array([0.0, 0.0, 0.0], dtype=np.float32)

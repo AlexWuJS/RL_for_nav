@@ -20,8 +20,8 @@ LOG_STD_MAX = 1.5
 class DSACConfig:
     observation_dim: int
     action_dim: int = 2
-    action_low: Tuple[float, float] = (-1.0, -1.0)
-    action_high: Tuple[float, float] = (2.0, 1.0)
+    action_low: Tuple[float, float] = (0.0, -0.6)
+    action_high: Tuple[float, float] = (1.5, 0.6)
     hidden_dim: int = 256
     num_quantiles: int = 32
     gamma: float = 0.99
@@ -577,7 +577,7 @@ def parse_dsac_args():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--frame-stack", type=int, default=4)
     parser.add_argument("--control-mode", choices=("low_level_velocity", "high_level_frenet"), default="high_level_frenet")
-    parser.add_argument("--dynamics-model", choices=("ideal", "inertia"), default="ideal")
+    parser.add_argument("--dynamics-model", choices=("ideal", "first_order", "inertia"), default="first_order")
     parser.add_argument("--curriculum", choices=("off", "auto"), default="auto")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--learning-starts", type=int, default=10000)

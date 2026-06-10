@@ -60,15 +60,18 @@ def planner_state(scan_ranges=None, y=0.0):
     return {
         "position": np.array([0.0, y], dtype=float),
         "yaw": 0.0,
-        "velocity": np.zeros(3, dtype=float),
+        "velocity": np.zeros(2, dtype=float),
         "target_position": np.array([10.0, 0.0], dtype=float),
         "frenet_transform": StraightFrenet(),
         "scan": FakeScan(scan_ranges or [10.0, 10.0, 10.0, 10.0, 10.0]),
         "dt": 0.1,
-        "mass": 2.0,
-        "damping": 0.5,
+        "surge_time_constant": 0.6,
+        "yaw_time_constant": 0.4,
+        "max_du": 0.15,
+        "max_dr": 0.12,
         "max_laser_range": 10.0,
         "last_action": np.array([0.5, 0.0], dtype=float),
+        "last_command": np.array([0.5, 0.0], dtype=float),
     }
 
 

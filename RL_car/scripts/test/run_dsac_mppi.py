@@ -119,7 +119,7 @@ def make_env(
     model_path: str | None = None,
     device: str = "auto",
     control_mode: str = "low_level_velocity",
-    dynamics_model: str = "inertia",
+    dynamics_model: str = "first_order",
 ) -> gym.Env:
     env = MyCarEnv(control_mode=control_mode, dynamics_model=dynamics_model)
     if hasattr(env, "seed"):
@@ -159,7 +159,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--control-mode", choices=("auto", "low_level_velocity", "high_level_frenet"), default="auto")
-    parser.add_argument("--dynamics-model", choices=("ideal", "inertia"), default="ideal")
+    parser.add_argument("--dynamics-model", choices=("ideal", "first_order", "inertia"), default="first_order")
     parser.add_argument("--log-every", type=int, default=10, help="Print MPPI debug every N steps. Use 0 to disable periodic logs.")
     parser.add_argument("--max-steps", type=int, default=0, help="Maximum steps per episode. Use 0 to run until env done.")
     parser.add_argument("--deterministic", action="store_true", default=True)

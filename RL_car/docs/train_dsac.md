@@ -15,7 +15,7 @@ python -m scripts.train.train_dsac
 python -m scripts.train.train_dsac \
   --model-name dsac_smoke \
   --control-mode high_level_frenet \
-  --dynamics-model ideal \
+  --dynamics-model first_order \
   --curriculum auto \
   --total-timesteps 5000 \
   --learning-starts 1000
@@ -27,7 +27,7 @@ python -m scripts.train.train_dsac \
 python -m scripts.train.train_dsac \
   --model-name dsac_high_level \
   --control-mode high_level_frenet \
-  --dynamics-model ideal \
+  --dynamics-model first_order \
   --curriculum auto \
   --total-timesteps 300000 \
   --log-interval 1000 \
@@ -60,7 +60,7 @@ tensorboard --logdir data/dsac_high_level/logs/tensorboard --port 6006
 - `--learning-starts`：开始更新网络前收集的环境步数。
 - `--frame-stack`：观测帧堆叠数量，默认 4。
 - `--control-mode`：`high_level_frenet` 表示 DSAC 输出 `[delta_s, target_d, target_speed]`；`low_level_velocity` 表示旧二维速度动作。
-- `--dynamics-model`：`ideal` 表示理想运动学；`inertia` 表示旧 3-DOF 惯性模型。
+- `--dynamics-model`：`first_order` 表示默认 USV 一阶滞后模型；`ideal` 表示理想速度跟踪调试模式；`inertia` 会兼容映射到 `first_order`。
 - `--curriculum`：`auto` 表示按最近训练回合自动推进课程阶段；`off` 表示直接使用完整随机环境。
 - `--log-interval`：按环境 step 输出一次训练状态表，并写入 TensorBoard，默认 1000。
 - `--episode-log-interval`：按 episode 输出一次汇总表，默认 100；设为 0 可关闭终端 episode 汇总。

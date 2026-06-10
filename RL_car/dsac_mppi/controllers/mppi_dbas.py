@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+from dsac_mppi.envs.usv_dynamics import config_from_planner_state, step_pose, velocity_to_ur
 
 
 V4_MODE_NAMES = (
@@ -323,8 +324,8 @@ class MPPIDBaSConfig:
     max_noise_scale: float = 1.5
     max_action_delta: Tuple[float, float] = (0.25, 0.25)
     mppi_max_action_delta: Tuple[float, float] = (0.25, 0.30)
-    action_low: Tuple[float, float] = (-1.0, -1.0)
-    action_high: Tuple[float, float] = (2.0, 1.0)
+    action_low: Tuple[float, float] = (0.0, -0.6)
+    action_high: Tuple[float, float] = (1.5, 0.6)
     goal_weight: float = 0.8
     progress_weight: float = 3.0
     lateral_weight: float = 2.5
@@ -418,30 +419,32 @@ class MPPIDBaSOptimizer:
     ) -> np.ndarray:
         """Predict XY points for RViz using the same kinematics as MPPI rollouts."""
         cfg = self.config
-        dt = float(planner_state.get("dt", 0.1))
-        mass = float(planner_state.get("mass", 2.0))
-        damping = float(planner_state.get("damping", 0.5))
-        dynamics_model = str(planner_state.get("dynamics_model", "inertia"))
+        dynamics_config = config_from_planner_state(planner_state)
+        dt = float(dynamics_config.dt)
+        dynamics_model = str(planner_state.get("dynamics_model", "first_order"))
         position = np.asarray(planner_state["position"], dtype=float).copy()
         yaw = float(planner_state.get("yaw", 0.0))
-        velocity = np.asarray(planner_state.get("velocity", [0.0, 0.0, 0.0]), dtype=float).copy()
-        prev_action = np.asarray(planner_state.get("last_action", self.last_action), dtype=float).reshape(-1)[:2]
+        velocity = velocity_to_ur(planner_state.get("velocity", [0.0, 0.0])).copy()
+        prev_action = np.asarray(
+            planner_state.get("last_command", planner_state.get("last_action", self.last_action)),
+            dtype=float,
+        ).reshape(-1)[:2]
         sequence = np.asarray(action_sequence, dtype=float).reshape(-1, 2)
 
         points = [position[:2].copy()]
         for action in sequence:
             effective_action = cfg.action_lag_alpha * prev_action + (1.0 - cfg.action_lag_alpha) * action
-            if dynamics_model == "ideal":
-                velocity = np.array([float(effective_action[0]), 0.0, float(effective_action[1])], dtype=float)
-            else:
-                control_input = np.array([float(effective_action[0]), 0.0, float(effective_action[1])], dtype=float)
-                acceleration = (control_input / mass) - (damping * velocity)
-                velocity = velocity + acceleration * dt
-            yaw = self._wrap_angle(yaw + velocity[2] * dt)
-            heading_vec = np.array([math.cos(yaw), math.sin(yaw)], dtype=float)
-            position = position + heading_vec * velocity[0] * dt
+            position, yaw, velocity, applied_action = step_pose(
+                position,
+                yaw,
+                velocity,
+                effective_action,
+                prev_action,
+                dynamics_config,
+                dynamics_model,
+            )
             points.append(position[:2].copy())
-            prev_action = effective_action
+            prev_action = applied_action
 
         return np.asarray(points, dtype=float)
 
@@ -1246,17 +1249,19 @@ class MPPIDBaSOptimizer:
         params: Dict[str, float],
     ) -> Dict[str, float]:
         cfg = self.config
-        dt = float(planner_state.get("dt", 0.1))
-        mass = float(planner_state.get("mass", 2.0))
-        damping = float(planner_state.get("damping", 0.5))
-        dynamics_model = str(planner_state.get("dynamics_model", "inertia"))
+        dynamics_config = config_from_planner_state(planner_state)
+        dt = float(dynamics_config.dt)
+        dynamics_model = str(planner_state.get("dynamics_model", "first_order"))
         position = np.asarray(planner_state["position"], dtype=float).copy()
         yaw = float(planner_state.get("yaw", 0.0))
-        velocity = np.asarray(planner_state.get("velocity", [0.0, 0.0, 0.0]), dtype=float).copy()
+        velocity = velocity_to_ur(planner_state.get("velocity", [0.0, 0.0])).copy()
         target = np.asarray(planner_state.get("target_position", position), dtype=float)
         frenet_transform = planner_state.get("frenet_transform")
         max_laser_range = float(planner_state.get("max_laser_range", 10.0))
-        prev_action = np.asarray(planner_state.get("last_action", self.last_action), dtype=float).reshape(-1)[:2]
+        prev_action = np.asarray(
+            planner_state.get("last_command", planner_state.get("last_action", self.last_action)),
+            dtype=float,
+        ).reshape(-1)[:2]
 
         if frenet_transform is not None:
             start_s, start_d = frenet_transform.cartesian_to_frenet(position)
@@ -1276,15 +1281,16 @@ class MPPIDBaSOptimizer:
 
         for step_idx, action in enumerate(action_sequence):
             effective_action = cfg.action_lag_alpha * prev_action + (1.0 - cfg.action_lag_alpha) * action
-            if dynamics_model == "ideal":
-                velocity = np.array([float(effective_action[0]), 0.0, float(effective_action[1])], dtype=float)
-            else:
-                control_input = np.array([float(effective_action[0]), 0.0, float(effective_action[1])], dtype=float)
-                acceleration = (control_input / mass) - (damping * velocity)
-                velocity = velocity + acceleration * dt
-            yaw = self._wrap_angle(yaw + velocity[2] * dt)
+            position, yaw, velocity, applied_action = step_pose(
+                position,
+                yaw,
+                velocity,
+                effective_action,
+                prev_action,
+                dynamics_config,
+                dynamics_model,
+            )
             heading_vec = np.array([math.cos(yaw), math.sin(yaw)], dtype=float)
-            position = position + heading_vec * velocity[0] * dt
 
             if frenet_transform is not None:
                 frenet_s, frenet_d = frenet_transform.cartesian_to_frenet(position)
@@ -1323,7 +1329,7 @@ class MPPIDBaSOptimizer:
                 terminal = "collision"
                 break
             prev_s = float(frenet_s)
-            prev_action = effective_action
+            prev_action = applied_action
 
         progress = float(prev_s - float(start_s)) if frenet_transform is not None else float(
             np.linalg.norm(target - np.asarray(planner_state["position"], dtype=float)) - np.linalg.norm(target - position)
@@ -2198,18 +2204,20 @@ class MPPIDBaSOptimizer:
         obstacles: Optional[np.ndarray],
     ) -> Dict[str, float]:
         cfg = self.config
-        dt = float(planner_state.get("dt", 0.1))
-        mass = float(planner_state.get("mass", 2.0))
-        damping = float(planner_state.get("damping", 0.5))
-        dynamics_model = str(planner_state.get("dynamics_model", "inertia"))
+        dynamics_config = config_from_planner_state(planner_state)
+        dt = float(dynamics_config.dt)
+        dynamics_model = str(planner_state.get("dynamics_model", "first_order"))
         position = np.asarray(planner_state["position"], dtype=float).copy()
         start_position = position.copy()
         yaw = float(planner_state.get("yaw", 0.0))
-        velocity = np.asarray(planner_state.get("velocity", [0.0, 0.0, 0.0]), dtype=float).copy()
+        velocity = velocity_to_ur(planner_state.get("velocity", [0.0, 0.0])).copy()
         target = np.asarray(planner_state.get("target_position", position), dtype=float)
         frenet_transform = planner_state.get("frenet_transform")
         max_laser_range = float(planner_state.get("max_laser_range", 10.0))
-        prev_action = np.asarray(planner_state.get("last_action", self.last_action), dtype=float).reshape(-1)[:2]
+        prev_action = np.asarray(
+            planner_state.get("last_command", planner_state.get("last_action", self.last_action)),
+            dtype=float,
+        ).reshape(-1)[:2]
 
         if frenet_transform is not None:
             prev_s, prev_d = frenet_transform.cartesian_to_frenet(position)
@@ -2236,15 +2244,16 @@ class MPPIDBaSOptimizer:
 
         for step_idx, action in enumerate(action_sequence):
             effective_action = cfg.action_lag_alpha * prev_action + (1.0 - cfg.action_lag_alpha) * action
-            if dynamics_model == "ideal":
-                velocity = np.array([float(effective_action[0]), 0.0, float(effective_action[1])], dtype=float)
-            else:
-                control_input = np.array([float(effective_action[0]), 0.0, float(effective_action[1])], dtype=float)
-                acceleration = (control_input / mass) - (damping * velocity)
-                velocity = velocity + acceleration * dt
-            yaw = self._wrap_angle(yaw + velocity[2] * dt)
+            position, yaw, velocity, applied_action = step_pose(
+                position,
+                yaw,
+                velocity,
+                effective_action,
+                prev_action,
+                dynamics_config,
+                dynamics_model,
+            )
             heading_vec = np.array([math.cos(yaw), math.sin(yaw)], dtype=float)
-            position = position + heading_vec * velocity[0] * dt
 
             dist_to_goal = float(np.linalg.norm(target - position))
             if frenet_transform is not None:
@@ -2310,7 +2319,7 @@ class MPPIDBaSOptimizer:
             predicted_reward += env_reward
             prev_s = frenet_s
             prev_abs_d = lateral_error
-            prev_action = effective_action
+            prev_action = applied_action
 
         trust_delta = action_sequence - base_action.reshape(1, 2)
         trust_region_cost = float(np.mean(np.sum(trust_delta * trust_delta, axis=1)))
@@ -2799,17 +2808,19 @@ class MPPIDBaSOptimizer:
         obstacles: Optional[np.ndarray],
     ) -> Dict[str, float]:
         cfg = self.config
-        dt = float(planner_state.get("dt", 0.1))
-        mass = float(planner_state.get("mass", 2.0))
-        damping = float(planner_state.get("damping", 0.5))
-        dynamics_model = str(planner_state.get("dynamics_model", "inertia"))
+        dynamics_config = config_from_planner_state(planner_state)
+        dt = float(dynamics_config.dt)
+        dynamics_model = str(planner_state.get("dynamics_model", "first_order"))
         position = np.asarray(planner_state["position"], dtype=float).copy()
         yaw = float(planner_state.get("yaw", 0.0))
-        velocity = np.asarray(planner_state.get("velocity", [0.0, 0.0, 0.0]), dtype=float).copy()
+        velocity = velocity_to_ur(planner_state.get("velocity", [0.0, 0.0])).copy()
         target = np.asarray(planner_state.get("target_position", position), dtype=float)
         frenet_transform = planner_state.get("frenet_transform")
         max_laser_range = float(planner_state.get("max_laser_range", 10.0))
-        prev_action = np.asarray(planner_state.get("last_action", self.last_action), dtype=float).reshape(-1)[:2]
+        prev_action = np.asarray(
+            planner_state.get("last_command", planner_state.get("last_action", self.last_action)),
+            dtype=float,
+        ).reshape(-1)[:2]
 
         start_dist_to_goal = float(np.linalg.norm(target - position))
         total_cost = 0.0
@@ -2822,16 +2833,16 @@ class MPPIDBaSOptimizer:
 
         for step_idx, action in enumerate(action_sequence):
             effective_action = cfg.action_lag_alpha * prev_action + (1.0 - cfg.action_lag_alpha) * action
-            if dynamics_model == "ideal":
-                velocity = np.array([float(effective_action[0]), 0.0, float(effective_action[1])], dtype=float)
-            else:
-                control_input = np.array([float(effective_action[0]), 0.0, float(effective_action[1])], dtype=float)
-                acceleration = (control_input / mass) - (damping * velocity)
-                velocity = velocity + acceleration * dt
-
-            yaw = self._wrap_angle(yaw + velocity[2] * dt)
+            position, yaw, velocity, applied_action = step_pose(
+                position,
+                yaw,
+                velocity,
+                effective_action,
+                prev_action,
+                dynamics_config,
+                dynamics_model,
+            )
             heading_vec = np.array([math.cos(yaw), math.sin(yaw)], dtype=float)
-            position = position + heading_vec * velocity[0] * dt
 
             dist_to_goal = float(np.linalg.norm(target - position))
             progress = start_dist_to_goal - dist_to_goal
@@ -2888,7 +2899,7 @@ class MPPIDBaSOptimizer:
             total_dbas_cost += dbas_cost
             total_ttc_cost += ttc_cost
             total_oob_cost += out_of_bounds_cost
-            prev_action = effective_action
+            prev_action = applied_action
 
         final_dist_to_goal = float(np.linalg.norm(target - position))
         progress = start_dist_to_goal - final_dist_to_goal

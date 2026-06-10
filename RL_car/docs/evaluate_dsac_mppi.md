@@ -48,4 +48,4 @@ python -m scripts.test.run_dsac_mppi \
   --log-every 10
 ```
 
-这个脚本适合观察小车动作、RViz marker 和 MPPI debug 信息。高层模型会自动使用 `high_level_frenet + ideal` 环境；旧二维模型会自动使用低层速度环境。
+这个脚本适合观察 USV 动作、RViz marker 和 MPPI debug 信息。高层模型会自动使用 `high_level_frenet + first_order` 环境；旧二维模型会自动使用低层速度环境。

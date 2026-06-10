@@ -216,10 +216,15 @@ class MppiRvizMarkerTests(unittest.TestCase):
         env = self.make_env_shell()
         env.control_mode = "high_level_frenet"
         env.dynamics_model = "ideal"
-        env.LOW_LEVEL_ACTION_LOW = np.array([-1.0, -1.0], dtype=np.float32)
-        env.LOW_LEVEL_ACTION_HIGH = np.array([2.0, 1.0], dtype=np.float32)
+        env.LOW_LEVEL_ACTION_LOW = np.array([0.0, -0.6], dtype=np.float32)
+        env.LOW_LEVEL_ACTION_HIGH = np.array([1.5, 0.6], dtype=np.float32)
         env.HIGH_LEVEL_ACTION_LOW = np.array([0.8, -2.2, 0.2], dtype=np.float32)
         env.HIGH_LEVEL_ACTION_HIGH = np.array([3.5, 2.2, 1.2], dtype=np.float32)
+        env.dt = 0.1
+        env.surge_time_constant = 0.6
+        env.yaw_time_constant = 0.4
+        env.max_du = 0.15
+        env.max_dr = 0.12
         env.frenet_transform = types.SimpleNamespace(
             path_length=10.0,
             cartesian_to_frenet=lambda point: (float(point[0]), float(point[1])),
@@ -236,27 +241,40 @@ class MppiRvizMarkerTests(unittest.TestCase):
     def test_ideal_dynamics_publishes_command_without_integrating_inertia(self):
         env = self.make_env_shell()
         env.dynamics_model = "ideal"
-        env.velocity = np.zeros(3, dtype=float)
-        env.last_cmd_velocity = np.zeros(3, dtype=float)
+        env.LOW_LEVEL_ACTION_LOW = np.array([0.0, -0.6], dtype=np.float32)
+        env.LOW_LEVEL_ACTION_HIGH = np.array([1.5, 0.6], dtype=np.float32)
+        env.dt = 0.1
+        env.surge_time_constant = 0.6
+        env.yaw_time_constant = 0.4
+        env.max_du = 0.15
+        env.max_dr = 0.12
+        env.velocity = np.zeros(2, dtype=float)
+        env.last_cmd_velocity = np.zeros(2, dtype=float)
         twist = env._low_level_action_to_twist(np.array([0.7, 0.2], dtype=np.float32))
 
         self.assertAlmostEqual(twist.linear.x, 0.7, places=6)
         self.assertAlmostEqual(twist.angular.z, 0.2, places=6)
-        np.testing.assert_allclose(env.velocity, np.zeros(3, dtype=float))
-        np.testing.assert_allclose(env.last_cmd_velocity, np.array([0.7, 0.0, 0.2], dtype=float), atol=1e-6)
+        np.testing.assert_allclose(env.velocity, np.array([0.7, 0.2], dtype=float), atol=1e-6)
+        np.testing.assert_allclose(env.last_cmd_velocity, np.array([0.7, 0.2], dtype=float), atol=1e-6)
 
-    def test_inertia_dynamics_keeps_old_integrated_behavior(self):
+    def test_first_order_dynamics_rate_limits_and_lags_command(self):
         env = self.make_env_shell()
-        env.dynamics_model = "inertia"
-        env.velocity = np.zeros(3, dtype=float)
-        env.mass = 2.0
-        env.damping = 0.5
+        env.dynamics_model = "first_order"
+        env.LOW_LEVEL_ACTION_LOW = np.array([0.0, -0.6], dtype=np.float32)
+        env.LOW_LEVEL_ACTION_HIGH = np.array([1.5, 0.6], dtype=np.float32)
+        env.velocity = np.zeros(2, dtype=float)
+        env.last_cmd_velocity = np.zeros(2, dtype=float)
         env.dt = 0.1
+        env.surge_time_constant = 0.6
+        env.yaw_time_constant = 0.4
+        env.max_du = 0.15
+        env.max_dr = 0.12
         twist = env._low_level_action_to_twist(np.array([1.0, 0.4], dtype=np.float32))
 
-        self.assertAlmostEqual(twist.linear.x, 0.05, places=6)
-        self.assertAlmostEqual(twist.angular.z, 0.02, places=6)
-        np.testing.assert_allclose(env.velocity, np.array([0.05, 0.0, 0.02], dtype=float), atol=1e-6)
+        self.assertAlmostEqual(twist.linear.x, 0.025, places=6)
+        self.assertAlmostEqual(twist.angular.z, 0.03, places=6)
+        np.testing.assert_allclose(env.last_cmd_velocity, np.array([0.15, 0.12], dtype=float), atol=1e-6)
+        np.testing.assert_allclose(env.velocity, np.array([0.025, 0.03], dtype=float), atol=1e-6)
 
 
 if __name__ == "__main__":
