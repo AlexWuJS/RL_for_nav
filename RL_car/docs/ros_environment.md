@@ -42,6 +42,6 @@ src/ros/
 
 ## MPPI 需要的环境接口
 
-`MyCarEnv.get_planner_state()` 是 MPPI wrapper 读取规划状态的入口，里面包含位置、速度、yaw、雷达、目标点、Frenet transform 等信息。
+`MyCarEnv.get_planner_state()` 是 MPPI wrapper 读取规划状态的入口，里面包含位置、速度、yaw、雷达、目标点、Frenet transform，以及当前参考线前方 `3.0m` 的 `lookahead_point/lookahead_body/lookahead_s` 等局部目标信息。
 
 如果 DSAC+MPPI 评估启动后卡住，优先检查 Gazebo 是否已经启动，以及上述 topic/service 是否存在。

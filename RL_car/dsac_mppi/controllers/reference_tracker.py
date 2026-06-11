@@ -9,7 +9,7 @@ from dsac_mppi.envs.usv_dynamics import USVDynamicsConfig, clip_command, frenet_
 
 @dataclass
 class ReferenceTrackerConfig:
-    lookahead_distance: float = 1.5
+    lookahead_distance: float = 3.0
     target_speed: float = 0.8
     min_heading_speed_scale: float = 0.25
     slowdown_distance: float = 1.0
@@ -43,11 +43,10 @@ class ReferenceLineTracker:
             target = np.asarray(target_position, dtype=float).reshape(-1)[:2]
             target_point = target
         else:
-            lookahead_s = min(
-                metrics["frenet_s"] + float(cfg.lookahead_distance),
-                float(frenet_transform.path_length),
+            lookahead_s, target_point = frenet_transform.get_lookahead_point(
+                metrics["frenet_s"],
+                cfg.lookahead_distance,
             )
-            target_point = frenet_transform.frenet_to_cartesian(lookahead_s, 0.0)
 
         position = np.asarray(position, dtype=float).reshape(-1)[:2]
         target_vec = np.asarray(target_point, dtype=float).reshape(2) - position
@@ -68,6 +67,7 @@ class ReferenceLineTracker:
 
         debug = {
             **metrics,
+            "lookahead_s": float(lookahead_s) if frenet_transform is not None else float(metrics["frenet_s"]),
             "lookahead_x": float(target_point[0]),
             "lookahead_y": float(target_point[1]),
             "target_heading": float(target_heading),

@@ -67,10 +67,11 @@ class MyCarEnv(gym.Env):
         self.max_laser_range = 10.0
         self.map_size = 40.0 
         self.goal_reach_threshold = 0.4
+        self.lookahead_distance = 3.0
         
         # Frenet坐标系
         self.observation_space = spaces.Box(low=-1.0, high=1.0,
-                                            shape=(self.n_laser_beams + 4,),
+                                            shape=(self.n_laser_beams + 6,),
                                             dtype=np.float32)
         
         # 路径可视化
@@ -134,6 +135,7 @@ class MyCarEnv(gym.Env):
         current_pos, current_yaw = self._get_robot_position()
         planner_velocity = self.velocity if self.dynamics_model == "first_order" else self.last_cmd_velocity
         dynamics_config = self._usv_dynamics_config()
+        nav = self._navigation_metrics(current_pos, current_yaw)
         return {
             "position": current_pos.copy(),
             "yaw": float(current_yaw),
@@ -141,6 +143,10 @@ class MyCarEnv(gym.Env):
             "current_pose": np.array([current_pos[0], current_pos[1], current_yaw], dtype=float),
             "target_position": self.target_pos.copy(),
             "frenet_transform": self.frenet_transform,
+            "lookahead_distance": float(nav["lookahead_distance"]),
+            "lookahead_s": float(nav["lookahead_s"]),
+            "lookahead_point": nav["lookahead_point"].copy(),
+            "lookahead_body": nav["lookahead_body"].copy(),
             "scan": self.latest_scan,
             "dynamic_obstacles": [dict(obstacle) for obstacle in self.dynamic_obstacles],
             "action_low": self.LOW_LEVEL_ACTION_LOW.copy(),
@@ -220,30 +226,16 @@ class MyCarEnv(gym.Env):
         # 可视化小车姿态箭头
         self._visualize_car_pose()
 
-        # 4. 计算 Frenet 坐标系相关信息
-        if self.frenet_transform is not None:
-            # 统一使用 self.current_pos 进行一次计算即可
-            frenet_s, frenet_d = self.frenet_transform.cartesian_to_frenet(self.current_pos)
-            heading_to_path = self.frenet_transform.get_heading_error(self.current_yaw, frenet_s)
-            
-            path_length = self.frenet_transform.path_length
-            distance_remaining = path_length - frenet_s
-            distance_remaining = max(distance_remaining, 0.0) 
-        else:
-            frenet_s = dist_to_goal
-            frenet_d = 0.0
-            heading_to_path = 0.0
-            path_length = dist_to_goal + 1.0
-            distance_remaining = dist_to_goal
+        # 4. 计算 Frenet 坐标系和局部 lookahead 目标
+        nav = self._navigation_metrics(self.current_pos, self.current_yaw)
+        frenet_s = nav["frenet_s"]
+        frenet_d = nav["frenet_d"]
+        heading_to_path = nav["heading_error"]
+        path_length = nav["path_length"]
+        distance_remaining = nav["remaining_path"]
 
         # 5. 构建状态观测 (Observation)
-        laser_state = self._process_scan_data(scan_data)
-        frenet_s_norm = (frenet_s / path_length) * 2 - 1
-        frenet_d_norm = np.clip(frenet_d / 3.0, -1.0, 1.0)
-        heading_norm = heading_to_path / math.pi
-        remaining_norm = (distance_remaining / path_length) * 2 - 1
-
-        obs = np.concatenate((laser_state, [frenet_s_norm, frenet_d_norm, heading_norm, remaining_norm])).astype(np.float32)
+        obs = self._build_obs_from_metrics(scan_data, nav)
 
         # 6. 初始化回合状态
         terminated = False
@@ -332,6 +324,10 @@ class MyCarEnv(gym.Env):
             "heading_to_path": float(heading_to_path),
             "heading_error": float(heading_to_path),
             "remaining_path": float(distance_remaining),
+            "lookahead_distance": float(nav["lookahead_distance"]),
+            "lookahead_s": float(nav["lookahead_s"]),
+            "lookahead_point": nav["lookahead_point"].copy().astype(np.float32),
+            "lookahead_body": nav["lookahead_body"].copy().astype(np.float32),
             "current_velocity": self.velocity.copy().astype(np.float32),
             "current_speed": float(self.velocity[0]),
             "current_yaw_rate": float(self.velocity[1]),
@@ -859,6 +855,69 @@ class MyCarEnv(gym.Env):
             except Exception:
                 pass
 
+    def _navigation_metrics(self, position, yaw):
+        position = np.asarray(position, dtype=float).reshape(2)
+        yaw = float(yaw)
+        dist_to_goal = float(np.linalg.norm(self.target_pos - position))
+        if self.frenet_transform is not None:
+            frenet_s, frenet_d = self.frenet_transform.cartesian_to_frenet(position)
+            heading_to_path = float(self.frenet_transform.get_heading_error(yaw, frenet_s))
+            path_length = float(self.frenet_transform.path_length)
+            remaining_path = max(path_length - float(frenet_s), 0.0)
+            lookahead_s, lookahead_point = self.frenet_transform.get_lookahead_point(
+                frenet_s,
+                self.lookahead_distance,
+            )
+        else:
+            frenet_s = dist_to_goal
+            frenet_d = 0.0
+            heading_to_path = 0.0
+            path_length = dist_to_goal + 1.0
+            remaining_path = dist_to_goal
+            lookahead_s = 0.0
+            lookahead_point = self.target_pos.copy()
+        lookahead_body = self._world_delta_to_body(np.asarray(lookahead_point, dtype=float) - position, yaw)
+        return {
+            "distance_to_goal": dist_to_goal,
+            "frenet_s": float(frenet_s),
+            "frenet_d": float(frenet_d),
+            "heading_error": float(heading_to_path),
+            "path_length": float(max(path_length, 1e-6)),
+            "remaining_path": float(remaining_path),
+            "lookahead_distance": float(self.lookahead_distance),
+            "lookahead_s": float(lookahead_s),
+            "lookahead_point": np.asarray(lookahead_point, dtype=float).reshape(2),
+            "lookahead_body": np.asarray(lookahead_body, dtype=float).reshape(2),
+        }
+
+    @staticmethod
+    def _world_delta_to_body(delta, yaw):
+        delta = np.asarray(delta, dtype=float).reshape(2)
+        c = math.cos(float(yaw))
+        s = math.sin(float(yaw))
+        return np.array([c * delta[0] + s * delta[1], -s * delta[0] + c * delta[1]], dtype=float)
+
+    def _build_obs_from_metrics(self, scan_data, nav):
+        path_length = max(float(nav["path_length"]), 1e-6)
+        lookahead_distance = max(float(nav["lookahead_distance"]), 1e-6)
+        lookahead_body = np.asarray(nav["lookahead_body"], dtype=float).reshape(2)
+        frenet_s_norm = (float(nav["frenet_s"]) / path_length) * 2.0 - 1.0
+        frenet_d_norm = np.clip(float(nav["frenet_d"]) / 3.0, -1.0, 1.0)
+        heading_norm = float(nav["heading_error"]) / math.pi
+        remaining_norm = (float(nav["remaining_path"]) / path_length) * 2.0 - 1.0
+        lookahead_x_norm = np.clip(lookahead_body[0] / lookahead_distance, -1.0, 1.0)
+        lookahead_y_norm = np.clip(lookahead_body[1] / lookahead_distance, -1.0, 1.0)
+        laser_state = self._process_scan_data(scan_data)
+        nav_state = [
+            frenet_s_norm,
+            frenet_d_norm,
+            heading_norm,
+            remaining_norm,
+            lookahead_x_norm,
+            lookahead_y_norm,
+        ]
+        return np.concatenate((laser_state, nav_state)).astype(np.float32)
+
     def _process_scan_data(self, data):
         if data is None:
             return np.zeros(self.n_laser_beams, dtype=np.float32)
@@ -877,23 +936,4 @@ class MyCarEnv(gym.Env):
         return (processed / self.max_laser_range).astype(np.float32)
 
     def _build_obs(self, scan_data, path_length):
-        if self.frenet_transform is not None:
-            frenet_s, frenet_d = self.frenet_transform.cartesian_to_frenet(self.current_pos)
-            
-            # 使用算好的 frenet_s 传给 get_heading_error 即可
-            heading_to_path = self.frenet_transform.get_heading_error(self.current_yaw, frenet_s)
-            
-            distance_remaining = max(0.0, path_length - frenet_s)
-        else:
-            frenet_s = 0.0
-            frenet_d = 0.0
-            heading_to_path = 0.0
-            distance_remaining = path_length
-
-        frenet_s_norm = (frenet_s / path_length) * 2 - 1
-        frenet_d_norm = np.clip(frenet_d / 3.0, -1.0, 1.0)
-        heading_norm = heading_to_path / math.pi
-        remaining_norm = (distance_remaining / path_length) * 2 - 1
-
-        laser_state = self._process_scan_data(scan_data)
-        return np.concatenate((laser_state, [frenet_s_norm, frenet_d_norm, heading_norm, remaining_norm])).astype(np.float32)
+        return self._build_obs_from_metrics(scan_data, self._navigation_metrics(self.current_pos, self.current_yaw))

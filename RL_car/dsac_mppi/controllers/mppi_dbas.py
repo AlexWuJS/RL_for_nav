@@ -327,6 +327,7 @@ class MPPIDBaSConfig:
     action_low: Tuple[float, float] = (0.0, -0.6)
     action_high: Tuple[float, float] = (1.5, 0.6)
     goal_weight: float = 0.8
+    lookahead_weight: float = 0.8
     progress_weight: float = 3.0
     lateral_weight: float = 2.5
     heading_weight: float = 1.5
@@ -2815,6 +2816,10 @@ class MPPIDBaSOptimizer:
         yaw = float(planner_state.get("yaw", 0.0))
         velocity = velocity_to_ur(planner_state.get("velocity", [0.0, 0.0])).copy()
         target = np.asarray(planner_state.get("target_position", position), dtype=float)
+        lookahead_raw = planner_state.get("lookahead_point")
+        lookahead_point = None
+        if lookahead_raw is not None:
+            lookahead_point = np.asarray(lookahead_raw, dtype=float).reshape(-1)[:2]
         frenet_transform = planner_state.get("frenet_transform")
         max_laser_range = float(planner_state.get("max_laser_range", 10.0))
         prev_action = np.asarray(
@@ -2902,6 +2907,10 @@ class MPPIDBaSOptimizer:
             prev_action = applied_action
 
         final_dist_to_goal = float(np.linalg.norm(target - position))
+        final_lookahead_distance = 0.0
+        if lookahead_point is not None and lookahead_point.size >= 2:
+            final_lookahead_distance = float(np.linalg.norm(lookahead_point - position))
+            total_cost += cfg.lookahead_weight * final_lookahead_distance
         progress = start_dist_to_goal - final_dist_to_goal
         collision_risk = 1.0 if min_distance < cfg.collision_distance else 0.0
         safety_violation = max(0.0, cfg.safe_distance - min_distance)
@@ -2924,6 +2933,9 @@ class MPPIDBaSOptimizer:
             "max_heading_error": float(max_heading_error),
             "progress": float(progress),
             "final_distance_to_goal": float(final_dist_to_goal),
+            "final_lookahead_distance": float(final_lookahead_distance),
+            "lookahead_weight": float(cfg.lookahead_weight),
+            "lookahead_s": float(planner_state.get("lookahead_s", 0.0)),
             "risk_score": float(risk_score),
             "collision_risk": float(collision_risk),
             "out_of_bounds_risk": float(out_of_bounds_risk),

@@ -157,7 +157,7 @@ def parse_args():
     parser.add_argument("--yaw", type=float, default=0.25, help="Initial yaw in radians.")
     parser.add_argument("--max-steps", type=int, default=300)
     parser.add_argument("--log-every", type=int, default=1, help="Print every N steps. Use 1 to inspect dynamics step-by-step.")
-    parser.add_argument("--lookahead", type=float, default=1.5)
+    parser.add_argument("--lookahead", type=float, default=3.0)
     parser.add_argument("--target-speed", type=float, default=0.8)
     parser.add_argument("--heading-gain", type=float, default=1.2)
     parser.add_argument("--lateral-gain", type=float, default=0.25)
@@ -233,6 +233,11 @@ def main() -> None:
                 "frenet_d": float(info["frenet_d"]),
                 "heading_error": float(info["heading_error"]),
                 "pursuit_heading_error": float(tracker_debug["pursuit_heading_error"]),
+                "lookahead_s": float(info["lookahead_s"]),
+                "lookahead_x": float(info["lookahead_point"][0]),
+                "lookahead_y": float(info["lookahead_point"][1]),
+                "lookahead_body_x": float(info["lookahead_body"][0]),
+                "lookahead_body_y": float(info["lookahead_body"][1]),
                 "remaining_path": float(info["remaining_path"]),
                 "min_laser_dist": float(info["min_laser_dist"]),
                 "reward": float(info.get("env_reward", 0.0)),
@@ -243,6 +248,7 @@ def main() -> None:
                 print(
                     f"step={step:04d} s={row['frenet_s']:.2f} d={row['frenet_d']:.2f} "
                     f"heading={row['heading_error']:.3f} remain={row['remaining_path']:.2f} "
+                    f"lh_s={row['lookahead_s']:.2f} lh_body=({row['lookahead_body_x']:.2f},{row['lookahead_body_y']:.2f}) "
                     f"tracker_cmd=({row['tracker_u_cmd']:.3f},{row['tracker_r_cmd']:.3f}) "
                     f"applied_cmd=({row['applied_u_cmd']:.3f},{row['applied_r_cmd']:.3f}) "
                     f"d_cmd=({row['delta_u_cmd']:.3f},{row['delta_r_cmd']:.3f}) "

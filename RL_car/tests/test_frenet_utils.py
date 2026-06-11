@@ -57,6 +57,35 @@ class FrenetTransformTests(unittest.TestCase):
         self.assertLessEqual(error, math.pi)
         self.assertAlmostEqual(error, math.pi / 2.0, places=6)
 
+    def test_lookahead_point_on_straight_path(self):
+        frenet = FrenetTransform(np.array([0.0, 0.0]), np.array([10.0, 0.0]), curve_offset=0.0)
+
+        lookahead_s, point = frenet.get_lookahead_point(4.0, 3.0)
+
+        self.assertAlmostEqual(lookahead_s, 7.0, places=5)
+        np.testing.assert_allclose(point, np.array([7.0, 0.0]), atol=1e-5)
+
+    def test_lookahead_point_clamps_near_goal_and_non_positive_distance(self):
+        frenet = FrenetTransform(np.array([0.0, 0.0]), np.array([10.0, 0.0]), curve_offset=0.0)
+
+        lookahead_s, point = frenet.get_lookahead_point(9.0, 3.0)
+        self.assertAlmostEqual(lookahead_s, frenet.path_length, places=5)
+        np.testing.assert_allclose(point, np.array([10.0, 0.0]), atol=1e-5)
+
+        same_s, same_point = frenet.get_lookahead_point(4.0, -1.0)
+        self.assertAlmostEqual(same_s, 4.0, places=5)
+        np.testing.assert_allclose(same_point, frenet.frenet_to_cartesian(4.0, 0.0), atol=1e-5)
+
+    def test_lookahead_point_on_curved_path_matches_centerline_conversion(self):
+        frenet = FrenetTransform(np.array([0.0, 0.0]), np.array([10.0, 0.0]), curve_offset=2.0)
+
+        lookahead_s, point = frenet.get_lookahead_point(2.0, 3.0)
+
+        self.assertAlmostEqual(lookahead_s, 5.0, places=5)
+        np.testing.assert_allclose(point, frenet.frenet_to_cartesian(5.0, 0.0), atol=1e-8)
+        _, d = frenet.cartesian_to_frenet(point)
+        self.assertAlmostEqual(d, 0.0, delta=0.03)
+
 
 if __name__ == "__main__":
     unittest.main()

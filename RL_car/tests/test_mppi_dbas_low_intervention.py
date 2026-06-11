@@ -49,6 +49,54 @@ def planner_state(scan_ranges=None, y=0.0):
 
 
 class LowInterventionMppiTests(unittest.TestCase):
+    def test_rollout_cost_prefers_motion_toward_lookahead_point(self):
+        optimizer = MPPIDBaSOptimizer(
+            MPPIDBaSConfig(
+                seed=0,
+                horizon=3,
+                action_lag_alpha=0.0,
+                goal_weight=0.0,
+                lookahead_weight=10.0,
+                progress_weight=0.0,
+                lateral_weight=0.0,
+                heading_weight=0.0,
+                obstacle_weight=0.0,
+                dbas_weight=0.0,
+                ttc_weight=0.0,
+                out_of_bounds_weight=0.0,
+                trust_region_weight=0.0,
+                control_weight=0.0,
+                smoothness_weight=0.0,
+            )
+        )
+        state = planner_state()
+        state.update(
+            {
+                "target_position": np.array([0.0, 0.0], dtype=float),
+                "lookahead_point": np.array([1.0, 0.0], dtype=float),
+                "lookahead_s": 1.0,
+                "max_du": 1.5,
+                "last_command": np.array([0.0, 0.0], dtype=float),
+                "last_action": np.array([0.0, 0.0], dtype=float),
+            }
+        )
+
+        forward = optimizer._rollout_metrics(np.tile(np.array([1.0, 0.0]), (3, 1)), np.zeros(2), state, None)
+        stopped = optimizer._rollout_metrics(np.zeros((3, 2)), np.zeros(2), state, None)
+
+        self.assertLess(forward["final_lookahead_distance"], stopped["final_lookahead_distance"])
+        self.assertLess(forward["total_cost"], stopped["total_cost"])
+        self.assertEqual(forward["lookahead_s"], 1.0)
+
+    def test_rollout_metrics_without_lookahead_point_remain_compatible(self):
+        optimizer = MPPIDBaSOptimizer(MPPIDBaSConfig(seed=0, horizon=2))
+        state = planner_state()
+
+        metrics = optimizer._rollout_metrics(np.zeros((2, 2)), np.zeros(2), state, None)
+
+        self.assertIn("final_lookahead_distance", metrics)
+        self.assertEqual(metrics["final_lookahead_distance"], 0.0)
+
     def test_reward_aligned_filter_leaves_safe_sac_action_unchanged(self):
         optimizer = MPPIDBaSOptimizer(
             MPPIDBaSConfig(seed=0, use_reward_aligned_cost=True, always_run_mppi=False)

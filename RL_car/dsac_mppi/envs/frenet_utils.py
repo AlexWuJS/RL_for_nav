@@ -108,6 +108,12 @@ class FrenetTransform:
         # 笛卡尔坐标 = 路径基准点 + d * 法向量
         cartesian_point = wp + d * normal
         return cartesian_point
+
+    def get_lookahead_point(self, s: float, lookahead_distance: float = 3.0) -> Tuple[float, np.ndarray]:
+        """Return the centerline point that lies lookahead_distance ahead of s."""
+        distance = max(float(lookahead_distance), 0.0)
+        lookahead_s = float(np.clip(float(s) + distance, 0.0, self.path_length))
+        return lookahead_s, self.frenet_to_cartesian(lookahead_s, 0.0)
     
     def generate_path_points(self, num_points: int = None) -> np.ndarray:
         """
