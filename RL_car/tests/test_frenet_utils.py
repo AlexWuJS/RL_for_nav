@@ -13,6 +13,12 @@ from dsac_mppi.envs.frenet_utils import FrenetTransform  # noqa: E402
 
 
 class FrenetTransformTests(unittest.TestCase):
+    @staticmethod
+    def body_frame_delta(delta, yaw):
+        c = math.cos(float(yaw))
+        s = math.sin(float(yaw))
+        return np.array([c * delta[0] + s * delta[1], -s * delta[0] + c * delta[1]], dtype=float)
+
     def test_straight_path_projection_s_d_and_sign(self):
         frenet = FrenetTransform(np.array([0.0, 0.0]), np.array([10.0, 0.0]), curve_offset=0.0)
 
@@ -85,6 +91,39 @@ class FrenetTransformTests(unittest.TestCase):
         np.testing.assert_allclose(point, frenet.frenet_to_cartesian(5.0, 0.0), atol=1e-8)
         _, d = frenet.cartesian_to_frenet(point)
         self.assertAlmostEqual(d, 0.0, delta=0.03)
+
+    def test_acceptance_straight_centerline_lookahead(self):
+        frenet = FrenetTransform(np.array([0.0, 0.0]), np.array([10.0, 0.0]), curve_offset=0.0)
+        position = np.array([5.0, 0.0])
+        s, d = frenet.cartesian_to_frenet(position)
+        lookahead_s, point = frenet.get_lookahead_point(s, 3.0)
+
+        self.assertAlmostEqual(d, 0.0, places=6)
+        self.assertAlmostEqual(lookahead_s, 8.0, places=6)
+        np.testing.assert_allclose(point, np.array([8.0, 0.0]), atol=1e-6)
+
+    def test_acceptance_straight_offset_body_frame_lookahead(self):
+        frenet = FrenetTransform(np.array([0.0, 0.0]), np.array([10.0, 0.0]), curve_offset=0.0)
+        position = np.array([5.0, 1.0])
+        yaw = 0.0
+        s, d = frenet.cartesian_to_frenet(position)
+        _, point = frenet.get_lookahead_point(s, 3.0)
+        body_delta = self.body_frame_delta(point - position, yaw)
+
+        self.assertAlmostEqual(s, 5.0, places=6)
+        self.assertAlmostEqual(d, 1.0, places=6)
+        np.testing.assert_allclose(point, np.array([8.0, 0.0]), atol=1e-6)
+        np.testing.assert_allclose(body_delta, np.array([3.0, -1.0]), atol=1e-6)
+
+    def test_acceptance_curved_lookahead_moves_smoothly(self):
+        frenet = FrenetTransform(np.array([0.0, 0.0]), np.array([10.0, 0.0]), curve_offset=2.0)
+        s_samples = np.linspace(0.0, frenet.path_length, 21)
+        points = np.asarray([frenet.get_lookahead_point(float(s), 3.0)[1] for s in s_samples])
+        adjacent_steps = np.linalg.norm(np.diff(points, axis=0), axis=1)
+        sample_ds = frenet.path_length / float(len(s_samples) - 1)
+
+        self.assertLess(float(np.max(adjacent_steps)), sample_ds * 1.35)
+        np.testing.assert_allclose(points[-1], frenet.frenet_to_cartesian(frenet.path_length, 0.0), atol=1e-6)
 
 
 if __name__ == "__main__":
