@@ -63,26 +63,25 @@ class FrenetTransform:
 
     def cartesian_to_frenet(self, point: np.ndarray) -> Tuple[float, float]:
         """将笛卡尔坐标转换为Frenet坐标"""
-        point = np.array(point)
-        
-        # 1. 找到距离输入点最近的路点索引
-        dists = np.linalg.norm(self.waypoints - point, axis=1)
-        closest_idx = np.argmin(dists)
+        point = np.asarray(point, dtype=float).reshape(2)
 
-        # 2. 获取该局部的参考信息
-        closest_wp = self.waypoints[closest_idx]
-        local_tangent = self.tangents[closest_idx]
-        local_normal = self.normals[closest_idx]
-        local_s = self.s_values[closest_idx]
+        # 投影到最近路径线段，而不是最近离散路点，减少曲线和稀疏采样时的 s/d 抖动。
+        segment_starts = self.waypoints[:-1]
+        segment_vecs = self.waypoints[1:] - segment_starts
+        segment_lengths_sq = np.sum(segment_vecs * segment_vecs, axis=1)
+        rel = point - segment_starts
+        ratios = np.sum(rel * segment_vecs, axis=1) / np.maximum(segment_lengths_sq, 1e-12)
+        ratios = np.clip(ratios, 0.0, 1.0)
+        projections = segment_starts + ratios[:, np.newaxis] * segment_vecs
+        dists_sq = np.sum((point - projections) ** 2, axis=1)
+        segment_idx = int(np.argmin(dists_sq))
 
-        # 3. 计算点相对于最近路点的局部向量
-        local_vec = point - closest_wp
-
-        # 4. 投影计算真实的 s 和 d
-        # s = 最近路点的s + 在切线上的投影偏差
-        s = local_s + np.dot(local_vec, local_tangent)
-        # d = 在法线上的投影
-        d = np.dot(local_vec, local_normal)
+        projection = projections[segment_idx]
+        tangent = segment_vecs[segment_idx] / max(math.sqrt(float(segment_lengths_sq[segment_idx])), 1e-12)
+        normal = np.array([-tangent[1], tangent[0]], dtype=float)
+        segment_length = math.sqrt(float(segment_lengths_sq[segment_idx]))
+        s = float(self.s_values[segment_idx] + ratios[segment_idx] * segment_length)
+        d = float(np.dot(point - projection, normal))
 
         return s, d
 
@@ -128,8 +127,8 @@ class FrenetTransform:
     def get_heading_error(self, robot_yaw: float, s: float) -> float:
         """获取机器人朝向与当前路径方向的角度误差"""
         s = np.clip(s, 0, self.path_length)
-        idx = np.searchsorted(self.s_values, s)
-        idx = min(idx, self.num_waypoints - 1)
+        idx = np.searchsorted(self.s_values, s, side="right") - 1
+        idx = int(np.clip(idx, 0, self.num_waypoints - 2))
         
         local_path_angle = self.path_angles[idx]
         error = local_path_angle - robot_yaw
