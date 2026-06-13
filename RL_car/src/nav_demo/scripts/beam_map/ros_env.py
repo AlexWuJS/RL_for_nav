@@ -2,15 +2,15 @@ import gymnasium as gym
 import rospy
 import numpy as np
 from gymnasium import spaces
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, Point
 from sensor_msgs.msg import LaserScan
-from gazebo_msgs.msg import ModelState
-from gazebo_msgs.srv import SetModelState, GetModelState
-import torch
-import torch.nn as nn
-import math
-from gazebo_msgs.srv import SpawnModel, DeleteModel
+from gazebo_msgs.msg import ModelState, ModelStates
+from gazebo_msgs.srv import SetModelState, GetModelState, SpawnModel
 from geometry_msgs.msg import Pose
+from visualization_msgs.msg import Marker, MarkerArray
+import math
+import tf.transformations
+from frenet_utils import FrenetTransform, frenet_reward
 
 class MyCarEnv(gym.Env):
     def __init__(self):
@@ -21,17 +21,27 @@ class MyCarEnv(gym.Env):
         except rospy.ROSException:
             pass
         
-        self.action_space = spaces.Box(low=np.array([0.0, -1.0]), high=np.array([2.0, 1.0]), dtype=np.float32)
+        self.action_space = spaces.Box(low=np.array([-1.0, -1.0]),
+                                       high=np.array([2.0, 1.0]),
+                                       dtype=np.float32)
+
+        self.n_laser_beams = 400 
+        self.max_laser_range = 10.0
+        self.map_size = 40.0 
+        self.goal_reach_threshold = 0.4
         
-        # === 修改 1: 增加雷达采样数 ===
-        # 假设你的 URDF 改成了 2000，这里我们降采样到 1000 给网络，既保留细节又减少计算
-        self.n_laser_beams = 1000 
-        self.max_laser_range = 20.0 # 雷达最大探测距离
-        self.map_size = 40.0 # 地图大小40 * 40米
-        self.goal_reach_threshold = 0.3 # 到达目标点的距离阈值
+        # Frenet坐标系
+        self.observation_space = spaces.Box(low=-1.0, high=1.0,
+                                            shape=(self.n_laser_beams + 4,),
+                                            dtype=np.float32)
         
-        #状态空间
-        self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(self.n_laser_beams +2,), dtype=np.float32)
+        # 路径可视化
+        self.pub_path_marker = rospy.Publisher('/global_path_marker', MarkerArray, queue_size=1, latch=True)
+        # 小车姿态箭头可视化
+        self.pub_car_pose_marker = rospy.Publisher('/car_pose_marker', Marker, queue_size=1)
+        self.frenet_transform = None
+        self.start_pos = np.array([0.0, 0.0])
+        self.last_frenet_s = 0.0
         
         self.pub_cmd_vel = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
         
@@ -41,306 +51,490 @@ class MyCarEnv(gym.Env):
         rospy.wait_for_service('/gazebo/get_model_state')
         self.get_state_proxy = rospy.ServiceProxy('/gazebo/get_model_state', GetModelState)
 
-        #内部变量
+        rospy.wait_for_service('/gazebo/spawn_sdf_model')
+        self.spawn_model_proxy = rospy.ServiceProxy('/gazebo/spawn_sdf_model', SpawnModel)
+        
         self.target_pos = np.array([0.0, 0.0])
         self.current_pos = np.array([0.0, 0.0])
         self.current_yaw = 0.0
         self.last_distance_to_goal = None
+        self.step_count = 0
+        self.max_steps = 500
+
+        # 3-DOF 惯性模型状态 (Surge, Sway, Yaw)
+        self.velocity = np.array([0.0, 0.0, 0.0])  # [u, v, r]
+        self.mass = 2.0    # 质量系数
+        self.damping = 0.5  # 阻尼系数
+        self.dt = 0.1       # 控制周期 (秒)
+
+        # 激光雷达异步回调缓存
+        self.latest_scan = None
+        rospy.Subscriber('/scan', LaserScan, self._scan_callback, queue_size=1)
+
+        # 机器人状态异步回调缓存
+        self.usv_pos = np.array([0.0, 0.0])
+        self.usv_yaw = 0.0
+        rospy.Subscriber('/gazebo/model_states', ModelStates, self._model_states_callback, queue_size=1)
+
+        # ROS 仿真时间频率控制器（锁定 MDP 步长为 10Hz，对应 dt=0.1）
+        self.rate = rospy.Rate(10)
     
     def _get_robot_position(self):
+        return self.usv_pos.copy(), self.usv_yaw
+
+    def get_planner_state(self):
+        """Return a read-only snapshot used by evaluation-time action optimizers."""
+        current_pos, current_yaw = self._get_robot_position()
+        return {
+            "position": current_pos.copy(),
+            "yaw": float(current_yaw),
+            "velocity": self.velocity.copy(),
+            "target_position": self.target_pos.copy(),
+            "frenet_transform": self.frenet_transform,
+            "scan": self.latest_scan,
+            "action_low": self.action_space.low.copy(),
+            "action_high": self.action_space.high.copy(),
+            "dt": float(self.dt),
+            "mass": float(self.mass),
+            "damping": float(self.damping),
+            "max_laser_range": float(self.max_laser_range),
+            "last_action": self.last_action.copy() if hasattr(self, "last_action") else np.zeros(2, dtype=np.float32),
+        }
+
+    def _scan_callback(self, msg):
+        self.latest_scan = msg
+
+    def _model_states_callback(self, msg):
         try:
-            res = self.get_state_proxy('car', 'world')
-            pos = res.pose.position
-            ori = res.pose.orientation
-
-            #简单的四元数转欧拉角
-            # siny_cosp = 2 * (w * z + x * y)
-            # cosy_cosp = 1 - 2 * (y * y + z * z)
-            siny_cosp = 2.0 * (ori.w * ori.z + ori.x * ori.y)
-            cosy_cosp = 1 - 2 * (ori.y * ori.y + ori.z * ori.z)
-            yaw = math.atan2(siny_cosp, cosy_cosp)
-
-            return np.array([pos.x, pos.y]), yaw
-        except rospy.ServiceException as e:
-            print("获取机器人状态失败: %s" % e)
-            return np.array([0.0, 0.0]), 0.0
+            idx = msg.name.index('usv')
+            pos = msg.pose[idx].position
+            ori = msg.pose[idx].orientation
+            self.usv_pos = np.array([pos.x, pos.y])
+            _, _, yaw = tf.transformations.euler_from_quaternion((ori.x, ori.y, ori.z, ori.w))
+            self.usv_yaw = yaw
+        except ValueError:
+            pass
 
     def step(self, action):
-        linear_vel = float(action[0])
-        angular_vel = float(action[1])
-        
+        # 1. 解析动作为控制输入 (欠驱动 USV: action[0]=Surge期望, action[1]=Yaw期望)
+        control_input = np.array([
+            float(action[0]),  # 期望 Surge 力/速度
+            0.0,               # Sway 无直接控制输入 (欠驱动)
+            float(action[1])   # 期望 Yaw 角速度
+        ])
+
+        # 2. 惯性结算: a = F/m - damping*v, V_{t+1} = V_t + a*dt
+        acceleration = (control_input / self.mass) - (self.damping * self.velocity)
+        self.velocity = self.velocity + acceleration * self.dt
+
+        # 3. 发布带有惯性的实际速度指令
         vel_msg = Twist()
-        vel_msg.linear.x = linear_vel
-        vel_msg.angular.z = angular_vel
+        vel_msg.linear.x = self.velocity[0]   # 实际 Surge 速度
+        vel_msg.linear.y = self.velocity[1]   # 实际 Sway 速度
+        vel_msg.angular.z = self.velocity[2]  # 实际 Yaw 角速度
         self.pub_cmd_vel.publish(vel_msg)
-        
-        # rospy.sleep(0.05) 
-        
-        scan_data = None
-        while scan_data is None:
-            try:
-                scan_data = rospy.wait_for_message('/scan', LaserScan, timeout=0.1)
-            except:
-                pass
-        
-        # A. 为了计算奖励，先处理原始数据（保持单位为米）
-        # 这里我们临时用一个不归一化的简单处理来算 min_dist
-        raw_ranges = np.array(scan_data.ranges)
-        raw_ranges[np.isinf(raw_ranges)] = self.max_laser_range
-        raw_ranges[np.isnan(raw_ranges)] = self.max_laser_range
-        min_laser_dist = np.min(raw_ranges) # 真实的物理距离
 
-        #获取自身位置
+        # 2. 获取激光雷达数据（非阻塞回调）
+        while self.latest_scan is None:
+            rospy.sleep(0.01)
+        scan_data = self.latest_scan
+
+        # 3. 获取机器人当前状态与目标距离
         self.current_pos, self.current_yaw = self._get_robot_position()
-
-        #计算相对于目标的距离和角度
         dist_to_goal = np.linalg.norm(self.target_pos - self.current_pos)
 
-        #计算目标相对与机器人的角度差
-        #计算全局角度
-        angle_to_goal = math.atan2(self.target_pos[1] - self.current_pos[1], self.target_pos[0] - self.current_pos[0])
-        #相对角度 = 全局目标角度 - 机器人当前朝向
-        heading_error = angle_to_goal - self.current_yaw
-        #归一化角度到[-pi,pi]
-        while heading_error > math.pi:
-            heading_error -= 2 * math.pi
-        while heading_error < -math.pi:
-            heading_error += 2 * math.pi
+        # 可视化小车姿态箭头
+        self._visualize_car_pose()
 
-        #整合状态
-        #处理雷达
+        # 4. 计算 Frenet 坐标系相关信息
+        if self.frenet_transform is not None:
+            # 统一使用 self.current_pos 进行一次计算即可
+            frenet_s, frenet_d = self.frenet_transform.cartesian_to_frenet(self.current_pos)
+            heading_to_path = self.frenet_transform.get_heading_error(self.current_yaw, frenet_s)
+            
+            path_length = self.frenet_transform.path_length
+            distance_remaining = path_length - frenet_s
+            distance_remaining = max(distance_remaining, 0.0) 
+        else:
+            frenet_s = dist_to_goal
+            frenet_d = 0.0
+            heading_to_path = 0.0
+            path_length = dist_to_goal + 1.0
+            distance_remaining = dist_to_goal
+
+        # 5. 构建状态观测 (Observation)
         laser_state = self._process_scan_data(scan_data)
+        frenet_s_norm = (frenet_s / path_length) * 2 - 1
+        frenet_d_norm = np.clip(frenet_d / 3.0, -1.0, 1.0)
+        heading_norm = heading_to_path / math.pi
+        remaining_norm = (distance_remaining / path_length) * 2 - 1
 
-        #归一化导航信息,方便网络训练
-        #距离归一化
-        norm_dist = dist_to_goal / self.map_size
-        #角度归一化到[-1,1]
-        norm_heading = heading_error / math.pi
+        obs = np.concatenate((laser_state, [frenet_s_norm, frenet_d_norm, heading_norm, remaining_norm])).astype(np.float32)
 
-        #拼接[雷达 1000 + 距离 1 + 角度 1]
-        obs = np.concatenate((laser_state,[norm_dist,norm_heading])).astype(np.float32)
-
-        # 计算奖励 (使用真实的米 min_dist_meters)
+        # 6. 初始化回合状态
         terminated = False
         truncated = False
         reward = 0.0
+        terminal_reason = "running"
+        self.step_count += 1
 
-        #A.碰撞惩罚
-        min_laser_dist = np.min(scan_data.ranges) if scan_data.ranges else 0
-        
-        
-        if min_laser_dist < 0.25: # 撞墙判定使用真实距离
-            reward = -50.0
-            terminated = True
+        # 获取最小障碍物距离
+        min_laser_dist = np.min(scan_data.ranges if scan_data else [0])
+        if min_laser_dist == float('inf'):
+            min_laser_dist = self.max_laser_range
 
-        #B.到达目标奖励
-        elif dist_to_goal < self.goal_reach_threshold:
-            reward = 100.0
-            terminated = True
+        # 初始化上一帧的 s 值 (用于计算 delta_s)
+        if not hasattr(self, 'last_frenet_s'):
+            self.last_frenet_s = frenet_s
         
-        #C.导航奖励
+        # 计算单步推进距离 (防止后退刷分)
+        delta_s = frenet_s - self.last_frenet_s
+
+        # ---------------------------------------------------------
+        # 7. 核心奖励函数逻辑 (Reward Design)
+        # ---------------------------------------------------------
+        
+        # 7.1 终结状态判别：碰撞惩罚与到达终点奖励
+        max_frenet_d_allowed = 3.0
+
+        if min_laser_dist < 0.25:
+            reward = -100.0
+            terminated = True
+            terminal_reason = "collision"
+            print("Collision detected!")
+            
+        elif abs(frenet_d) > max_frenet_d_allowed:  # 越界死亡逻辑
+            reward = -100.0
+            terminated = True
+            terminal_reason = "out_of_bounds"
+            print(f"Out of bounds! Deviated {frenet_d:.2f}m from path.")
+            
+        elif distance_remaining < self.goal_reach_threshold:
+            reward = +1000.0
+            terminated = True
+            terminal_reason = "success"
+            print("Goal reached!")
+            
         else:
-            #c1:靠近奖励（如果当前距离比上一步近，给正分）
-            if self.last_distance_to_goal is not None:
-                reward += (self.last_distance_to_goal - dist_to_goal) * 10.0
-            #c2:时间/生存惩罚（鼓励快速到达）
-            reward -= 0.05
-        
-        self.last_distance_to_goal = dist_to_goal
+            # 7.2 路径跟踪奖励 (Frenet，放大2.5倍鼓励探索)
+            frenet_reward_dict = frenet_reward(delta_s, frenet_d, heading_to_path)
+            frenet_amplification_factor = 2.5
+            reward += frenet_reward_dict['total'] * frenet_amplification_factor
 
-        return obs, reward, terminated, truncated, {}
-                
-        # 返回给神经网络的是归一化后的数据
-        return laser_state_norm, reward, terminated, truncated, {}
+            # 7.3 安全避障惩罚（收缩边界，k=5.0，上限10.0）
+            safe_distance = 0.45
+            if min_laser_dist < safe_distance:
+                k = 5.0
+                penalty = math.exp(k * (safe_distance - min_laser_dist)) - 1
+                reward -= min(penalty, 10.0)  # 上限-10
+
+            # 7.4 动作平滑度约束（削弱系数，降低前期探索阻力）
+            surge_change_penalty = abs(action[0] - self.last_action[0]) * 0.2
+            yaw_change_penalty = abs(action[1] - self.last_action[1]) * 0.1
+            reward -= surge_change_penalty + yaw_change_penalty
+
+            # 7.5 存活时间惩罚
+            reward -= 0.1
+
+        # ---------------------------------------------------------
+
+        # 8. 超时截断判断
+        if self.step_count >= self.max_steps:
+            truncated = True
+            if terminal_reason == "running":
+                terminal_reason = "timeout"
+            print(f"Timeout at {self.step_count} steps.")
+
+        # 9. 更新上一帧的 s 值
+        self.last_frenet_s = frenet_s
+        # 10. 更新上一帧动作（用于下一step的动作平滑度惩罚）
+        self.last_action = np.array([float(action[0]), float(action[1])])
+
+        # 11. 锁定 MDP 步长为仿真时间 10Hz
+        self.rate.sleep()
+
+        info = {
+            "current_position": self.current_pos.copy(),
+            "current_yaw": float(self.current_yaw),
+            "target_position": self.target_pos.copy(),
+            "distance_to_goal": float(dist_to_goal),
+            "distance_remaining": float(distance_remaining),
+            "frenet_s": float(frenet_s),
+            "frenet_d": float(frenet_d),
+            "heading_to_path": float(heading_to_path),
+            "min_laser_dist": float(min_laser_dist),
+            "is_success": bool(distance_remaining < self.goal_reach_threshold),
+            "is_collision": bool(min_laser_dist < 0.25),
+            "is_timeout": bool(truncated),
+            "is_out_of_bounds": bool(terminal_reason == "out_of_bounds"),
+            "terminal_reason": terminal_reason,
+        }
+
+        return obs, reward, terminated, truncated, info
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.pub_cmd_vel.publish(Twist())
+        self.step_count = 0
+        # 重置 3-DOF 惯性速度状态
+        self.velocity = np.array([0.0, 0.0, 0.0])
+        # 重置动作平滑度状态
+        self.last_action = np.array([0.0, 0.0])
+
+        range_limit = 20.0
+        start_x = np.random.uniform(-range_limit/2, range_limit/2)
+        start_y = np.random.uniform(-range_limit/2, range_limit/2)
+        self.start_pos = np.array([start_x, start_y])
+
+        while True:
+            goal_x = np.random.uniform(-range_limit/2, range_limit/2)
+            goal_y = np.random.uniform(-range_limit/2, range_limit/2)
+            if np.linalg.norm([goal_x - start_x, goal_y - start_y]) > 4.0:
+                self.target_pos = np.array([goal_x, goal_y])
+                break
+
+        # 初始化Frenet坐标系（随机曲率增强泛化）
+        curve_offset = np.random.uniform(-2.5, 2.5)
+        self.frenet_transform = FrenetTransform(self.start_pos, self.target_pos, curve_offset=curve_offset)
+
+        # 可视化
+        self._update_marker("marker_start", start_x, start_y, "Blue")
+        self._update_marker("marker_goal", self.target_pos[0], self.target_pos[1], "Red")
+        self._visualize_path()
+
+        # 移动机器人
+        state_msg = ModelState()
+        state_msg.model_name = 'usv'
+        state_msg.pose.position.x = start_x
+        state_msg.pose.position.y = start_y
+        state_msg.pose.position.z = 0.05
+
+        # 先计算起点到目标的直线大方向作为基准参考
+        path_vec = self.target_pos - self.start_pos
+        base_yaw = math.atan2(path_vec[1], path_vec[0])
+
+        # 给一个正负 0.5 弧度（约30度）的随机偏差，降低初始探索难度
+        yaw = base_yaw + np.random.uniform(-0.5, 0.5)
+
+        # 确保 yaw 在 -pi 到 pi 之间
+        while yaw > math.pi: yaw -= 2 * math.pi
+        while yaw < -math.pi: yaw += 2 * math.pi
+        
+        q = tf.transformations.quaternion_from_euler(0, 0, yaw)
+        state_msg.pose.orientation.x = q[0]
+        state_msg.pose.orientation.y = q[1]
+        state_msg.pose.orientation.z = q[2]
+        state_msg.pose.orientation.w = q[3]
+
+        state_msg.twist.linear.x = 0
+        state_msg.twist.linear.y = 0
+        state_msg.twist.angular.z = 0
+
+        try:
+            self.set_state_proxy(state_msg)
+        except rospy.ServiceException:
+            pass
+
+        self.current_pos = np.array([start_x, start_y])
+        self.current_yaw = yaw
+        self.last_frenet_s = 0.0
+        path_length = self.frenet_transform.path_length
+        self.max_steps = int((path_length / 0.2) * 10 * 2) + 200
+
+        print("Reset: Start(%.1f,%.1f) -> Goal(%.1f,%.1f) | Path Length: %.2fm" %
+              (start_x, start_y, self.target_pos[0], self.target_pos[1], path_length))
+
+        while self.latest_scan is None:
+            rospy.sleep(0.01)
+        data = self.latest_scan
+
+        return self._build_obs(data, path_length), {}
+
+    def _visualize_path(self):
+        if self.frenet_transform is None:
+            return
+
+        # 生成路径点
+        path_points = self.frenet_transform.generate_path_points(num_points=50)
+        marker_array = MarkerArray()
+
+        # --- 1. 路径线 (Line Strip) ---
+        marker = Marker()
+        marker.header.frame_id = "odom"
+        marker.header.stamp = rospy.Time.now()
+        marker.ns = "global_path"
+        marker.id = 0
+        marker.type = Marker.LINE_STRIP  
+        marker.action = Marker.ADD
+        marker.scale.x = 0.1  # 线宽
+        marker.color.r = 0.0; marker.color.g = 1.0; marker.color.b = 0.0; marker.color.a = 0.8
+
+        marker.pose.orientation.w = 1.0
+        
+        for point in path_points:
+            p = Point()
+            p.x = point[0]
+            p.y = point[1]
+            p.z = 0.1  
+            marker.points.append(p)
+        marker_array.markers.append(marker)
+
+        # 计算路径方向用于箭头朝向
+        path_vector = self.target_pos - self.start_pos
+        angle = math.atan2(path_vector[1], path_vector[0])
+        q = tf.transformations.quaternion_from_euler(0, 0, angle)
+
+        # --- 2. 起点箭头 (Start Arrow) ---
+        start_marker = Marker()
+        start_marker.header.frame_id = "odom"
+        start_marker.header.stamp = rospy.Time.now()
+        start_marker.ns = "global_path"
+        start_marker.id = 1
+        start_marker.type = Marker.ARROW
+        start_marker.action = Marker.ADD
+        start_marker.pose.position.x = self.start_pos[0]
+        start_marker.pose.position.y = self.start_pos[1]
+        start_marker.pose.position.z = 0.1
+        start_marker.pose.orientation.x = q[0]
+        start_marker.pose.orientation.y = q[1]
+        start_marker.pose.orientation.z = q[2]
+        start_marker.pose.orientation.w = q[3]
+        start_marker.scale.x = 1.0; start_marker.scale.y = 0.2; start_marker.scale.z = 0.2 
+        start_marker.color.r = 0.0; start_marker.color.g = 0.0; start_marker.color.b = 1.0; start_marker.color.a = 1.0 
+        marker_array.markers.append(start_marker)
+
+        # --- 3. 终点箭头 (End Arrow) ---
+        end_marker = Marker()
+        end_marker.header.frame_id = "odom"
+        end_marker.header.stamp = rospy.Time.now()
+        end_marker.ns = "global_path"
+        end_marker.id = 2
+        end_marker.type = Marker.ARROW
+        end_marker.action = Marker.ADD
+        end_marker.pose.position.x = self.target_pos[0]
+        end_marker.pose.position.y = self.target_pos[1]
+        end_marker.pose.position.z = 0.1
+        end_marker.pose.orientation.x = q[0]
+        end_marker.pose.orientation.y = q[1]
+        end_marker.pose.orientation.z = q[2]
+        end_marker.pose.orientation.w = q[3]
+        end_marker.scale.x = 1.0; end_marker.scale.y = 0.2; end_marker.scale.z = 0.2
+        end_marker.color.r = 1.0; end_marker.color.g = 0.0; end_marker.color.b = 0.0; end_marker.color.a = 1.0 
+        marker_array.markers.append(end_marker)
+
+        # 发布
+        self.pub_path_marker.publish(marker_array)
+
+    def _visualize_car_pose(self):
+        """发布小车当前位置和朝向的箭头 Marker"""
+        marker = Marker()
+        marker.header.frame_id = "odom"
+        marker.header.stamp = rospy.Time.now()
+        marker.ns = "car_pose"
+        marker.id = 0
+        marker.type = Marker.ARROW
+        marker.action = Marker.ADD
+
+        # 位置
+        marker.pose.position.x = self.current_pos[0]
+        marker.pose.position.y = self.current_pos[1]
+        marker.pose.position.z = 0.2  
+
+        # 朝向 (根据 yaw 转换成四元数)
+        q = tf.transformations.quaternion_from_euler(0, 0, self.current_yaw)
+        marker.pose.orientation.x = q[0]
+        marker.pose.orientation.y = q[1]
+        marker.pose.orientation.z = q[2]
+        marker.pose.orientation.w = q[3]
+
+        # 箭头尺寸
+        marker.scale.x = 1.0  
+        marker.scale.y = 0.15 
+        marker.scale.z = 0.15 
+
+        # 颜色 (紫色)
+        marker.color.r = 0.8
+        marker.color.g = 0.2
+        marker.color.b = 0.8
+        marker.color.a = 1.0
+
+        self.pub_car_pose_marker.publish(marker)
+
+    def _update_marker(self, marker_name, x, y, color):
+        sdf_xml = """<sdf version="1.6">
+        <model name="%s">
+            <static>0</static>
+            <link name="link">
+            <gravity>0</gravity>
+            <visual name="visual">
+                <geometry><sphere><radius>0.25</radius></sphere></geometry>
+                <material><script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/%s</name></script></material>
+                <cast_shadows>0</cast_shadows>
+            </visual>
+            </link>
+        </model>
+        </sdf>""" % (marker_name, color)
+
+        state_msg = ModelState()
+        state_msg.model_name = marker_name
+        state_msg.pose.position.x = x
+        state_msg.pose.position.y = y
+        state_msg.pose.position.z = 0.5
+        state_msg.pose.orientation.w = 1.0
+        state_msg.twist.linear.x = 0
+        state_msg.twist.linear.y = 0
+        state_msg.twist.angular.z = 0
+
+        try:
+            resp = self.set_state_proxy(state_msg)
+            if not resp.success:
+                raise rospy.ServiceException("Model not found")
+        except rospy.ServiceException:
+            try:
+                initial_pose = Pose()
+                initial_pose.position.x = x
+                initial_pose.position.y = y
+                initial_pose.position.z = 0.5
+                initial_pose.orientation.w = 1.0
+                self.spawn_model_proxy(marker_name, sdf_xml, "", initial_pose, "world")
+            except Exception:
+                pass
 
     def _process_scan_data(self, data):
         if data is None:
             return np.zeros(self.n_laser_beams, dtype=np.float32)
-            
+
         raw_ranges = np.array(data.ranges)
-        raw_ranges[np.isinf(raw_ranges)] = self.max_laser_range
-        raw_ranges[np.isnan(raw_ranges)] = self.max_laser_range
-        
-        bin_size = len(raw_ranges) // self.n_laser_beams
-        processed_ranges = []
-        for i in range(self.n_laser_beams):
-            segment = raw_ranges[i*bin_size : (i+1)*bin_size]
-            if len(segment) > 0:
-                min_val = np.min(segment)
-            else:
-                min_val = self.max_laser_range
-            processed_ranges.append(min_val)
+        raw_ranges = np.nan_to_num(raw_ranges, nan=self.max_laser_range, posinf=self.max_laser_range, neginf=self.max_laser_range)
+        raw_ranges = np.clip(raw_ranges, 0, self.max_laser_range)
+
+        if len(raw_ranges) == self.n_laser_beams:
+            processed = raw_ranges
+        else:
+            x_old = np.linspace(0, 1, len(raw_ranges))
+            x_new = np.linspace(0, 1, self.n_laser_beams)
+            processed = np.interp(x_new, x_old, raw_ranges)
+
+        return (processed / self.max_laser_range).astype(np.float32)
+
+    def _build_obs(self, scan_data, path_length):
+        if self.frenet_transform is not None:
+            frenet_s, frenet_d = self.frenet_transform.cartesian_to_frenet(self.current_pos)
             
-        # === 修改 3: 归一化 ===
-        # 将 [0, 30] 映射到 [0, 1]，这对神经网络训练非常重要
-        processed_ranges = np.array(processed_ranges, dtype=np.float32)
-        return processed_ranges / self.max_laser_range
-    
-    def _update_marker(self, marker_name, x, y, color):
-            """
-            生成或移动一个【无重力、无碰撞、可移动】的幽灵球体
-            """
-            # === 核心修改：SDF 定义 ===
-            # 1. <static>0</static>: 让它变成动态物体，这样才能被 SetModelState 移动
-            # 2. <gravity>0</gravity>: 关掉重力，让它悬浮在半空
-            # 3. <inertial>: 动态物体必须有质量，给个极小值
-            # 4. <collision>: 故意不写，实现“无碰撞”
-            sdf_xml = f"""
-            <sdf version="1.6">
-            <model name="{marker_name}">
-                <static>0</static> 
-                <link name="link">
-                <gravity>0</gravity>
-                <inertial>
-                    <mass>0.001</mass>
-                    <inertia>
-                    <ixx>0.0001</ixx><ixy>0</ixy><ixz>0</ixz>
-                    <iyy>0.0001</iyy><iyz>0</iyz>
-                    <izz>0.0001</izz>
-                    </inertia>
-                </inertial>
-                <visual name="visual">
-                    <geometry><sphere><radius>0.3</radius></sphere></geometry>
-                    <material>
-                    <script>
-                        <uri>file://media/materials/scripts/gazebo.material</uri>
-                        <name>Gazebo/{color}</name>
-                    </script>
-                    </material>
-                    <cast_shadows>0</cast_shadows>
-                </visual>
-                <!-- 没有 collision 标签，车可以直接穿过去 -->
-                </link>
-            </model>
-            </sdf>
-            """
-
-            # 尝试移动模型
-            state_msg = ModelState()
-            state_msg.model_name = marker_name
-            state_msg.pose.position.x = x
-            state_msg.pose.position.y = y
-            state_msg.pose.position.z = 0.5 # 高度
-            state_msg.pose.orientation.w = 1.0
-            # 强制速度为0，防止之前如果有速度残留导致它漂移
-            state_msg.twist.linear.x = 0
-            state_msg.twist.linear.y = 0
-            state_msg.twist.angular.z = 0
+            # 使用算好的 frenet_s 传给 get_heading_error 即可
+            heading_to_path = self.frenet_transform.get_heading_error(self.current_yaw, frenet_s)
             
-            try:
-                # 发送移动指令
-                resp = self.set_state_proxy(state_msg)
-                
-                # 如果移动失败（通常是因为模型还不存在），则生成它
-                if not resp.success:
-                    raise rospy.ServiceException("Model not found")
-            
-            except rospy.ServiceException:
-                # 如果报错，说明模型还没生成，调用 spawn
-                try:
-                    spawn_proxy = rospy.ServiceProxy('/gazebo/spawn_sdf_model', SpawnModel)
-                    spawn_proxy(marker_name, sdf_xml, "", Pose(), "world")
-                    
-                    # 生成后立刻再设置一次位置，确保万无一失
-                    rospy.sleep(0.05) 
-                    self.set_state_proxy(state_msg)
-                except rospy.ServiceException as e:
-                    pass
+            distance_remaining = max(0.0, path_length - frenet_s)
+        else:
+            frenet_s = 0.0
+            frenet_d = 0.0
+            heading_to_path = 0.0
+            distance_remaining = path_length
 
-    def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
+        frenet_s_norm = (frenet_s / path_length) * 2 - 1
+        frenet_d_norm = np.clip(frenet_d / 3.0, -1.0, 1.0)
+        heading_norm = heading_to_path / math.pi
+        remaining_norm = (distance_remaining / path_length) * 2 - 1
 
-        # 随机生成目标点和起点
-        #活动范围
-        range_limit = 40.0
-
-        # 随机生成起点
-        start_x = np.random.uniform(-range_limit/2, range_limit/2)
-        start_y = np.random.uniform(-range_limit/2, range_limit/2)
-
-        # 随机生成目标点
-        while True:
-            goal_x = np.random.uniform(-range_limit/2, range_limit/2)
-            goal_y = np.random.uniform(-range_limit/2, range_limit/2)
-            if np.linalg.norm(np.array([goal_x - start_x, goal_y - start_y])) > 5.0:
-                self.target_pos = np.array([goal_x, goal_y])
-                break
-        
-        # 1. 标记终点 (红色球)
-        self._update_marker("marker_goal", self.target_pos[0], self.target_pos[1], "Red")
-        
-        # 2. 标记起点 (蓝色球)
-        self._update_marker("marker_start", start_x, start_y, "Blue")
-        
-        state_msg = ModelState()
-        state_msg.model_name = 'car'
-        state_msg.pose.position.x = start_x
-        state_msg.pose.position.y = start_y
-        state_msg.pose.position.z = 0.0
-
-        #随即朝向
-        yaw = np.random.uniform(-math.pi, math.pi)
-        state_msg.pose.orientation.z = math.sin(yaw / 2)
-        state_msg.pose.orientation.w = math.cos(yaw / 2)
-
-        #速度清零
-        state_msg.twist.linear.x = 0.0
-        state_msg.twist.linear.y = 0.0
-        state_msg.twist.angular.z = 0.0
-
-
-
-        # state_msg.model_name = 'car' 
-        # state_msg.pose.position.x = 0.0
-        # state_msg.pose.position.y = 0.0
-        # state_msg.pose.position.z = 0.0
-        # state_msg.pose.orientation.w = 1
-        # state_msg.twist.linear.x = 0
-        # state_msg.twist.linear.y = 0
-        # state_msg.twist.angular.z = 0
-
-        try:
-            self.set_state_proxy(state_msg)
-        except rospy.ServiceException as e:
-            print("瞬移服务调用失败: %s" % e)
-
-        #初始化内部变量
-        self.current_pos = np.array([start_x, start_y])
-        self.current_yaw = yaw
-        self.last_distance_to_goal = np.linalg.norm(self.target_pos - self.current_pos)
-        
-        #获取初始化观测
-        data = None
-        retry_count = 0
-        while data is None and retry_count < 10:
-            try:
-                data = rospy.wait_for_message('/scan', LaserScan, timeout=0.5)
-            except:
-                retry_count += 1
-
-        laser_state = self._process_scan_data(data)
-        
-        # if data is None:
-        #     obs = np.zeros(self.n_laser_beams, dtype=np.float32)
-        # else:
-        #     obs = self._process_scan_data(data)
-
-        #初始化导航信息
-        dist = self.last_distance_to_goal
-        #计算初始相对角度
-        angle_to_goal = math.atan2(self.target_pos[1] - start_y, self.target_pos[0] - start_x)
-        heading_error = angle_to_goal - self.current_yaw
-        
-        while heading_error > math.pi:
-            heading_error -= 2 * math.pi
-        while heading_error < -math.pi:
-            heading_error += 2 * math.pi
-
-        norm_dist = dist / self.map_size
-        norm_heading = heading_error / math.pi
-
-        obs = np.concatenate((laser_state, [norm_dist, norm_heading])).astype(np.float32)
-
-        print(f"Reset: Start({start_x:.1f},{start_y:.1f}) -> Goal({self.target_pos[0]:.1f},{self.target_pos[1]:.1f})")
-
-        return obs, {}
+        laser_state = self._process_scan_data(scan_data)
+        return np.concatenate((laser_state, [frenet_s_norm, frenet_d_norm, heading_norm, remaining_norm])).astype(np.float32)

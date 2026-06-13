@@ -1,6 +1,5 @@
 <robot name="mycar" xmlns:xacro="http://wiki.ros.org/xacro">
 
-    
     <xacro:property name="footprint_radius" value="0.001" />
     <!-- 1.添加 base_footprint -->
     <link name="base_footprint">
@@ -10,132 +9,118 @@
             </geometry>
         </visual>
     </link>
-    <!-- 2.添加底盘 -->
-    <xacro:property name="base_radius" value="0.1" />
-    <xacro:property name="base_length" value="0.08" />
-    <xacro:property name="base_mass" value="2" />
-    <xacro:property name="lidi" value="0.015" />
-    <xacro:property name="base_joint_z" value="${base_length / 2 + lidi}" />
 
-    <!-- 2.1 link -->
+    <!-- 2. USV 船体参数 -->
+    <xacro:property name="hull_length" value="0.3" />
+    <xacro:property name="hull_width" value="0.15" />
+    <xacro:property name="hull_height" value="0.1" />
+    <xacro:property name="hull_mass" value="2.0" />
+    <xacro:property name="hull_joint_z" value="${hull_height / 2}" />
+
+    <!-- 向后兼容: 其他xacro文件(如laser)仍使用base_length -->
+    <xacro:property name="base_length" value="${hull_length}" />
+    <xacro:property name="base_radius" value="${hull_width / 2}" />
+
+    <!-- 2.1 船体 link -->
     <link name="base_link">
         <visual>
             <geometry>
-                <cylinder radius="${base_radius}" length="${base_length}" />
+                <box size="${hull_length} ${hull_width} ${hull_height}" />
             </geometry>
-
             <origin xyz="0 0 0" rpy="0 0 0"/>
-
-            <material name="baselink_color">
-                <color rgba="1.0 0.5 0.2 0.5" />
+            <material name="hull_color">
+                <color rgba="0.2 0.5 0.8 0.5" />
             </material>
         </visual>
         <collision>
             <geometry>
-                <cylinder radius="${base_radius}" length="${base_length}" />
+                <box size="${hull_length} ${hull_width} ${hull_height}" />
             </geometry>
-
             <origin xyz="0 0 0" rpy="0 0 0"/>
         </collision>
-        <!-- 调用惯性矩阵函数 -->
-        <xacro:cylinder_inertial_matrix m="${base_mass}" r="${base_radius}" h="${base_length}"/>
+        <!-- USV 船体惯性矩阵: m=2.0, l=0.3, w=0.15, h=0.1
+             Ixx = m*(w²+h²)/12 = 2*(0.0225+0.01)/12 ≈ 0.00542
+             Iyy = m*(l²+h²)/12 = 2*(0.09+0.01)/12 ≈ 0.0167
+             Izz = m*(l²+w²)/12 = 2*(0.09+0.0225)/12 ≈ 0.01875 -->
+        <inertial>
+            <mass value="${hull_mass}" />
+            <inertia ixx="${hull_mass*(hull_width*hull_width + hull_height*hull_height)/12}" ixy="0" ixz="0"
+                iyy="${hull_mass*(hull_length*hull_length + hull_height*hull_height)/12}" iyz="0"
+                izz="${hull_mass*(hull_length*hull_length + hull_width*hull_width)/12}" />
+        </inertial>
     </link>
-    <gazebo reference="base_link"> 
-        <material>Gazebo/Yellow</material>
+    <gazebo reference="base_link">
+        <material>Gazebo/Blue</material>
     </gazebo>
+
     <!-- 2.2 joint -->
     <joint name="link2footprint" type="fixed">
         <parent link="base_footprint"/>
         <child link="base_link"/>
-        <origin xyz="0 0 ${base_joint_z}" rpy="0 0 0"/>
+        <origin xyz="0 0 ${hull_joint_z}" rpy="0 0 0"/>
     </joint>
-    <!-- 属性的封装 -->
-    <xacro:property name="wheel_radius" value="0.0325" />
-    <xacro:property name="wheel_length" value="0.015" />
-    <xacro:property name="wheel_mass" value="0.05" />
-    <xacro:property name="PI" value="3.1415927" />
-    
-    <!-- 注意：结果是负数 -->
-    <xacro:property name="wheel_joint_z" value="${(base_length / 2 + lidi - wheel_radius) * -1}" />
-   
-   <xacro:macro name="wheel_func" params="wheel_name flag" >
-   
-        <!-- 3.添加驱动轮 -->
-        <link name="${wheel_name}_wheel">
-            <visual>
-                <geometry>
-                    <cylinder radius="${wheel_radius}" length="${wheel_length}" />
-                </geometry>
-                <origin xyz="0 0 0" rpy="${PI / 2} 0 0"/>
 
-                <material name="wheel_color">
-                    <color rgba="0 0 0 0.3" />
-                </material>
-            </visual>
-            <collision>
-                <geometry>
-                    <cylinder radius="${wheel_radius}" length="${wheel_length}" />
-                </geometry>
-                <origin xyz="0 0 0" rpy="${PI / 2} 0 0"/>  
-            </collision>
-            <xacro:cylinder_inertial_matrix m="${wheel_mass}" r="${wheel_radius}" h="${wheel_length}" />
-        </link>
-        <gazebo reference="${wheel_name}_wheel">
-            <material>Gazebo/Red</material>
-        </gazebo>
+    <!-- 3. 推进器参数 -->
+    <xacro:property name="thruster_radius" value="0.05" />
+    <xacro:property name="thruster_length" value="0.15" />
+    <xacro:property name="thruster_mass" value="0.5" />
 
+    <!-- 3.1 左推进器 -->
+    <link name="thruster_left">
+        <visual>
+            <geometry>
+                <cylinder radius="${thruster_radius}" length="${thruster_length}" />
+            </geometry>
+            <origin xyz="0 0 0" rpy="${PI/2} 0 0"/>
+            <material name="thruster_color">
+                <color rgba="0.5 0.5 0.5 0.5" />
+            </material>
+        </visual>
+        <collision>
+            <geometry>
+                <cylinder radius="${thruster_radius}" length="${thruster_length}" />
+            </geometry>
+            <origin xyz="0 0 0" rpy="${PI/2} 0 0"/>
+        </collision>
+        <xacro:cylinder_inertial_matrix m="${thruster_mass}" r="${thruster_radius}" h="${thruster_length}"/>
+    </link>
+    <gazebo reference="thruster_left">
+        <material>Gazebo/Gray</material>
+    </gazebo>
 
-        <joint name="${wheel_name}2link" type="continuous">
-            <parent link="base_link"/>
-            <child link="${wheel_name}_wheel"/>
-            <origin xyz="0 ${0.1 * flag} ${wheel_joint_z}" rpy="0 0 0"/>
-            <axis xyz="0 1 0" />
-        </joint>
+    <joint name="thruster_left2base" type="fixed">
+        <parent link="base_link"/>
+        <child link="thruster_left"/>
+        <origin xyz="-0.15 0.075 0" rpy="0 0 0"/>
+    </joint>
 
-    </xacro:macro>
+    <!-- 3.2 右推进器 -->
+    <link name="thruster_right">
+        <visual>
+            <geometry>
+                <cylinder radius="${thruster_radius}" length="${thruster_length}" />
+            </geometry>
+            <origin xyz="0 0 0" rpy="${PI/2} 0 0"/>
+            <material name="thruster_color">
+                <color rgba="0.5 0.5 0.5 0.5" />
+            </material>
+        </visual>
+        <collision>
+            <geometry>
+                <cylinder radius="${thruster_radius}" length="${thruster_length}" />
+            </geometry>
+            <origin xyz="0 0 0" rpy="${PI/2} 0 0"/>
+        </collision>
+        <xacro:cylinder_inertial_matrix m="${thruster_mass}" r="${thruster_radius}" h="${thruster_length}"/>
+    </link>
+    <gazebo reference="thruster_right">
+        <material>Gazebo/Gray</material>
+    </gazebo>
 
-    <xacro:wheel_func wheel_name="left" flag="1" />
-    <xacro:wheel_func wheel_name="right" flag="-1" />
-    
-    <xacro:property name="small_wheel_radius" value="0.0075" />
-    <xacro:property name="small_wheel_mass" value="0.01" />
-    <xacro:property name="small_joint_z" value="${(base_length / 2 + lidi - small_wheel_radius) * -1}" />
-
-    <xacro:macro name="small_wheel_func" params="small_wheel_name flag">
-        <!-- 4.添加万向轮 -->
-        <link name="${small_wheel_name}_wheel">
-            <visual>
-                <geometry>
-                    <sphere radius="${small_wheel_radius}" />
-                </geometry>
-                <origin xyz="0 0 0" rpy="0 0 0"/>
-
-                <material name="wheel_color">
-                    <color rgba="0 0 0 0.3" />
-                </material>
-            </visual>
-            <collision>
-                <geometry>
-                    <sphere radius="${small_wheel_radius}" />
-                </geometry>
-                <origin xyz="0 0 0" rpy="0 0 0"/>
-            </collision>
-            <xacro:sphere_inertial_matrix m="${small_wheel_mass}" r="${small_wheel_radius}" />
-        </link>
-        <gazebo reference="${small_wheel_name}_wheel">
-            <material>Gazebo/Red</material>
-        </gazebo>
-
-        <joint name="${small_wheel_name}link" type="continuous">
-            <parent link="base_link"/>
-            <child link="${small_wheel_name}_wheel"/>
-            <origin xyz="${0.08 * flag} 0 ${small_joint_z}" rpy="0 0 0"/>
-            <axis xyz="1 1 1" />
-        </joint>
-
-    </xacro:macro>
-
-    <xacro:small_wheel_func small_wheel_name="front" flag="1" />
-    <xacro:small_wheel_func small_wheel_name="back" flag="-1" />
+    <joint name="thruster_right2base" type="fixed">
+        <parent link="base_link"/>
+        <child link="thruster_right"/>
+        <origin xyz="-0.15 -0.075 0" rpy="0 0 0"/>
+    </joint>
 
 </robot>

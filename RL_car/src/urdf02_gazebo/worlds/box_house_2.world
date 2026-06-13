@@ -44,17 +44,17 @@
     <model name='boundary_walls'>
       <static>1</static>
       <link name='walls'>
-        <collision name='north'><pose>0 20 1 0 0 0</pose><geometry><box><size>40 0.5 2</size></box></geometry></collision>
-        <visual name='north'><pose>0 20 1 0 0 0</pose><geometry><box><size>40 0.5 2</size></box></geometry><material><script><name>Gazebo/Bricks</name><uri>file://media/materials/scripts/gazebo.material</uri></script></material></visual>
+        <collision name='collision_north'><pose>0 20 1 0 0 0</pose><geometry><box><size>40 0.5 2</size></box></geometry></collision>
+        <visual name='visual_north'><pose>0 20 1 0 0 0</pose><geometry><box><size>40 0.5 2</size></box></geometry><material><script><name>Gazebo/Bricks</name><uri>file://media/materials/scripts/gazebo.material</uri></script></material></visual>
 
-        <collision name='south'><pose>0 -20 1 0 0 0</pose><geometry><box><size>40 0.5 2</size></box></geometry></collision>
-        <visual name='south'><pose>0 -20 1 0 0 0</pose><geometry><box><size>40 0.5 2</size></box></geometry><material><script><name>Gazebo/Bricks</name><uri>file://media/materials/scripts/gazebo.material</uri></script></material></visual>
+        <collision name='collision_south'><pose>0 -20 1 0 0 0</pose><geometry><box><size>40 0.5 2</size></box></geometry></collision>
+        <visual name='visual_south'><pose>0 -20 1 0 0 0</pose><geometry><box><size>40 0.5 2</size></box></geometry><material><script><name>Gazebo/Bricks</name><uri>file://media/materials/scripts/gazebo.material</uri></script></material></visual>
 
-        <collision name='east'><pose>20 0 1 0 0 0</pose><geometry><box><size>0.5 40 2</size></box></geometry></collision>
-        <visual name='east'><pose>20 0 1 0 0 0</pose><geometry><box><size>0.5 40 2</size></box></geometry><material><script><name>Gazebo/Bricks</name><uri>file://media/materials/scripts/gazebo.material</uri></script></material></visual>
+        <collision name='collision_east'><pose>20 0 1 0 0 0</pose><geometry><box><size>0.5 40 2</size></box></geometry></collision>
+        <visual name='visual_east'><pose>20 0 1 0 0 0</pose><geometry><box><size>0.5 40 2</size></box></geometry><material><script><name>Gazebo/Bricks</name><uri>file://media/materials/scripts/gazebo.material</uri></script></material></visual>
 
-        <collision name='west'><pose>-20 0 1 0 0 0</pose><geometry><box><size>0.5 40 2</size></box></geometry></collision>
-        <visual name='west'><pose>-20 0 1 0 0 0</pose><geometry><box><size>0.5 40 2</size></box></geometry><material><script><name>Gazebo/Bricks</name><uri>file://media/materials/scripts/gazebo.material</uri></script></material></visual>
+        <collision name='collision_west'><pose>-20 0 1 0 0 0</pose><geometry><box><size>0.5 40 2</size></box></geometry></collision>
+        <visual name='visual_west'><pose>-20 0 1 0 0 0</pose><geometry><box><size>0.5 40 2</size></box></geometry><material><script><name>Gazebo/Bricks</name><uri>file://media/materials/scripts/gazebo.material</uri></script></material></visual>
       </link>
     </model>
 
@@ -100,98 +100,253 @@
 
     <!-- ================= 动态障碍物 (已改为 Model，等待 Python 控制) ================= -->
     
-    <!-- 原红色方块 -->
-    <model name="moving_box_square">
-      <pose>5 5 0.6 0 0 0</pose>
-      <static>0</static> <!-- 设置为非静态，允许移动 -->
+<model name="obs_small_1">
+      <pose>-5 -5 0.3 0 0 0</pose> <static>0</static>
       <link name="link">
-        <inertial><mass>1.0</mass><inertia><ixx>0.16</ixx><iyy>0.16</iyy><izz>0.16</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia></inertial>
+        <inertial><mass>0.5</mass><inertia><ixx>0.01</ixx><iyy>0.01</iyy><izz>0.01</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia></inertial>
         <visual name="visual">
-          <geometry><box><size>1.2 1.2 1.2</size></box></geometry>
-          <material><script><name>Gazebo/Red</name><uri>file://media/materials/scripts/gazebo.material</uri></script></material>
-        </visual>
-        <collision name="collision"><geometry><box><size>1.2 1.2 1.2</size></box></geometry></collision>
-      </link>
-    </model>
-
-    <!-- 原蓝色方块 -->
-    <model name="moving_box_patrol">
-      <pose>-10 10 0.5 0 0 0</pose>
-      <static>0</static>
-      <link name="link">
-        <inertial><mass>1.0</mass><inertia><ixx>0.16</ixx><iyy>0.16</iyy><izz>0.16</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia></inertial>
-        <visual name="visual">
-          <geometry><box><size>1 1 1</size></box></geometry>
+          <geometry><box><size>0.4 0.4 0.6</size></box></geometry>
           <material><script><name>Gazebo/Blue</name><uri>file://media/materials/scripts/gazebo.material</uri></script></material>
         </visual>
-        <collision name="collision"><geometry><box><size>1 1 1</size></box></geometry></collision>
+        <collision name="collision"><geometry><box><size>0.4 0.4 0.6</size></box></geometry></collision>
       </link>
     </model>
 
-    <!-- 原绿色圆柱 -->
-    <model name="moving_cylinder_diamond">
-      <pose>8 -8 0.6 0 0 0</pose>
-      <static>0</static>
+    <model name="obs_small_2">
+      <pose>-8 6 0.4 0 0 0</pose> <static>0</static>
       <link name="link">
-        <inertial><mass>1.0</mass><inertia><ixx>0.1</ixx><iyy>0.1</iyy><izz>0.1</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia></inertial>
+        <inertial><mass>0.5</mass><inertia><ixx>0.01</ixx><iyy>0.01</iyy><izz>0.01</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia></inertial>
         <visual name="visual">
-          <geometry><cylinder><radius>0.6</radius><length>1.2</length></cylinder></geometry>
-          <material><script><name>Gazebo/Green</name><uri>file://media/materials/scripts/gazebo.material</uri></script></material>
+          <geometry><cylinder><radius>0.15</radius><length>0.8</length></cylinder></geometry>
+          <material><script><name>Gazebo/Grey</name><uri>file://media/materials/scripts/gazebo.material</uri></script></material>
         </visual>
-        <collision name="collision"><geometry><cylinder><radius>0.6</radius><length>1.2</length></cylinder></geometry></collision>
+        <collision name="collision"><geometry><cylinder><radius>0.15</radius><length>0.8</length></cylinder></geometry></collision>
       </link>
     </model>
 
-        <!-- 原绿色圆柱 -->
-    <model name="moving_cylinder_diamond_2">
-      <pose>-8 8 0.6 0 0 0</pose>
-      <static>0</static>
+    <model name="obs_small_3">
+      <pose>6 10 0.25 0 0 0</pose> <static>0</static>
       <link name="link">
-        <inertial><mass>1.0</mass><inertia><ixx>0.1</ixx><iyy>0.1</iyy><izz>0.1</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia></inertial>
+        <inertial><mass>0.5</mass><inertia><ixx>0.01</ixx><iyy>0.01</iyy><izz>0.01</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia></inertial>
         <visual name="visual">
-          <geometry><cylinder><radius>0.3</radius><length>1.2</length></cylinder></geometry>
-          <material><script><name>Gazebo/Green</name><uri>file://media/materials/scripts/gazebo.material</uri></script></material>
-        </visual>
-        <collision name="collision"><geometry><cylinder><radius>0.6</radius><length>1.2</length></cylinder></geometry></collision>
-      </link>
-    </model>
-
-    <!-- [新增] 动态障碍物 5: 黄色球体 -->
-    <model name="moving_sphere_yellow">
-      <pose>0 -10 0.5 0 0 0</pose>
-      <static>0</static>
-      <link name="link">
-        <inertial><mass>1.0</mass><inertia><ixx>0.1</ixx><iyy>0.1</iyy><izz>0.1</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia></inertial>
-        <visual name="visual">
-          <geometry><sphere><radius>0.5</radius></sphere></geometry>
-          <material><script><name>Gazebo/Yellow</name><uri>file://media/materials/scripts/gazebo.material</uri></script></material>
-        </visual>
-        <collision name="collision"><geometry><sphere><radius>0.5</radius></sphere></geometry></collision>
-      </link>
-    </model>
-
-    <!-- [新增] 动态障碍物 6: 紫色方块 -->
-    <model name="moving_box_purple">
-      <pose>-5 0 0.5 0 0 0</pose>
-      <static>0</static>
-      <link name="link">
-        <inertial><mass>1.0</mass><inertia><ixx>0.16</ixx><iyy>0.16</iyy><izz>0.16</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia></inertial>
-        <visual name="visual">
-          <geometry><box><size>1 1 1</size></box></geometry>
+          <geometry><box><size>0.3 0.3 0.5</size></box></geometry>
           <material><script><name>Gazebo/Purple</name><uri>file://media/materials/scripts/gazebo.material</uri></script></material>
         </visual>
-        <collision name="collision"><geometry><box><size>1 1 1</size></box></geometry></collision>
+        <collision name="collision"><geometry><box><size>0.3 0.3 0.5</size></box></geometry></collision>
       </link>
     </model>
 
-    <physics type="ode">
-      <!-- 设为 0 表示不限制运行速度，全速跑 -->
-      <real_time_update_rate>0</real_time_update_rate> 
-      
-      <!-- 物理仿真步长，0.001是标准精度。 -->
-      <!-- 如果想要更快，可以改为 0.002 或 0.005，但可能会导致碰撞检测不准 -->
-      <max_step_size>0.001</max_step_size>
-    </physics>  
+    <model name="obs_small_4">
+      <pose>12 -4 0.3 0 0 0</pose>
+      <static>0</static>
+      <link name="link">
+        <inertial><mass>0.5</mass><inertia><ixx>0.01</ixx><iyy>0.01</iyy><izz>0.01</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia></inertial>
+        <visual name="visual"><geometry><box><size>0.4 0.4 0.6</size></box></geometry>
+          <material><script><name>Gazebo/Blue</name><uri>file://media/materials/scripts/gazebo.material</uri></script></material>
+        </visual>
+        <collision name="collision"><geometry><box><size>0.4 0.4 0.6</size></box></geometry></collision>
+      </link>
+    </model>
+
+    <model name="obs_small_5">
+      <pose>-12 -12 0.3 0 0 0</pose>
+      <static>0</static>
+      <link name="link">
+        <inertial><mass>0.5</mass><inertia><ixx>0.01</ixx><iyy>0.01</iyy><izz>0.01</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia></inertial>
+        <visual name="visual"><geometry><cylinder><radius>0.2</radius><length>0.6</length></cylinder></geometry>
+          <material><script><name>Gazebo/DarkGrey</name><uri>file://media/materials/scripts/gazebo.material</uri></script></material>
+        </visual>
+        <collision name="collision"><geometry><cylinder><radius>0.2</radius><length>0.6</length></cylinder></geometry></collision>
+      </link>
+    </model>
+
+    <model name="obs_small_6">
+      <pose>0 15 0.3 0 0 0</pose>
+      <static>0</static>
+      <link name="link">
+        <inertial><mass>0.5</mass><inertia><ixx>0.01</ixx><iyy>0.01</iyy><izz>0.01</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia></inertial>
+        <visual name="visual"><geometry><box><size>0.5 0.5 0.6</size></box></geometry>
+          <material><script><name>Gazebo/Blue</name><uri>file://media/materials/scripts/gazebo.material</uri></script></material>
+        </visual>
+        <collision name="collision"><geometry><box><size>0.5 0.5 0.6</size></box></geometry></collision>
+      </link>
+    </model>
+
+    <model name="obs_small_7">
+      <pose>-5 18 0.25 0 0 0</pose>
+      <static>0</static>
+      <link name="link">
+        <inertial><mass>0.5</mass><inertia><ixx>0.01</ixx><iyy>0.01</iyy><izz>0.01</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia></inertial>
+        <visual name="visual"><geometry><box><size>0.4 0.4 0.5</size></box></geometry>
+          <material><script><name>Gazebo/Purple</name><uri>file://media/materials/scripts/gazebo.material</uri></script></material>
+        </visual>
+        <collision name="collision"><geometry><box><size>0.4 0.4 0.5</size></box></geometry></collision>
+      </link>
+    </model>
+
+    <model name="obs_med_1">
+      <pose>8 -8 0.85 0 0 0</pose> <static>0</static>
+      <link name="link">
+        <inertial><mass>1.0</mass><inertia><ixx>0.1</ixx><iyy>0.1</iyy><izz>0.05</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia></inertial>
+        <visual name="visual">
+          <geometry><cylinder><radius>0.25</radius><length>1.7</length></cylinder></geometry>
+          <material><script><name>Gazebo/Green</name><uri>file://media/materials/scripts/gazebo.material</uri></script></material>
+        </visual>
+        <collision name="collision"><geometry><cylinder><radius>0.25</radius><length>1.7</length></cylinder></geometry></collision>
+      </link>
+    </model>
+
+    <model name="obs_med_2">
+      <pose>-10 -2 0.6 0 0 0</pose> <static>0</static>
+      <link name="link">
+        <inertial><mass>1.0</mass><inertia><ixx>0.1</ixx><iyy>0.1</iyy><izz>0.1</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia></inertial>
+        <visual name="visual">
+          <geometry><box><size>0.6 0.6 1.2</size></box></geometry>
+          <material><script><name>Gazebo/Yellow</name><uri>file://media/materials/scripts/gazebo.material</uri></script></material>
+        </visual>
+        <collision name="collision"><geometry><box><size>0.6 0.6 1.2</size></box></geometry></collision>
+      </link>
+    </model>
+
+    <model name="obs_med_3">
+      <pose>3 8 0.85 0 0 0</pose>
+      <static>0</static>
+      <link name="link">
+        <inertial><mass>1.0</mass><inertia><ixx>0.1</ixx><iyy>0.1</iyy><izz>0.05</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia></inertial>
+        <visual name="visual"><geometry><cylinder><radius>0.25</radius><length>1.7</length></cylinder></geometry>
+          <material><script><name>Gazebo/Green</name><uri>file://media/materials/scripts/gazebo.material</uri></script></material>
+        </visual>
+        <collision name="collision"><geometry><cylinder><radius>0.25</radius><length>1.7</length></cylinder></geometry></collision>
+      </link>
+    </model>
+
+    <model name="obs_med_4">
+      <pose>-15 5 0.85 0 0 0</pose>
+      <static>0</static>
+      <link name="link">
+        <inertial><mass>1.0</mass><inertia><ixx>0.1</ixx><iyy>0.1</iyy><izz>0.05</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia></inertial>
+        <visual name="visual"><geometry><cylinder><radius>0.25</radius><length>1.7</length></cylinder></geometry>
+          <material><script><name>Gazebo/Green</name><uri>file://media/materials/scripts/gazebo.material</uri></script></material>
+        </visual>
+        <collision name="collision"><geometry><cylinder><radius>0.25</radius><length>1.7</length></cylinder></geometry></collision>
+      </link>
+    </model>
+
+    <model name="obs_med_5">
+      <pose>10 -15 0.6 0 0 0</pose>
+      <static>0</static>
+      <link name="link">
+        <inertial><mass>1.0</mass><inertia><ixx>0.1</ixx><iyy>0.1</iyy><izz>0.1</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia></inertial>
+        <visual name="visual"><geometry><box><size>0.6 0.6 1.2</size></box></geometry>
+          <material><script><name>Gazebo/Yellow</name><uri>file://media/materials/scripts/gazebo.material</uri></script></material>
+        </visual>
+        <collision name="collision"><geometry><box><size>0.6 0.6 1.2</size></box></geometry></collision>
+      </link>
+    </model>
+
+    <model name="obs_med_6">
+      <pose>0 -10 0.85 0 0 0</pose>
+      <static>0</static>
+      <link name="link">
+        <inertial><mass>1.0</mass><inertia><ixx>0.1</ixx><iyy>0.1</iyy><izz>0.05</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia></inertial>
+        <visual name="visual"><geometry><cylinder><radius>0.3</radius><length>1.7</length></cylinder></geometry>
+          <material><script><name>Gazebo/Green</name><uri>file://media/materials/scripts/gazebo.material</uri></script></material>
+        </visual>
+        <collision name="collision"><geometry><cylinder><radius>0.3</radius><length>1.7</length></cylinder></geometry></collision>
+      </link>
+    </model>
+
+    <model name="obs_med_7">
+      <pose>-8 -8 0.6 0 0 0</pose>
+      <static>0</static>
+      <link name="link">
+        <inertial><mass>1.0</mass><inertia><ixx>0.1</ixx><iyy>0.1</iyy><izz>0.1</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia></inertial>
+        <visual name="visual"><geometry><box><size>0.7 0.7 1.2</size></box></geometry>
+          <material><script><name>Gazebo/Yellow</name><uri>file://media/materials/scripts/gazebo.material</uri></script></material>
+        </visual>
+        <collision name="collision"><geometry><box><size>0.7 0.7 1.2</size></box></geometry></collision>
+      </link>
+    </model>
+
+    <model name="obs_large_1">
+      <pose>15 15 0.75 0 0 0</pose> <static>0</static>
+      <link name="link">
+        <inertial><mass>3.0</mass><inertia><ixx>0.5</ixx><iyy>0.5</iyy><izz>0.5</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia></inertial>
+        <visual name="visual">
+          <geometry><box><size>1.0 1.0 1.5</size></box></geometry>
+          <material><script><name>Gazebo/Red</name><uri>file://media/materials/scripts/gazebo.material</uri></script></material>
+        </visual>
+        <collision name="collision"><geometry><box><size>1.0 1.0 1.5</size></box></geometry></collision>
+      </link>
+    </model>
+
+    <model name="obs_large_2">
+      <pose>-15 -15 0.75 0 0 0</pose>
+      <static>0</static>
+      <link name="link">
+        <inertial><mass>3.0</mass><inertia><ixx>0.5</ixx><iyy>0.5</iyy><izz>0.5</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia></inertial>
+        <visual name="visual"><geometry><box><size>1.2 0.8 1.5</size></box></geometry>
+          <material><script><name>Gazebo/Red</name><uri>file://media/materials/scripts/gazebo.material</uri></script></material>
+        </visual>
+        <collision name="collision"><geometry><box><size>1.2 0.8 1.5</size></box></geometry></collision>
+      </link>
+    </model>
+
+    <model name="obs_large_3">
+      <pose>0 5 0.75 0 0 1.57</pose> <static>0</static>
+      <link name="link">
+        <inertial><mass>5.0</mass><inertia><ixx>1.0</ixx><iyy>1.0</iyy><izz>1.0</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia></inertial>
+        <visual name="visual"><geometry><box><size>0.5 2.0 1.5</size></box></geometry>
+          <material><script><name>Gazebo/Orange</name><uri>file://media/materials/scripts/gazebo.material</uri></script></material>
+        </visual>
+        <collision name="collision"><geometry><box><size>0.5 2.0 1.5</size></box></geometry></collision>
+      </link>
+    </model>
+
+    <model name="obs_large_4">
+      <pose>5 -12 0.75 0 0 0</pose>
+      <static>0</static>
+      <link name="link">
+        <inertial><mass>3.0</mass><inertia><ixx>0.5</ixx><iyy>0.5</iyy><izz>0.5</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia></inertial>
+        <visual name="visual"><geometry><box><size>1.0 1.0 1.5</size></box></geometry>
+          <material><script><name>Gazebo/Red</name><uri>file://media/materials/scripts/gazebo.material</uri></script></material>
+        </visual>
+        <collision name="collision"><geometry><box><size>1.0 1.0 1.5</size></box></geometry></collision>
+      </link>
+    </model>
+
+    <model name="obs_large_5">
+      <pose>-18 0 0.75 0 0 0</pose>
+      <static>0</static>
+      <link name="link">
+        <inertial><mass>3.0</mass><inertia><ixx>0.5</ixx><iyy>0.5</iyy><izz>0.5</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia></inertial>
+        <visual name="visual"><geometry><box><size>1.1 1.1 1.5</size></box></geometry>
+          <material><script><name>Gazebo/Orange</name><uri>file://media/materials/scripts/gazebo.material</uri></script></material>
+        </visual>
+        <collision name="collision"><geometry><box><size>1.1 1.1 1.5</size></box></geometry></collision>
+      </link>
+    </model>
+
+    <model name="obs_large_6">
+      <pose>18 0 0.75 0 0 0</pose>
+      <static>0</static>
+      <link name="link">
+        <inertial><mass>3.0</mass><inertia><ixx>0.5</ixx><iyy>0.5</iyy><izz>0.5</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia></inertial>
+        <visual name="visual"><geometry><box><size>1.0 1.0 1.5</size></box></geometry>
+          <material><script><name>Gazebo/Red</name><uri>file://media/materials/scripts/gazebo.material</uri></script></material>
+        </visual>
+        <collision name="collision"><geometry><box><size>1.0 1.0 1.5</size></box></geometry></collision>
+      </link>
+    </model>
+
+<physics type="ode">
+  <!-- 设为 0 表示不限制运行速度，全速跑 -->
+  <real_time_update_rate>0</real_time_update_rate> 
+  
+  <!-- 物理仿真步长，0.001是标准精度。 -->
+  <!-- 如果想要更快，可以改为 0.002 或 0.005，但可能会导致碰撞检测不准 -->
+  <max_step_size>0.001</max_step_size>
+</physics> 
 
   </world>
 </sdf>
